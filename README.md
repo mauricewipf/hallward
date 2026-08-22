@@ -2,10 +2,12 @@
 
 This folder is a **file-manager photo library**: pictures live in `photos/` as ordinary files. A SQLite catalog in `.album/` makes agent search fast. There is no gallery app and no tool to install.
 
+It is **agent-agnostic**. Point any coding agent at this folder — Claude, Cursor, Codex, Gemini, or similar — and ask it to find photos. Instructions in `AGENTS.md` and `skills/` are portable; they are not tied to one product.
+
 ## Workflows
 
 1. **Browse** — open `photos/` in any file manager and view files with the system image/video app.
-2. **Ask an agent** — open this folder as the workspace and describe what you want. The agent should run `scripts/search.py`, not walk every image.
+2. **Ask an agent** — open this folder as that agent’s workspace and describe what you want. The agent should follow `AGENTS.md`, load `skills/*/SKILL.md`, and run `scripts/search.py` rather than walking every image.
 
 ## Layout
 
