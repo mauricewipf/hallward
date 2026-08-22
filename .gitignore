@@ -1,0 +1,19 @@
+# Test/library media — never commit photo or video bytes
+photos/*
+!photos/.gitkeep
+
+# Generated catalog and caches
+.album/*.sqlite
+.album/*.sqlite-*
+.album/thumbs/
+.album/jobs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
