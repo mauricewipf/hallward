@@ -38,3 +38,7 @@ python3 scripts/search.py --text IMG_ --limit 20
 ```
 
 Output is TSV: `relpath`, `captured_at`, `filename`. Paths are relative to `photos/`.
+
+## Who is Hallward?
+
+Basil Hallward is the painter in Oscar Wilde’s *The Picture of Dorian Gray*. He makes Dorian’s portrait and then refuses to exhibit it — he wants the picture kept, not hung in a gallery. This library is named after him: photos stay as ordinary files, and you ask for them rather than putting them on display.
