@@ -4,10 +4,17 @@ This folder is a **file-manager photo library**: pictures live in `photos/` as o
 
 It is **agent-agnostic**. Point any coding agent at this folder — Claude, Cursor, Codex, Gemini, or similar — and ask it to find photos. Instructions in `AGENTS.md` and `skills/` are portable; they are not tied to one product.
 
-## Workflows
+## Prerequisites
 
-1. **Browse** — open `photos/` in any file manager and view files with the system image/video app.
-2. **Ask an agent** — open this folder as that agent’s workspace and describe what you want. The agent should follow `AGENTS.md`, load `skills/*/SKILL.md`, and run `scripts/search.py` rather than walking every image.
+- **Python 3** on `PATH` (`python3`) — needed to index and search. Browsing files does not require it.
+- **Any agent** — Claude, Cursor, Codex, Gemini, or similar. Instructions in `AGENTS.md` and `skills/` are portable.
+
+## How to start
+
+1. **Add photos** — put pictures in `photos/`. Each folder is an album.
+2. **Index** — open this project folder as your agent’s workspace and ask it to index the library.
+3. **Search** — ask the agent to find photos.
+4. **Browse** — open `photos/` in a file manager and view files as ordinary files; no AI required.
 
 ## Layout
 
@@ -16,12 +23,6 @@ It is **agent-agnostic**. Point any coding agent at this folder — Claude, Curs
 - `scripts/index.py` / `scripts/search.py` — catalog tools (Python 3 stdlib)
 - `skills/` — portable agent skills (`index-photos`, `search-photos`)
 - `AGENTS.md` — rules for any coding agent
-
-## Python
-
-Indexing and search need **Python 3** on `PATH` (`python3`). Browsing files does not.
-
-If `python3` is missing, **ask the user whether to install it**. Do not install Python or packages unless they say yes.
 
 ## Index
 
