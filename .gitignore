@@ -2,18 +2,17 @@
 photos/*
 !photos/.gitkeep
 
-# Generated catalog and caches
-.album/*.sqlite
-.album/*.sqlite-*
-.album/thumbs/
-.album/jobs/
+# Generated catalog and caches (library root or repo root)
+.album/
+**/.album/
 
-# Python
+# Python leftovers
 __pycache__/
 *.py[cod]
-*$py.class
 .venv/
 
 # OS
 .DS_Store
 Thumbs.db
+
+/target

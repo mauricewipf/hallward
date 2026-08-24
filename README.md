@@ -1,47 +1,87 @@
-# Photo library
+# Hallward
 
-This folder is a **file-manager photo library**: pictures live in `photos/` as ordinary files. A SQLite catalog in `.album/` makes agent search fast. There is no gallery app and no tool to install.
+Terminal photo library: miller-style folders, a thumbnail grid for albums, and an **external** image viewer. Photos stay ordinary files on disk. Hallward only adds a `.album/` directory (SQLite catalog + JPEG thumbs).
 
-It is **agent-agnostic**. Point any coding agent at this folder — Claude, Cursor, Codex, Gemini, or similar — and ask it to find photos. Instructions in `AGENTS.md` and `skills/` are portable; they are not tied to one product.
+v1 indexes **still images** only. Videos (including Live Photo `.MOV` companions) stay on disk and are ignored.
 
-## Prerequisites
+## Install
 
-- **Python 3** on `PATH` (`python3`) — needed to index and search. Browsing files does not require it.
-- **Any agent** — Claude, Cursor, Codex, Gemini, or similar. Instructions in `AGENTS.md` and `skills/` are portable.
+Needs:
 
-## How to start
+- [Rust](https://rustup.rs/) (stable)
+- `libheif` / `heif-convert` for HEIC thumbnails (Arch: `pacman -S libheif`)
+- A terminal with **Kitty or Sixel** graphics (Kitty, Ghostty, …) for the grid
+- An image viewer: **imv** (preferred), or nsxiv, feh, swayimg
 
-1. **Add photos** — put pictures in `photos/`. Each folder is an album.
-2. **Index** — open this project folder as your agent’s workspace and ask it to index the library.
-3. **Search** — ask the agent to find photos.
-4. **Browse** — open `photos/` in a file manager and view files as ordinary files; no AI required.
+```bash
+git clone <this-repo>
+cd hallward
+cargo install --path .
+```
+
+Or without installing:
+
+```bash
+cargo build --release
+# binary: target/release/hallward
+```
+
+## Use
+
+Point Hallward at a folder of albums (collections are folders that only contain other folders):
+
+```text
+~/Pictures/Library/
+  2025/                 # collection
+    Etyek/              # album (images)
+  Samples/              # album
+```
+
+First run in that folder:
+
+```bash
+cd ~/Pictures/Library
+hallward
+```
+
+You will be asked to initialize. That creates `.album/` and builds thumbs (HEIC decode can take a minute).
+
+```bash
+hallward init          # create .album/ and index
+hallward index         # refresh after adding/removing files
+hallward               # open the TUI
+hallward --root PATH   # library is PATH instead of cwd
+```
+
+### Keyboard
+
+| Key | Action |
+|-----|--------|
+| arrows | Miller columns; in an album grid, move the selection frame |
+| Right on a collection | Open its subfolders |
+| Right on an album | Focus the thumbnail grid |
+| Left from the left edge of the grid | Back to the album column |
+| letters / digits | Filter collection and album **names** (not filenames) |
+| Tab | Jump to the filtered tree |
+| Esc | Clear search and show the full tree |
+| Enter | Open the **whole album** in the external viewer (imv starts at the selected photo; swayimg starts at the first) |
+| q | Quit (when search is closed) |
+
+EXIF for the highlighted still is in the bottom-left pane.
+
+## Dev (this repo)
+
+```bash
+cargo test
+cargo run -- --root photos init
+cargo run -- --root photos
+```
 
 ## Layout
 
-- `photos/` — dated folders of media (`YYYY/YYYY-MM-DD/…`)
-- `.album/catalog.sqlite` — generated index (not committed)
-- `scripts/index.py` / `scripts/search.py` — catalog tools (Python 3 stdlib)
-- `skills/` — portable agent skills (`index-photos`, `search-photos`)
-- `AGENTS.md` — rules for any coding agent
+- Library root — your albums (any folder)
+- `.album/catalog.sqlite` — generated index
+- `.album/thumbs/` — 256px JPEG thumbs
+- `src/` — Rust TUI (`hallward` crate)
 
-## Index
-
-```bash
-python3 scripts/index.py
-```
-
-Re-run after adding, removing, or moving files under `photos/`. Unchanged files are skipped.
-
-## Search
-
-```bash
-python3 scripts/search.py --year 2024
-python3 scripts/search.py --from 2020-01-01 --until 2024-12-31
-python3 scripts/search.py --text IMG_ --limit 20
-```
-
-Output is TSV: `relpath`, `captured_at`, `filename`. Paths are relative to `photos/`.
-
-## Who is Hallward?
-
-Basil Hallward is the painter in Oscar Wilde’s *The Picture of Dorian Gray*. He makes Dorian’s portrait and then refuses to exhibit it — he wants the picture kept, not hung in a gallery. This library is named after him: photos stay as ordinary files, and you ask for them rather than putting them on display.
+Do not commit `photos/` or `.album/`.
