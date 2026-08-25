@@ -1,16 +1,19 @@
 use std::collections::HashMap;
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
@@ -29,7 +32,9 @@ use crate::viewer;
 
 /// Inner image height in rows. Width is derived from the terminal font so the photo is square.
 const CELL_INNER_H: u16 = 6;
-const STATUS_HINT: &str = "arrows move · type to search · Enter opens viewer · r reindex · q quit";
+const STATUS_HINT: &str =
+    "arrows move · click to select · double-click opens · type to search · Enter opens viewer · r reindex · q quit";
+const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -38,11 +43,34 @@ enum Focus {
     Grid,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MillerHit {
+    inner: Rect,
+    scroll_offset: usize,
+    item_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GridHit {
+    inner: Rect,
+    cell_w: u16,
+    cell_h: u16,
+    cols: usize,
+    scroll_first: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HitRegions {
+    search: Rect,
+    miller: Vec<MillerHit>,
+    grid: Option<GridHit>,
+}
+
 pub fn run(root: PathBuf) -> Result<()> {
     let mut app = App::new(root)?;
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    enter_tui(&mut stdout)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     // Query after the alternate screen so font-size / protocol detection can work.
@@ -50,9 +78,19 @@ pub fn run(root: PathBuf) -> Result<()> {
         Some(Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((10, 20))));
     let result = event_loop(&mut terminal, &mut app);
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    leave_tui(terminal.backend_mut())?;
     terminal.show_cursor()?;
     result
+}
+
+fn enter_tui<W: std::io::Write>(out: &mut W) -> Result<()> {
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    Ok(())
+}
+
+fn leave_tui<W: std::io::Write>(out: &mut W) -> Result<()> {
+    execute!(out, DisableMouseCapture, LeaveAlternateScreen)?;
+    Ok(())
 }
 
 struct App {
@@ -71,6 +109,9 @@ struct App {
     picker: Option<Picker>,
     protocols: HashMap<String, StatefulProtocol>,
     status: String,
+    miller_states: Vec<ListState>,
+    hit: HitRegions,
+    last_grid_click: Option<(usize, Instant)>,
 }
 
 impl App {
@@ -94,6 +135,9 @@ impl App {
             picker: None,
             protocols: HashMap::new(),
             status: STATUS_HINT.into(),
+            miller_states: Vec::new(),
+            hit: HitRegions::default(),
+            last_grid_click: None,
         };
         app.reload_photos();
         Ok(app)
@@ -200,6 +244,9 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
                     break;
                 }
             }
+            Event::Mouse(mouse) => {
+                handle_mouse(app, mouse, terminal)?;
+            }
             Event::Resize(_, _) => {}
             _ => {}
         }
@@ -273,6 +320,105 @@ fn handle_key(
         _ => {}
     }
     Ok(false)
+}
+
+fn handle_mouse(
+    app: &mut App,
+    mouse: MouseEvent,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+) -> Result<()> {
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return Ok(());
+    }
+    let pos = Position {
+        x: mouse.column,
+        y: mouse.row,
+    };
+
+    if app.hit.search.contains(pos) {
+        app.focus = Focus::Search;
+        return Ok(());
+    }
+
+    for (col, hit) in app.hit.miller.iter().enumerate() {
+        if let Some(row) = miller_row_at(*hit, pos) {
+            select_miller_row(app, col, row);
+            return Ok(());
+        }
+    }
+
+    if let Some(hit) = app.hit.grid {
+        if let Some(idx) = grid_index_at(hit, pos, app.photos.len()) {
+            let now = Instant::now();
+            if is_double_click(app.last_grid_click, idx, now, DOUBLE_CLICK) {
+                app.last_grid_click = None;
+                app.grid_idx = idx;
+                app.focus = Focus::Grid;
+                open_viewer(app, terminal)?;
+            } else {
+                app.last_grid_click = Some((idx, now));
+                app.grid_idx = idx;
+                app.focus = Focus::Grid;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn select_miller_row(app: &mut App, col: usize, row: usize) {
+    if app.cursor.len() <= col {
+        app.cursor.resize(col + 1, 0);
+    }
+    app.cursor[col] = row;
+    app.cursor.truncate(col + 1);
+    app.miller_focus = col;
+    app.focus = Focus::Miller;
+    app.grid_idx = 0;
+    app.last_grid_click = None;
+    app.reload_photos();
+}
+
+fn miller_row_at(hit: MillerHit, pos: Position) -> Option<usize> {
+    if !hit.inner.contains(pos) || hit.item_count == 0 {
+        return None;
+    }
+    let row = (pos.y.saturating_sub(hit.inner.y)) as usize;
+    let idx = hit.scroll_offset.saturating_add(row);
+    if idx < hit.item_count {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
+fn grid_index_at(hit: GridHit, pos: Position, photo_count: usize) -> Option<usize> {
+    if !hit.inner.contains(pos) || photo_count == 0 || hit.cell_w == 0 || hit.cell_h == 0 {
+        return None;
+    }
+    let col = ((pos.x.saturating_sub(hit.inner.x)) / hit.cell_w) as usize;
+    let row = ((pos.y.saturating_sub(hit.inner.y)) / hit.cell_h) as usize;
+    if col >= hit.cols {
+        return None;
+    }
+    let n = row.saturating_mul(hit.cols).saturating_add(col);
+    let idx = hit.scroll_first.saturating_add(n);
+    if idx < photo_count {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
+fn is_double_click(
+    last: Option<(usize, Instant)>,
+    idx: usize,
+    now: Instant,
+    threshold: Duration,
+) -> bool {
+    match last {
+        Some((last_idx, last_time)) if last_idx == idx => now.duration_since(last_time) < threshold,
+        _ => false,
+    }
 }
 
 fn column_len(app: &App, col: usize) -> usize {
@@ -427,11 +573,11 @@ fn open_viewer(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>)
     let start = app.grid_idx;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    leave_tui(terminal.backend_mut())?;
     terminal.show_cursor()?;
     let open = viewer::open(&files, start);
     enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    enter_tui(terminal.backend_mut())?;
     terminal.clear()?;
     match open {
         Ok(()) => {
@@ -443,6 +589,7 @@ fn open_viewer(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>)
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
+    app.hit = HitRegions::default();
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -453,6 +600,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
+    app.hit.search = chunks[0];
     draw_search(frame, app, chunks[0]);
 
     let col_count = app.miller_columns().len();
@@ -471,6 +619,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
             main[0],
         );
     } else {
+        app.hit.miller.resize(col_count, MillerHit::default());
         for i in 0..col_count {
             draw_miller_col(frame, app, i, main[i]);
         }
@@ -502,7 +651,7 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(p, area);
 }
 
-fn draw_miller_col(frame: &mut Frame, app: &App, col: usize, area: Rect) {
+fn draw_miller_col(frame: &mut Frame, app: &mut App, col: usize, area: Rect) {
     let cols = app.miller_columns();
     let items: Vec<ListItem> = cols
         .get(col)
@@ -523,21 +672,29 @@ fn draw_miller_col(frame: &mut Frame, app: &App, col: usize, area: Rect) {
         Style::default()
     };
     let title = if col == 0 { "Library" } else { "Folders" };
-    let list = List::new(items)
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border)
+        .title(title);
+    let inner = block.inner(area);
+    let list = List::new(items.clone())
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border)
-                .title(title),
-        );
-    let mut state = ListState::default();
+        .block(block);
+    if app.miller_states.len() <= col {
+        app.miller_states.resize(col + 1, ListState::default());
+    }
+    let state = &mut app.miller_states[col];
     state.select(app.cursor.get(col).copied());
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, area, state);
+    app.hit.miller[col] = MillerHit {
+        inner,
+        scroll_offset: state.offset(),
+        item_count: items.len(),
+    };
 }
 
 fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -570,10 +727,12 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
                 .style(Style::default().fg(Color::DarkGray)),
             inner,
         );
+        app.hit.grid = None;
         return;
     }
     if app.photos.is_empty() {
         frame.render_widget(Paragraph::new("No still images in this album."), inner);
+        app.hit.grid = None;
         return;
     }
 
@@ -598,6 +757,13 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
         app.grid_scroll = row + 1 - rows;
     }
     let first = app.grid_scroll * cols;
+    app.hit.grid = Some(GridHit {
+        inner,
+        cell_w,
+        cell_h,
+        cols,
+        scroll_first: first,
+    });
 
     let rels: Vec<String> = app
         .photos
@@ -731,5 +897,77 @@ mod tests {
     fn square_cell_matches_taller_font() {
         // Ghostty-like 8×22: 6×22 / 8 = 16.5 → 17 image columns.
         assert_eq!(square_cell_size(8, 22, 6), (19, 8));
+    }
+
+    #[test]
+    fn miller_click_maps_row_with_scroll_offset() {
+        let hit = MillerHit {
+            inner: Rect::new(1, 4, 20, 10),
+            scroll_offset: 3,
+            item_count: 8,
+        };
+        let pos = Position { x: 2, y: 5 };
+        assert_eq!(miller_row_at(hit, pos), Some(4));
+    }
+
+    #[test]
+    fn miller_click_ignores_border_and_empty_lists() {
+        let hit = MillerHit {
+            inner: Rect::new(1, 4, 20, 10),
+            scroll_offset: 0,
+            item_count: 2,
+        };
+        assert_eq!(miller_row_at(hit, Position { x: 0, y: 5 }), None);
+        assert_eq!(
+            miller_row_at(
+                MillerHit {
+                    item_count: 0,
+                    ..hit
+                },
+                Position { x: 2, y: 5 }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn grid_click_maps_scrolled_cell() {
+        let hit = GridHit {
+            inner: Rect::new(30, 2, 40, 20),
+            cell_w: 10,
+            cell_h: 8,
+            cols: 3,
+            scroll_first: 6,
+        };
+        // column 1, row 1 → local index 4 → photo 10
+        let pos = Position { x: 41, y: 10 };
+        assert_eq!(grid_index_at(hit, pos, 20), Some(10));
+    }
+
+    #[test]
+    fn grid_click_ignores_out_of_range_cells() {
+        let hit = GridHit {
+            inner: Rect::new(0, 0, 30, 16),
+            cell_w: 10,
+            cell_h: 8,
+            cols: 3,
+            scroll_first: 18,
+        };
+        assert_eq!(grid_index_at(hit, Position { x: 5, y: 1 }, 20), Some(18));
+        assert_eq!(grid_index_at(hit, Position { x: 25, y: 9 }, 20), None);
+    }
+
+    #[test]
+    fn double_click_requires_same_index_within_threshold() {
+        let now = Instant::now();
+        let last = Some((2, now - Duration::from_millis(200)));
+        assert!(is_double_click(last, 2, now, DOUBLE_CLICK));
+        assert!(!is_double_click(last, 3, now, DOUBLE_CLICK));
+        assert!(!is_double_click(
+            Some((2, now - Duration::from_millis(600))),
+            2,
+            now,
+            DOUBLE_CLICK
+        ));
     }
 }
