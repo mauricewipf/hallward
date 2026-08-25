@@ -4,28 +4,6 @@ Terminal photo library: miller-style folders, a thumbnail grid for albums, and a
 
 v1 indexes **still images** only. Videos (including Live Photo `.MOV` companions) stay on disk and are ignored.
 
-## Install
-
-Needs:
-
-- [Rust](https://rustup.rs/) (stable)
-- `libheif` / `heif-convert` for HEIC thumbnails (Arch: `pacman -S libheif`)
-- A terminal with **Kitty or Sixel** graphics (Kitty, Ghostty, …) for the grid
-- An image viewer: **imv** (preferred), or nsxiv, feh, swayimg
-
-```bash
-git clone <this-repo>
-cd hallward
-cargo install --path .
-```
-
-Or without installing:
-
-```bash
-cargo build --release
-# binary: target/release/hallward
-```
-
 ## Use
 
 Point Hallward at a folder of albums (collections are folders that only contain other folders):
@@ -33,7 +11,7 @@ Point Hallward at a folder of albums (collections are folders that only contain 
 ```text
 ~/Pictures/Library/
   2025/                 # collection
-    Etyek/              # album (images)
+    Rome/              # album (images)
   Samples/              # album
 ```
 
@@ -68,6 +46,28 @@ hallward --root PATH   # library is PATH instead of cwd
 | q | Quit (when search is closed) |
 
 EXIF for the highlighted still is in the bottom-left pane.
+
+## Install
+
+Needs:
+
+- [Rust](https://rustup.rs/) (stable)
+- `libheif` / `heif-convert` for HEIC thumbnails (Arch: `pacman -S libheif`)
+- A terminal with **Kitty or Sixel** graphics (Kitty, Ghostty, …) for the grid
+- An image viewer: **imv** (preferred), or nsxiv, feh, swayimg
+
+```bash
+git clone <this-repo>
+cd hallward
+cargo install --path .
+```
+
+Or without installing:
+
+```bash
+cargo build --release
+# binary: target/release/hallward
+```
 
 ## Dev (this repo)
 
