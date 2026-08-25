@@ -27,26 +27,44 @@ pub fn thumb_path(root: &Path, relpath: &str) -> PathBuf {
     thumbs_dir(root).join(thumb_filename(relpath))
 }
 
+/// True when a 256×256 thumb exists and is at least as new as the original.
+pub fn is_current(root: &Path, abs: &Path, relpath: &str) -> bool {
+    let out = thumb_path(root, relpath);
+    let Ok(src_m) = abs.metadata().and_then(|m| m.modified()) else {
+        return false;
+    };
+    let Ok(dst_m) = out.metadata().and_then(|m| m.modified()) else {
+        return false;
+    };
+    dst_m >= src_m && is_square_thumb(&out)
+}
+
 pub fn generate_thumb(root: &Path, abs: &Path, relpath: &str) -> Result<PathBuf> {
     let out = thumb_path(root, relpath);
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
     }
-    if out.exists() {
-        let src_m = abs.metadata()?.modified()?;
-        let dst_m = out.metadata()?.modified()?;
-        if dst_m >= src_m {
-            return Ok(out);
-        }
+    if is_current(root, abs, relpath) {
+        return Ok(out);
     }
 
     let img = load_image(abs).with_context(|| format!("decode {}", abs.display()))?;
-    let thumb = img.resize(THUMB_SIZE, THUMB_SIZE, FilterType::Triangle);
+    let thumb = crop_square(img);
     thumb
         .to_rgb8()
         .save_with_format(&out, ImageFormat::Jpeg)
         .with_context(|| format!("write {}", out.display()))?;
     Ok(out)
+}
+
+fn crop_square(img: DynamicImage) -> DynamicImage {
+    img.resize_to_fill(THUMB_SIZE, THUMB_SIZE, FilterType::Triangle)
+}
+
+fn is_square_thumb(path: &Path) -> bool {
+    image::image_dimensions(path)
+        .ok()
+        .is_some_and(|(w, h)| w == THUMB_SIZE && h == THUMB_SIZE)
 }
 
 fn load_image(path: &Path) -> Result<DynamicImage> {
@@ -91,4 +109,25 @@ fn placeholder() -> DynamicImage {
         THUMB_SIZE,
         image::Rgb([32, 32, 32]),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use image::{Rgb, RgbImage};
+
+    use super::*;
+
+    #[test]
+    fn crop_square_fills_thumb_size() {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(40, 20, Rgb([255, 0, 0])));
+        let thumb = crop_square(img);
+        assert_eq!((thumb.width(), thumb.height()), (THUMB_SIZE, THUMB_SIZE));
+    }
+
+    #[test]
+    fn crop_square_portrait_also_fills() {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(20, 40, Rgb([0, 255, 0])));
+        let thumb = crop_square(img);
+        assert_eq!((thumb.width(), thumb.height()), (THUMB_SIZE, THUMB_SIZE));
+    }
 }

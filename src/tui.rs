@@ -27,8 +27,8 @@ use crate::search;
 use crate::thumbs;
 use crate::viewer;
 
-const CELL_W: u16 = 16;
-const CELL_H: u16 = 8;
+/// Inner image height in rows. Width is derived from the terminal font so the photo is square.
+const CELL_INNER_H: u16 = 6;
 const STATUS_HINT: &str = "arrows move · type to search · Enter opens viewer · r reindex · q quit";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -577,8 +577,14 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let cols = (inner.width / CELL_W).max(1) as usize;
-    let rows = (inner.height / CELL_H).max(1) as usize;
+    let (fw, fh) = app
+        .picker
+        .as_ref()
+        .map(|p| p.font_size())
+        .unwrap_or((10, 20));
+    let (cell_w, cell_h) = square_cell_size(fw, fh, CELL_INNER_H);
+    let cols = (inner.width / cell_w).max(1) as usize;
+    let rows = (inner.height / cell_h).max(1) as usize;
     app.grid_cols = cols;
     let vis = cols * rows;
     if vis == 0 {
@@ -609,10 +615,10 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
         let c = (n % cols) as u16;
         let r = (n / cols) as u16;
         let cell = Rect {
-            x: inner.x + c * CELL_W,
-            y: inner.y + r * CELL_H,
-            width: CELL_W.min(inner.width.saturating_sub(c * CELL_W)),
-            height: CELL_H.min(inner.height.saturating_sub(r * CELL_H)),
+            x: inner.x + c * cell_w,
+            y: inner.y + r * cell_h,
+            width: cell_w.min(inner.width.saturating_sub(c * cell_w)),
+            height: cell_h.min(inner.height.saturating_sub(r * cell_h)),
         };
         if cell.width < 3 || cell.height < 3 {
             continue;
@@ -695,4 +701,35 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             .block(Block::default().borders(Borders::ALL).title("Status")),
         area,
     );
+}
+
+/// Character-cell size whose inner area (inside the border) is as square as the font allows.
+fn square_cell_size(font_w: u16, font_h: u16, inner_h: u16) -> (u16, u16) {
+    let font_w = font_w.max(1) as u32;
+    let font_h = font_h.max(1) as u32;
+    let inner_h = inner_h.max(1) as u32;
+    let inner_w = (inner_h * font_h + font_w / 2) / font_w;
+    let inner_w = inner_w.max(1) as u16;
+    let inner_h = inner_h as u16;
+    (
+        inner_w.saturating_add(2).max(3),
+        inner_h.saturating_add(2).max(3),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn square_cell_matches_1_by_2_font() {
+        // 10×20px cells: 6 rows → 12 cols of image, plus a 1-cell border.
+        assert_eq!(square_cell_size(10, 20, 6), (14, 8));
+    }
+
+    #[test]
+    fn square_cell_matches_taller_font() {
+        // Ghostty-like 8×22: 6×22 / 8 = 16.5 → 17 image columns.
+        assert_eq!(square_cell_size(8, 22, 6), (19, 8));
+    }
 }

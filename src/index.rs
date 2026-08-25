@@ -59,7 +59,7 @@ pub fn index_library(root: &Path) -> Result<IndexStats> {
         let mtime = mtime_epoch(&meta_fs)?;
         let size = meta_fs.len() as i64;
         if let Some((old_m, old_s)) = catalog::get_mtime_size(&conn, &rel)? {
-            if old_m == mtime && old_s == size && thumbs::thumb_path(root, &rel).exists() {
+            if old_m == mtime && old_s == size && thumbs::is_current(root, path, &rel) {
                 stats.skipped += 1;
                 continue;
             }
