@@ -15,7 +15,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "hallward", about = "Terminal photo library")]
+#[command(name = "hallward", version, about = "Terminal photo library")]
 struct Cli {
     /// Library root (folder of albums). Default: cwd, or a parent that contains .album/
     #[arg(long, global = true)]
@@ -81,4 +81,19 @@ pub fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clap_exposes_crate_version() {
+        let err = Cli::try_parse_from(["hallward", "--version"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(env!("CARGO_PKG_VERSION")),
+            "expected crate version in --version output: {msg}"
+        );
+    }
 }

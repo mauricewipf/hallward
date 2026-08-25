@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Terminal photo library: miller collections, thumbnail albums, external viewer"
 license = "MIT"
+repository = "https://github.com/mauricewipf/hallward"
 
 [dependencies]
 anyhow = "1"

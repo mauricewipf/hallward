@@ -1,0 +1,73 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            notes: "false"
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            notes: "true"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "tag=$tag cargo=$cargo"
+          test -n "$tag"
+          test -n "$cargo"
+          test "$tag" = "$cargo"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: bash
+        run: |
+          triple="${{ matrix.target }}"
+          mkdir -p dist
+          cp target/release/hallward "dist/hallward"
+          tar -C dist -czf "hallward-${triple}.tar.gz" hallward
+          if command -v sha256sum >/dev/null; then
+            sha256sum "hallward-${triple}.tar.gz" > "hallward-${triple}.tar.gz.sha256"
+          else
+            shasum -a 256 "hallward-${triple}.tar.gz" > "hallward-${triple}.tar.gz.sha256"
+          fi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            hallward-${{ matrix.target }}.tar.gz
+            hallward-${{ matrix.target }}.tar.gz.sha256
+          fail_on_unmatched_files: true
+
+      - name: Release notes
+        if: matrix.notes == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            HEIC thumbnails still need system `libheif` / `heif-convert`.
+            macOS binaries are unsigned (allow the app in System Settings → Privacy & Security if Gatekeeper blocks it).
+            The Linux binary is glibc, built on Ubuntu 24.04.

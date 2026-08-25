@@ -8,6 +8,7 @@ This is a **Rust TUI photo library** (`hallward`). Photos stay ordinary files on
 - Index with `cargo run -- --root medialibrary init` or `index`.
 - Keep media as normal files under the library root. Never commit `medialibrary/` or `.album/`.
 - Ask before moving, renaming, or deleting media.
+- Shipping a version: use the `release` skill (`.cursor/skills/release/`). Do not tag by hand.
 
 ## Do not
 

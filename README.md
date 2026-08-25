@@ -57,10 +57,23 @@ EXIF for the highlighted still is in the bottom-left pane.
 
 ## Install
 
+Download a binary from [Releases](https://github.com/mauricewipf/hallward/releases):
+
+- macOS Apple Silicon: `hallward-aarch64-apple-darwin.tar.gz`
+- Linux x86_64 (glibc, Ubuntu 24.04): `hallward-x86_64-unknown-linux-gnu.tar.gz`
+
+```bash
+tar -xzf hallward-aarch64-apple-darwin.tar.gz
+chmod +x hallward
+# move onto PATH, e.g. mkdir -p ~/.local/bin && mv hallward ~/.local/bin/
+```
+
+The macOS binary is unsigned; if Gatekeeper blocks it, allow it in System Settings → Privacy & Security. HEIC thumbnails still need `libheif` / `heif-convert` (see Prerequisites).
+
 From source (needs [Rust](https://rustup.rs/)):
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/mauricewipf/hallward.git
 cd hallward
 cargo install --path .
 ```
