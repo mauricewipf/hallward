@@ -495,7 +495,7 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
     let title = if app.focus == Focus::Search {
         "Search (Tab tree · Esc clear)"
     } else {
-        "Search (type to filter collections/albums)"
+        "Search (type to filter albums)"
     };
     let style = if app.focus == Focus::Search {
         Style::default().fg(Color::Yellow)
