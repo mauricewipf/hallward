@@ -1,8 +1,8 @@
 # Test/library media — never commit photo or video bytes
-photos/*
-!photos/.gitkeep
+medialibrary/*
+!medialibrary/.gitkeep
 
-# Generated catalog and caches (library root or repo root)
+# Generated catalog and thumbs (inside the library root)
 .album/
 **/.album/
 

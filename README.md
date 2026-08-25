@@ -73,8 +73,8 @@ EXIF for the highlighted still is in the bottom-left pane.
 
 ```bash
 cargo test
-cargo run -- --root photos init
-cargo run -- --root photos
+cargo run -- --root medialibrary init
+cargo run -- --root medialibrary
 ```
 
 ## Layout
@@ -84,4 +84,4 @@ cargo run -- --root photos
 - `.album/thumbs/` — 256px JPEG thumbs
 - `src/` — Rust TUI (`hallward` crate)
 
-Do not commit `photos/` or `.album/`.
+Do not commit `medialibrary/` or `.album/`.
