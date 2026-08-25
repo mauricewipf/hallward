@@ -21,6 +21,7 @@ use ratatui_image::StatefulImage;
 use rusqlite::Connection;
 
 use crate::catalog::{self, Photo};
+use crate::index;
 use crate::library::{self, Folder, Kind};
 use crate::search;
 use crate::thumbs;
@@ -28,6 +29,7 @@ use crate::viewer;
 
 const CELL_W: u16 = 16;
 const CELL_H: u16 = 8;
+const STATUS_HINT: &str = "arrows move · type to search · Enter opens viewer · r reindex · q quit";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -97,7 +99,7 @@ impl App {
             picker,
             graphics,
             protocols: HashMap::new(),
-            status: "arrows move · type to search · Enter opens viewer · q quit".into(),
+            status: STATUS_HINT.into(),
         };
         app.reload_photos();
         Ok(app)
@@ -252,6 +254,7 @@ fn handle_key(
 
     match key.code {
         KeyCode::Char('q') => return Ok(true),
+        KeyCode::Char('r') => reindex(app, terminal)?,
         KeyCode::Esc => {
             if !app.query.is_empty() {
                 app.query.clear();
@@ -372,6 +375,54 @@ fn move_right(app: &mut App) {
     }
 }
 
+fn reindex(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    app.status = "indexing…".into();
+    terminal.draw(|f| draw(f, app))?;
+    match index::index_library(&app.root) {
+        Ok(stats) => {
+            app.status = format!(
+                "indexed {} files (updated {}, skipped {}, removed {})",
+                stats.total, stats.added_or_updated, stats.skipped, stats.removed
+            );
+        }
+        Err(e) => app.status = format!("index failed: {e:#}"),
+    }
+    match library::scan_tree(&app.root) {
+        Ok(tree) => {
+            app.full_tree = tree;
+            app.view_tree = if app.query.is_empty() {
+                app.full_tree.clone()
+            } else {
+                search::filter_tree(&app.full_tree, &app.query)
+            };
+            clamp_cursor(app);
+        }
+        Err(e) => app.status = format!("{} · tree scan failed: {e:#}", app.status),
+    }
+    app.protocols.clear();
+    app.reload_photos();
+    Ok(())
+}
+
+fn clamp_cursor(app: &mut App) {
+    if app.cursor.is_empty() {
+        app.cursor.push(0);
+    }
+    let n_cols = app.miller_columns().len().max(1);
+    if app.miller_focus >= n_cols {
+        app.miller_focus = n_cols - 1;
+    }
+    app.cursor.truncate(n_cols);
+    for col in 0..app.cursor.len() {
+        let n = column_len(app, col);
+        if n == 0 {
+            app.cursor[col] = 0;
+        } else if app.cursor[col] >= n {
+            app.cursor[col] = n - 1;
+        }
+    }
+}
+
 fn open_viewer(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     if app.photos.is_empty() {
         app.status = "no photos in this album".into();
@@ -390,7 +441,7 @@ fn open_viewer(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>)
     terminal.clear()?;
     match open {
         Ok(()) => {
-            app.status = "arrows move · type to search · Enter opens viewer · q quit".into();
+            app.status = STATUS_HINT.into();
         }
         Err(e) => app.status = format!("{e:#}"),
     }

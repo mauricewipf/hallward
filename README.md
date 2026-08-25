@@ -43,6 +43,7 @@ hallward --root PATH   # library is PATH instead of cwd
 | Tab | Jump to the filtered tree |
 | Esc | Clear search and show the full tree |
 | Enter | Open the **whole album** in the external viewer (imv starts at the selected photo; swayimg starts at the first) |
+| r | Re-scan files and refresh thumbnails (when search is closed) |
 | q | Quit (when search is closed) |
 
 EXIF for the highlighted still is in the bottom-left pane.
