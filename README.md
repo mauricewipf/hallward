@@ -54,7 +54,7 @@ Needs:
 
 - [Rust](https://rustup.rs/) (stable)
 - `libheif` / `heif-convert` for HEIC thumbnails (Arch: `pacman -S libheif`)
-- A terminal with **Kitty or Sixel** graphics (Kitty, Ghostty, …) for the grid
+- A color terminal for the grid (Kitty, Ghostty, WezTerm, iTerm2 give sharp thumbs; others use unicode halfblocks)
 - An image viewer: **imv** (preferred), or nsxiv, feh, swayimg
 
 ```bash

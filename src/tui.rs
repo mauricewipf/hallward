@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::Stdout;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -45,6 +45,9 @@ pub fn run(root: PathBuf) -> Result<()> {
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    // Query after the alternate screen so font-size / protocol detection can work.
+    app.picker =
+        Some(Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((10, 20))));
     let result = event_loop(&mut terminal, &mut app);
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -66,7 +69,6 @@ struct App {
     grid_cols: usize,
     grid_scroll: usize,
     picker: Option<Picker>,
-    graphics: bool,
     protocols: HashMap<String, StatefulProtocol>,
     status: String,
 }
@@ -76,13 +78,6 @@ impl App {
         let conn = catalog::open(&root, false)?;
         let full_tree = library::scan_tree(&root)?;
         let view_tree = full_tree.clone();
-        let (picker, graphics) = match Picker::from_query_stdio() {
-            Ok(p) => {
-                let ok = p.protocol_type() != ProtocolType::Halfblocks;
-                (Some(p), ok)
-            }
-            Err(_) => (None, false),
-        };
         let mut app = Self {
             root,
             conn,
@@ -96,8 +91,7 @@ impl App {
             grid_idx: 0,
             grid_cols: 1,
             grid_scroll: 0,
-            picker,
-            graphics,
+            picker: None,
             protocols: HashMap::new(),
             status: STATUS_HINT.into(),
         };
@@ -179,7 +173,7 @@ impl App {
     }
 
     fn ensure_protocol(&mut self, rel: &str) {
-        if !self.graphics || self.protocols.contains_key(rel) {
+        if self.protocols.contains_key(rel) {
             return;
         }
         let Some(picker) = self.picker.as_mut() else {
@@ -582,20 +576,6 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new("No still images in this album."), inner);
         return;
     }
-    if !app.graphics {
-        let name = app
-            .selected_photo()
-            .map(|p| p.filename.as_str())
-            .unwrap_or("");
-        frame.render_widget(
-            Paragraph::new(format!(
-                "No Kitty/Sixel graphics in this terminal.\nUse Kitty or Ghostty for the thumbnail grid.\nEnter still opens the external viewer.\n\nSelected: {name}"
-            ))
-            .wrap(Wrap { trim: true }),
-            inner,
-        );
-        return;
-    }
 
     let cols = (inner.width / CELL_W).max(1) as usize;
     let rows = (inner.height / CELL_H).max(1) as usize;
@@ -651,6 +631,17 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(cell_block, cell);
         if let Some(proto) = app.protocols.get_mut(rel) {
             frame.render_stateful_widget(StatefulImage::default(), img_area, proto);
+        } else {
+            let name = Path::new(rel)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(rel);
+            frame.render_widget(
+                Paragraph::new(name)
+                    .style(Style::default().fg(Color::DarkGray))
+                    .wrap(Wrap { trim: true }),
+                img_area,
+            );
         }
     }
 }
@@ -683,11 +674,21 @@ fn draw_exif(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn protocol_name(picker: Option<&Picker>) -> &'static str {
+    match picker.map(|p| p.protocol_type()) {
+        Some(ProtocolType::Kitty) => "kitty",
+        Some(ProtocolType::Sixel) => "sixel",
+        Some(ProtocolType::Iterm2) => "iterm2",
+        Some(ProtocolType::Halfblocks) | None => "halfblocks",
+    }
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let viewer_name = viewer::detect()
         .map(|v| v.bin().to_string())
         .unwrap_or_else(|| "no viewer".into());
-    let text = format!("{}\nviewer: {viewer_name}", app.status);
+    let thumbs = protocol_name(app.picker.as_ref());
+    let text = format!("{}\nviewer: {viewer_name} · thumbs: {thumbs}", app.status);
     frame.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: true })
