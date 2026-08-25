@@ -4,14 +4,21 @@ Terminal photo library: miller-style folders, a thumbnail grid for albums, and a
 
 v1 indexes **still images** only. Videos (including Live Photo `.MOV` companions) stay on disk and are ignored.
 
+## Prerequisites
+
+- **Ghostty**, **Kitty** or another graphic-supporting terminal. Other terminals fall back to coarse unicode blocks.
+- `libheif` / `heif-convert` for HEIC thumbnails (Arch: `pacman -S libheif`)
+- An image viewer: **imv** (preferred), or nsxiv, feh, swayimg
+
 ## Use
 
 Point Hallward at a folder of albums (collections are folders that only contain other folders):
 
 ```text
 ~/Pictures/Library/
+  .album/               # generated on init (catalog + thumbs)
   2025/                 # collection
-    Rome/              # album (images)
+    Rome/               # album (images)
   Samples/              # album
 ```
 
@@ -50,12 +57,7 @@ EXIF for the highlighted still is in the bottom-left pane.
 
 ## Install
 
-Needs:
-
-- [Rust](https://rustup.rs/) (stable)
-- `libheif` / `heif-convert` for HEIC thumbnails (Arch: `pacman -S libheif`)
-- A color terminal for the grid (Kitty, Ghostty, WezTerm, iTerm2 give sharp thumbs; others use unicode halfblocks)
-- An image viewer: **imv** (preferred), or nsxiv, feh, swayimg
+From source (needs [Rust](https://rustup.rs/)):
 
 ```bash
 git clone <this-repo>
@@ -77,12 +79,3 @@ cargo test
 cargo run -- --root medialibrary init
 cargo run -- --root medialibrary
 ```
-
-## Layout
-
-- Library root — your albums (any folder)
-- `.album/catalog.sqlite` — generated index
-- `.album/thumbs/` — 256px JPEG thumbs
-- `src/` — Rust TUI (`hallward` crate)
-
-Do not commit `medialibrary/` or `.album/`.
