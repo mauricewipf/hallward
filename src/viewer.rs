@@ -7,12 +7,19 @@ use anyhow::{bail, Context, Result};
 
 use crate::media::{is_image, is_video};
 
+const OPEN_BIN: &str = "/usr/bin/open";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Viewer {
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Imv,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Nsxiv,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Feh,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Swayimg,
+    Preview,
 }
 
 impl Viewer {
@@ -22,6 +29,14 @@ impl Viewer {
             Viewer::Nsxiv => "nsxiv",
             Viewer::Feh => "feh",
             Viewer::Swayimg => "swayimg",
+            Viewer::Preview => "Preview",
+        }
+    }
+
+    fn spawn_name(self) -> &'static str {
+        match self {
+            Viewer::Preview => "open",
+            _ => self.bin(),
         }
     }
 }
@@ -42,9 +57,19 @@ impl VideoPlayer {
 }
 
 pub fn detect() -> Option<Viewer> {
-    [Viewer::Imv, Viewer::Nsxiv, Viewer::Feh, Viewer::Swayimg]
-        .into_iter()
-        .find(|&v| on_path(v.bin()))
+    #[cfg(target_os = "macos")]
+    {
+        if Path::new(OPEN_BIN).is_file() {
+            return Some(Viewer::Preview);
+        }
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        [Viewer::Imv, Viewer::Nsxiv, Viewer::Feh, Viewer::Swayimg]
+            .into_iter()
+            .find(|&v| on_path(v.bin()))
+    }
 }
 
 pub fn detect_video_player() -> Option<VideoPlayer> {
@@ -61,13 +86,18 @@ fn on_path(bin: &str) -> bool {
 
 /// Argument vector (including argv0) to open `files` starting at `start` (0-based).
 /// Swayimg has no start-at flag: always starts at the first file.
+/// Preview uses `/usr/bin/open` and puts the selected file first (no start-at flag).
 pub fn argv(viewer: Viewer, files: &[PathBuf], start: usize) -> Vec<OsString> {
+    if viewer == Viewer::Preview {
+        return preview_argv(files, start);
+    }
     let mut args = vec![OsString::from(viewer.bin())];
     if files.is_empty() {
         return args;
     }
     let start = start.min(files.len() - 1);
     match viewer {
+        Viewer::Preview => unreachable!(),
         Viewer::Imv => {
             args.push("-n".into());
             args.push(files[start].clone().into());
@@ -87,6 +117,26 @@ pub fn argv(viewer: Viewer, files: &[PathBuf], start: usize) -> Vec<OsString> {
             args.extend(files.iter().map(|p| p.clone().into()));
         }
     }
+    args
+}
+
+fn preview_argv(files: &[PathBuf], start: usize) -> Vec<OsString> {
+    if files.is_empty() {
+        return vec![OsString::from(OPEN_BIN)];
+    }
+    let start = start.min(files.len() - 1);
+    let mut args: Vec<OsString> = [OPEN_BIN, "-n", "-W", "-a", "Preview", "--"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    args.push(files[start].clone().into());
+    args.extend(
+        files
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != start)
+            .map(|(_, p)| p.clone().into()),
+    );
     args
 }
 
@@ -140,9 +190,12 @@ pub fn open(files: &[PathBuf], start: usize) -> Result<()> {
 
 fn open_images(files: &[PathBuf], start: usize) -> Result<()> {
     let Some(viewer) = detect() else {
+        #[cfg(target_os = "macos")]
+        bail!("no image viewer found (Preview requires /usr/bin/open)");
+        #[cfg(not(target_os = "macos"))]
         bail!("no image viewer found (tried imv, nsxiv, feh, swayimg)");
     };
-    spawn(&argv(viewer, files, start), viewer.bin())
+    spawn(&argv(viewer, files, start), viewer.spawn_name())
 }
 
 fn open_video(files: &[PathBuf], start: usize) -> Result<()> {
@@ -226,6 +279,31 @@ mod tests {
     fn swayimg_starts_at_first_no_workaround() {
         let a = os(&argv(Viewer::Swayimg, &files(), 2));
         assert_eq!(a, vec!["swayimg", "/lib/a.jpg", "/lib/b.jpg", "/lib/c.jpg"]);
+    }
+
+    #[test]
+    fn preview_starts_at_selected_path() {
+        let a = os(&argv(Viewer::Preview, &files(), 1));
+        assert_eq!(
+            a,
+            vec![
+                "/usr/bin/open",
+                "-n",
+                "-W",
+                "-a",
+                "Preview",
+                "--",
+                "/lib/b.jpg",
+                "/lib/a.jpg",
+                "/lib/c.jpg",
+            ]
+        );
+    }
+
+    #[test]
+    fn preview_empty_files_is_open_only() {
+        let a = os(&argv(Viewer::Preview, &[], 0));
+        assert_eq!(a, vec!["/usr/bin/open"]);
     }
 
     #[test]

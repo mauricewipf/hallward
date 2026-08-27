@@ -9,12 +9,11 @@ v1 indexes **still images** and **standalone videos** (`.mov` / `.mp4`). iPhone 
 - **Ghostty**, **Kitty** or another graphic-supporting terminal. Other terminals fall back to coarse unicode blocks.
 - `libheif` / `heif-convert` for HEIC thumbnails (Arch: `pacman -S libheif`)
 - **ffmpeg** (ships `ffprobe`) for video **thumbnails** and Live Photo detection — not a player
-- An image viewer: **imv** (preferred), or nsxiv, feh, swayimg
 - A video player: **mpv**
 
-**macOS:** video playback requires **mpv** (`brew install mpv`). FFmpeg’s `ffplay` is a terminal player: it tears down the TUI, dumps decoder logs to the shell, and is not an acceptable viewer. If the status pane says `video: ffplay` or `video: no player`, install mpv and restart Hallward until it shows `video: mpv`.
+**macOS:** still images open in built-in **Preview** (no extra install). Quit Preview (Cmd-Q) to return to Hallward, same as mpv. Video playback requires **mpv** (`brew install mpv`). FFmpeg’s `ffplay` is a terminal player: it tears down the TUI, dumps decoder logs to the shell, and is not an acceptable viewer. If the status pane says `video: ffplay` or `video: no player`, install mpv and restart Hallward until it shows `video: mpv`.
 
-**Linux / Omarchy:** **mpv** is preferred. `ffplay` is a last-resort fallback only.
+**Linux / Omarchy:** an image viewer: **imv** (preferred), or nsxiv, feh, swayimg. **mpv** is preferred for video; `ffplay` is a last-resort fallback only.
 
 The status pane shows `thumbs: kitty` when the terminal is drawing real image pixels, and `thumbs: halfblocks` when it fell back to coarse unicode blocks (looks pixelated). Multiplexers must pass Kitty graphics through to the host terminal:
 
@@ -74,7 +73,7 @@ hallward --root PATH   # library is PATH instead of cwd
 | letters / digits | Filter collection and album **names** (not filenames) |
 | Tab | Jump to the filtered tree |
 | Esc | Clear search and show the full tree |
-| Enter / Space | Open a same-type playlist: images in the image viewer (imv starts at the selected photo; swayimg starts at the first); videos in **mpv** |
+| Enter / Space | Open a same-type playlist: images in **Preview** on macOS (selected photo first; Cmd-Q to return) or imv / nsxiv / feh / swayimg on Linux; videos in **mpv** |
 | r | Re-scan files and refresh thumbnails (when search is closed) |
 | q | Quit (when search is closed) |
 
