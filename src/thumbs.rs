@@ -8,7 +8,7 @@ use image::{DynamicImage, ImageFormat};
 use sha2::{Digest, Sha256};
 
 use crate::library::ALBUM_DIR;
-use crate::media::{is_dng, is_heic};
+use crate::media::{is_dng, is_heic, is_video};
 use crate::meta;
 
 pub const THUMB_SIZE: u32 = 256;
@@ -68,6 +68,9 @@ fn is_square_thumb(path: &Path) -> bool {
 }
 
 fn load_image(path: &Path) -> Result<DynamicImage> {
+    if is_video(path) {
+        return load_video_frame(path);
+    }
     if is_heic(path) {
         return load_heic(path);
     }
@@ -75,6 +78,60 @@ fn load_image(path: &Path) -> Result<DynamicImage> {
         return load_dng(path);
     }
     Ok(image::open(path)?)
+}
+
+/// Argv (including argv0) to extract a single JPEG frame. `ss` is the seek in seconds.
+pub fn ffmpeg_frame_argv(path: &Path, out: &Path, ss: &str) -> Vec<std::ffi::OsString> {
+    vec![
+        "ffmpeg".into(),
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-y".into(),
+        "-ss".into(),
+        ss.into(),
+        "-i".into(),
+        path.as_os_str().to_os_string(),
+        "-vframes".into(),
+        "1".into(),
+        "-q:v".into(),
+        "2".into(),
+        out.as_os_str().to_os_string(),
+    ]
+}
+
+fn load_video_frame(path: &Path) -> Result<DynamicImage> {
+    let dir = tempfile::tempdir()?;
+    let out = dir.path().join("frame.jpg");
+    if extract_frame(path, &out, "1").is_ok() {
+        if let Ok(img) = image::open(&out) {
+            return Ok(img);
+        }
+    }
+    extract_frame(path, &out, "0").with_context(|| {
+        format!(
+            "run ffmpeg (install ffmpeg) to thumbnail {}",
+            path.display()
+        )
+    })?;
+    image::open(&out).with_context(|| format!("read ffmpeg frame for {}", path.display()))
+}
+
+fn extract_frame(path: &Path, out: &Path, ss: &str) -> Result<()> {
+    let args = ffmpeg_frame_argv(path, out, ss);
+    let status = Command::new(&args[0])
+        .args(&args[1..])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("run ffmpeg (install ffmpeg)")?;
+    if !status.success() {
+        anyhow::bail!("ffmpeg failed on {} (ss={ss})", path.display());
+    }
+    if !out.exists() {
+        anyhow::bail!("ffmpeg wrote no frame for {}", path.display());
+    }
+    Ok(())
 }
 
 fn load_heic(path: &Path) -> Result<DynamicImage> {
@@ -129,5 +186,20 @@ mod tests {
         let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(20, 40, Rgb([0, 255, 0])));
         let thumb = crop_square(img);
         assert_eq!((thumb.width(), thumb.height()), (THUMB_SIZE, THUMB_SIZE));
+    }
+
+    #[test]
+    fn ffmpeg_argv_seeks_then_extracts_one_jpeg() {
+        let args = ffmpeg_frame_argv(Path::new("/lib/clip.mov"), Path::new("/tmp/frame.jpg"), "1");
+        let s: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(s[0], "ffmpeg");
+        assert!(s.contains(&"-ss".into()));
+        assert!(!s.contains(&"-noautorotate".to_string()));
+        assert_eq!(s[s.iter().position(|x| x == "-ss").unwrap() + 1], "1");
+        assert!(s.contains(&"-vframes".into()));
+        assert_eq!(s.last().unwrap(), "/tmp/frame.jpg");
     }
 }

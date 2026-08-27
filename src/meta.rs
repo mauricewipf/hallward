@@ -17,6 +17,42 @@ pub fn read_meta(path: &Path) -> PhotoMeta {
     read_meta_inner(path).unwrap_or_default()
 }
 
+/// Sort key for videos that lack EXIF: filesystem mtime as `YYYY:MM:DD HH:MM:SS` (UTC).
+pub fn video_meta_from_mtime(mtime: i64) -> PhotoMeta {
+    PhotoMeta {
+        captured_at: Some(unix_to_exif_datetime(mtime)),
+        camera: None,
+        width: None,
+        height: None,
+    }
+}
+
+/// Civil UTC date from a Unix timestamp. Howard Hinnant's days-from-civil inverse.
+fn unix_to_exif_datetime(secs: i64) -> String {
+    let secs = secs.max(0) as u64;
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = rem / 3_600;
+    let min = (rem % 3_600) / 60;
+    let sec = rem % 60;
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}:{m:02}:{d:02} {hour:02}:{min:02}:{sec:02}")
+}
+
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32, d as u32)
+}
+
 fn read_meta_inner(path: &Path) -> Result<PhotoMeta> {
     let mut file = File::open(path)?;
     if let Ok(exif) = Reader::new().read_from_container(&mut BufReader::new(&mut file)) {
@@ -103,5 +139,13 @@ mod tests {
         let jpeg = embedded_jpeg(&data).unwrap();
         assert_eq!(jpeg.first(), Some(&0xFF));
         assert_eq!(jpeg.last(), Some(&0xD9));
+    }
+
+    #[test]
+    fn video_mtime_formats_exif_datetime() {
+        let meta = video_meta_from_mtime(0);
+        assert_eq!(meta.captured_at.as_deref(), Some("1970:01:01 00:00:00"));
+        let meta = video_meta_from_mtime(1_704_067_200); // 2024-01-01 00:00:00 UTC
+        assert_eq!(meta.captured_at.as_deref(), Some("2024:01:01 00:00:00"));
     }
 }

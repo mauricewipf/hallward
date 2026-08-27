@@ -1,11 +1,26 @@
+use std::env;
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 pub const IMAGE_EXTS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "gif", "heic", "heif", "tif", "tiff", "dng", "bmp",
 ];
 
+pub const VIDEO_EXTS: &[&str] = &["mov", "mp4"];
+
+const LIVE_STILL_EXT_VARIANTS: &[&str] =
+    &["heic", "HEIC", "heif", "HEIF", "jpg", "JPG", "jpeg", "JPEG"];
+
 pub fn is_image(path: &Path) -> bool {
     ext_in(path, IMAGE_EXTS)
+}
+
+pub fn is_video(path: &Path) -> bool {
+    ext_in(path, VIDEO_EXTS)
+}
+
+pub fn is_media_ext(path: &Path) -> bool {
+    is_image(path) || is_video(path)
 }
 
 pub fn is_heic(path: &Path) -> bool {
@@ -27,9 +42,82 @@ pub fn is_hidden(name: &str) -> bool {
     name.starts_with('.')
 }
 
+pub fn bin_on_path(bin: &str) -> bool {
+    env::var_os("PATH")
+        .map(|paths| env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+        .unwrap_or(false)
+}
+
+/// Argv (including argv0) to read Apple's Live Photo content identifier from a video.
+pub fn ffprobe_live_photo_argv(path: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        "ffprobe".into(),
+        "-v".into(),
+        "error".into(),
+        "-show_entries".into(),
+        "format_tags=com.apple.quicktime.content.identifier".into(),
+        "-of".into(),
+        "default=nk=1:nw=1".into(),
+        path.as_os_str().to_os_string(),
+    ]
+}
+
+/// True when `path` is a Live Photo motion component and should not be indexed.
+///
+/// Prefers Apple's `com.apple.quicktime.content.identifier` via ffprobe. On
+/// missing ffprobe or probe error, falls back to a same-stem still sibling.
+pub fn is_live_photo_companion(path: &Path, have_ffprobe: bool) -> bool {
+    if !is_video(path) {
+        return false;
+    }
+    if have_ffprobe {
+        match probe_content_identifier(path) {
+            Ok(Some(_)) => return true,
+            Ok(None) => return false,
+            Err(_) => {}
+        }
+    }
+    live_photo_companion_by_stem(path)
+}
+
+fn probe_content_identifier(path: &Path) -> anyhow::Result<Option<String>> {
+    let args = ffprobe_live_photo_argv(path);
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!("ffprobe failed on {}", path.display());
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if id.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(id))
+    }
+}
+
+/// Same-stem still sibling (`<stem>.{heic,heif,jpg,jpeg}`), case variants on the extension.
+pub fn live_photo_companion_by_stem(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if stem.is_empty() {
+        return false;
+    }
+    LIVE_STILL_EXT_VARIANTS
+        .iter()
+        .any(|ext| parent.join(format!("{stem}.{ext}")).exists())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::path::PathBuf;
 
     #[test]
@@ -39,5 +127,78 @@ mod tests {
         assert!(is_dng(&PathBuf::from("raw.DNG")));
         assert!(!is_image(&PathBuf::from("clip.MOV")));
         assert!(!is_image(&PathBuf::from("note.xmp")));
+    }
+
+    #[test]
+    fn detects_videos_by_extension() {
+        assert!(is_video(&PathBuf::from("IMG_1234.MOV")));
+        assert!(is_video(&PathBuf::from("clip.mp4")));
+        assert!(!is_video(&PathBuf::from("note.txt")));
+        assert!(!is_video(&PathBuf::from("a.HEIC")));
+    }
+
+    #[test]
+    fn media_ext_accepts_stills_and_videos() {
+        assert!(is_media_ext(&PathBuf::from("a.HEIC")));
+        assert!(is_media_ext(&PathBuf::from("a.jpg")));
+        assert!(is_media_ext(&PathBuf::from("clip.MOV")));
+        assert!(is_media_ext(&PathBuf::from("clip.mp4")));
+        assert!(!is_media_ext(&PathBuf::from("note.xmp")));
+        assert!(!is_media_ext(&PathBuf::from("note.txt")));
+    }
+
+    #[test]
+    fn ffprobe_argv_requests_content_identifier() {
+        let args = ffprobe_live_photo_argv(Path::new("/lib/IMG_1.MOV"));
+        let s: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(s[0], "ffprobe");
+        assert!(s.contains(&"format_tags=com.apple.quicktime.content.identifier".into()));
+        assert_eq!(s.last().unwrap(), "/lib/IMG_1.MOV");
+    }
+
+    #[test]
+    fn stem_fallback_pairs_same_stem_still() {
+        let dir = tempfile::tempdir().unwrap();
+        File::create(dir.path().join("IMG_1234.HEIC")).unwrap();
+        File::create(dir.path().join("IMG_1234.MOV")).unwrap();
+        assert!(live_photo_companion_by_stem(
+            &dir.path().join("IMG_1234.MOV")
+        ));
+        assert!(is_live_photo_companion(
+            &dir.path().join("IMG_1234.MOV"),
+            false
+        ));
+    }
+
+    #[test]
+    fn stem_fallback_ignores_different_stems() {
+        let dir = tempfile::tempdir().unwrap();
+        File::create(dir.path().join("photo.jpg")).unwrap();
+        File::create(dir.path().join("other.MOV")).unwrap();
+        assert!(!live_photo_companion_by_stem(&dir.path().join("other.MOV")));
+        assert!(!is_live_photo_companion(
+            &dir.path().join("other.MOV"),
+            false
+        ));
+    }
+
+    #[test]
+    fn stem_fallback_standalone_video_is_not_companion() {
+        let dir = tempfile::tempdir().unwrap();
+        File::create(dir.path().join("clip.MOV")).unwrap();
+        assert!(!live_photo_companion_by_stem(&dir.path().join("clip.MOV")));
+    }
+
+    #[test]
+    fn stem_fallback_extension_case_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        File::create(dir.path().join("img_1234.heic")).unwrap();
+        File::create(dir.path().join("img_1234.MOV")).unwrap();
+        assert!(live_photo_companion_by_stem(
+            &dir.path().join("img_1234.MOV")
+        ));
     }
 }

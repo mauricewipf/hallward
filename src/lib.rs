@@ -41,21 +41,12 @@ pub fn run() -> Result<()> {
     match cli.cmd {
         Some(Cmd::Init) => {
             let stats = index::init_library(&start)?;
-            println!(
-                "initialized {} (indexed {}, skipped {}, removed {})",
-                start.display(),
-                stats.total,
-                stats.skipped,
-                stats.removed
-            );
+            println!("initialized {} ({})", start.display(), stats.summary());
         }
         Some(Cmd::Index) => {
             let root = library::find_library_root(&start).unwrap_or(start);
             let stats = index::index_library(&root)?;
-            println!(
-                "indexed {} files (updated {}, skipped {}, removed {})",
-                stats.total, stats.added_or_updated, stats.skipped, stats.removed
-            );
+            println!("{}", stats.summary());
         }
         None => {
             let root = if cli.root.is_some() {
@@ -72,10 +63,7 @@ pub fn run() -> Result<()> {
                     anyhow::bail!("not a library (no .album/). Run `hallward init` first.");
                 }
                 let stats = index::init_library(&root)?;
-                eprintln!(
-                    "indexed {} photos ({} updated, {} skipped)",
-                    stats.total, stats.added_or_updated, stats.skipped
-                );
+                eprintln!("{}", stats.summary());
             }
             tui::run(root)?;
         }

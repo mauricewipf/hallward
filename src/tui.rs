@@ -520,10 +520,7 @@ fn reindex(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> 
     terminal.draw(|f| draw(f, app))?;
     match index::index_library(&app.root) {
         Ok(stats) => {
-            app.status = format!(
-                "indexed {} files (updated {}, skipped {}, removed {})",
-                stats.total, stats.added_or_updated, stats.skipped, stats.removed
-            );
+            app.status = stats.summary();
         }
         Err(e) => app.status = format!("index failed: {e:#}"),
     }
@@ -859,8 +856,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let viewer_name = viewer::detect()
         .map(|v| v.bin().to_string())
         .unwrap_or_else(|| "no viewer".into());
+    let video_name = viewer::detect_video_player()
+        .map(|v| v.bin().to_string())
+        .unwrap_or_else(|| "no player".into());
     let thumbs = protocol_name(app.picker.as_ref());
-    let text = format!("{}\nviewer: {viewer_name} · thumbs: {thumbs}", app.status);
+    let text = format!(
+        "{}\nviewer: {viewer_name} · video: {video_name} · thumbs: {thumbs}",
+        app.status
+    );
     frame.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: true })

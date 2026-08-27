@@ -2,13 +2,34 @@
 
 Terminal photo library: miller-style folders, a thumbnail grid for albums, and an **external** image viewer. Photos stay ordinary files on disk. Hallward only adds a `.album/` directory (SQLite catalog + JPEG thumbs).
 
-v1 indexes **still images** only. Videos (including Live Photo `.MOV` companions) stay on disk and are ignored.
+v1 indexes **still images** and **standalone videos** (`.mov` / `.mp4`). iPhone Live Photo motion clips are detected via Apple's `com.apple.quicktime.content.identifier` metadata and ignored — only the HEIC still is cataloged.
 
 ## Prerequisites
 
 - **Ghostty**, **Kitty** or another graphic-supporting terminal. Other terminals fall back to coarse unicode blocks.
 - `libheif` / `heif-convert` for HEIC thumbnails (Arch: `pacman -S libheif`)
+- **ffmpeg** (ships `ffprobe`) for video thumbnails and Live Photo detection
 - An image viewer: **imv** (preferred), or nsxiv, feh, swayimg
+- A video player: **mpv** (preferred), or ffplay
+
+The status pane shows `thumbs: kitty` when the terminal is drawing real image pixels, and `thumbs: halfblocks` when it fell back to coarse unicode blocks (looks pixelated). Multiplexers must pass Kitty graphics through to the host terminal:
+
+**tmux** (3.3+), in `~/.tmux.conf`:
+
+```tmux
+set -g allow-passthrough on
+```
+
+Then `tmux source-file ~/.tmux.conf` (or restart tmux). Hallward already wraps Kitty sequences in tmux’s DCS envelope when it detects tmux; without `allow-passthrough`, tmux strips them.
+
+**herdr**, in `~/.config/herdr/config.toml`:
+
+```toml
+[experimental]
+kitty_graphics = true
+```
+
+Reload config (`prefix`+`shift+r`), detach, and reattach. For `herdr --remote`, set this on **both** the local client and the remote server, then restart the remote (`herdr server stop` and start again). herdr does not use tmux passthrough; this flag is the equivalent.
 
 ## Use
 
@@ -18,7 +39,7 @@ Point Hallward at a folder of albums (collections are folders that only contain 
 ~/Pictures/Library/
   .album/               # generated on init (catalog + thumbs)
   2025/                 # collection
-    Rome/               # album (images)
+    Rome/               # album (images and/or standalone videos)
   Samples/              # album
 ```
 
@@ -49,7 +70,7 @@ hallward --root PATH   # library is PATH instead of cwd
 | letters / digits | Filter collection and album **names** (not filenames) |
 | Tab | Jump to the filtered tree |
 | Esc | Clear search and show the full tree |
-| Enter | Open the **whole album** in the external viewer (imv starts at the selected photo; swayimg starts at the first) |
+| Enter | Open a same-type playlist: images in the image viewer (imv starts at the selected photo; swayimg starts at the first); videos in **mpv** (or the selected file in ffplay) |
 | r | Re-scan files and refresh thumbnails (when search is closed) |
 | q | Quit (when search is closed) |
 
@@ -68,7 +89,7 @@ chmod +x hallward
 # move onto PATH, e.g. mkdir -p ~/.local/bin && mv hallward ~/.local/bin/
 ```
 
-The macOS binary is unsigned; if Gatekeeper blocks it, allow it in System Settings → Privacy & Security. HEIC thumbnails still need `libheif` / `heif-convert` (see Prerequisites).
+The macOS binary is unsigned; if Gatekeeper blocks it, allow it in System Settings → Privacy & Security. HEIC thumbnails still need `libheif` / `heif-convert`; video thumbnails need `ffmpeg` (see Prerequisites).
 
 From source (needs [Rust](https://rustup.rs/)):
 

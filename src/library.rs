@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::media::{is_hidden, is_image};
+use crate::media::{is_hidden, is_media_ext};
 
 pub const ALBUM_DIR: &str = ".album";
 
@@ -54,7 +54,7 @@ pub fn has_album_dir(root: &Path) -> bool {
     root.join(ALBUM_DIR).is_dir()
 }
 
-/// Scan the library folder tree. Direct image files ⇒ album (child dirs ignored).
+/// Scan the library folder tree. Direct media files ⇒ album (child dirs ignored).
 /// Only subfolders ⇒ collection.
 pub fn scan_tree(root: &Path) -> Result<Folder> {
     scan_dir(root, PathBuf::new(), String::new()).context("scan library tree")
@@ -62,7 +62,7 @@ pub fn scan_tree(root: &Path) -> Result<Folder> {
 
 fn scan_dir(abs: &Path, relpath: PathBuf, name: String) -> Result<Folder> {
     let mut dirs = Vec::new();
-    let mut has_images = false;
+    let mut has_media = false;
 
     let rd = match fs::read_dir(abs) {
         Ok(rd) => rd,
@@ -87,12 +87,12 @@ fn scan_dir(abs: &Path, relpath: PathBuf, name: String) -> Result<Folder> {
         let ft = entry.file_type()?;
         if ft.is_dir() {
             dirs.push((fname.into_owned(), path));
-        } else if ft.is_file() && is_image(&path) {
-            has_images = true;
+        } else if ft.is_file() && is_media_ext(&path) {
+            has_media = true;
         }
     }
 
-    if has_images {
+    if has_media {
         return Ok(Folder {
             name,
             relpath,
@@ -147,6 +147,19 @@ mod tests {
         let samples = tree.children.iter().find(|c| c.name == "Samples").unwrap();
         assert_eq!(samples.kind, Kind::Album);
         assert!(samples.children.is_empty());
+    }
+
+    #[test]
+    fn video_only_folder_is_album() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("Clips")).unwrap();
+        File::create(root.join("Clips/clip.mov")).unwrap();
+
+        let tree = scan_tree(root).unwrap();
+        let clips = tree.children.iter().find(|c| c.name == "Clips").unwrap();
+        assert_eq!(clips.kind, Kind::Album);
+        assert!(clips.children.is_empty());
     }
 
     #[test]
