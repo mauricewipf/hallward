@@ -33,7 +33,7 @@ use crate::viewer;
 /// Inner image height in rows. Width is derived from the terminal font so the photo is square.
 const CELL_INNER_H: u16 = 6;
 const STATUS_HINT: &str =
-    "arrows move · click to select · double-click opens · type to search · Enter opens viewer · r reindex · q quit";
+    "arrows move · click to select · double-click opens · type to search · Enter/Space opens viewer · r reindex · q quit";
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -307,6 +307,7 @@ fn handle_key(
                 app.focus = Focus::Search;
             }
         }
+        KeyCode::Enter | KeyCode::Char(' ') => open_viewer(app, terminal)?,
         KeyCode::Char(c) if !c.is_control() => {
             app.query.push(c);
             app.apply_query();
@@ -316,7 +317,6 @@ fn handle_key(
         KeyCode::Down => move_down(app),
         KeyCode::Left => move_left(app),
         KeyCode::Right => move_right(app),
-        KeyCode::Enter => open_viewer(app, terminal)?,
         _ => {}
     }
     Ok(false)

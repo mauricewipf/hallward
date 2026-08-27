@@ -70,7 +70,7 @@ hallward --root PATH   # library is PATH instead of cwd
 | letters / digits | Filter collection and album **names** (not filenames) |
 | Tab | Jump to the filtered tree |
 | Esc | Clear search and show the full tree |
-| Enter | Open a same-type playlist: images in the image viewer (imv starts at the selected photo; swayimg starts at the first); videos in **mpv** (or the selected file in ffplay) |
+| Enter / Space | Open a same-type playlist: images in the image viewer (imv starts at the selected photo; swayimg starts at the first); videos in **mpv** (or the selected file in ffplay) |
 | r | Re-scan files and refresh thumbnails (when search is closed) |
 | q | Quit (when search is closed) |
 
