@@ -70,6 +70,7 @@ jobs:
           body: |
             HEIC thumbnails still need system `libheif` / `heif-convert`.
             Video thumbnails need system `ffmpeg` (includes `ffprobe` for Live Photo detection).
-            Playback uses **mpv** (preferred) or ffplay for videos; imv / nsxiv / feh / swayimg for stills.
+            Video playback uses **mpv** (required on macOS: `brew install mpv`). Do not use ffplay.
+            Stills use imv / nsxiv / feh / swayimg.
             macOS binaries are unsigned (allow the app in System Settings → Privacy & Security if Gatekeeper blocks it).
             The Linux binary is glibc, built on Ubuntu 24.04.

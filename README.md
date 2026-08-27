@@ -8,9 +8,13 @@ v1 indexes **still images** and **standalone videos** (`.mov` / `.mp4`). iPhone 
 
 - **Ghostty**, **Kitty** or another graphic-supporting terminal. Other terminals fall back to coarse unicode blocks.
 - `libheif` / `heif-convert` for HEIC thumbnails (Arch: `pacman -S libheif`)
-- **ffmpeg** (ships `ffprobe`) for video thumbnails and Live Photo detection
+- **ffmpeg** (ships `ffprobe`) for video **thumbnails** and Live Photo detection — not a player
 - An image viewer: **imv** (preferred), or nsxiv, feh, swayimg
-- A video player: **mpv** (preferred), or ffplay
+- A video player: **mpv**
+
+**macOS:** video playback requires **mpv** (`brew install mpv`). FFmpeg’s `ffplay` is a terminal player: it tears down the TUI, dumps decoder logs to the shell, and is not an acceptable viewer. If the status pane says `video: ffplay` or `video: no player`, install mpv and restart Hallward until it shows `video: mpv`.
+
+**Linux / Omarchy:** **mpv** is preferred. `ffplay` is a last-resort fallback only.
 
 The status pane shows `thumbs: kitty` when the terminal is drawing real image pixels, and `thumbs: halfblocks` when it fell back to coarse unicode blocks (looks pixelated). Multiplexers must pass Kitty graphics through to the host terminal:
 
@@ -70,7 +74,7 @@ hallward --root PATH   # library is PATH instead of cwd
 | letters / digits | Filter collection and album **names** (not filenames) |
 | Tab | Jump to the filtered tree |
 | Esc | Clear search and show the full tree |
-| Enter / Space | Open a same-type playlist: images in the image viewer (imv starts at the selected photo; swayimg starts at the first); videos in **mpv** (or the selected file in ffplay) |
+| Enter / Space | Open a same-type playlist: images in the image viewer (imv starts at the selected photo; swayimg starts at the first); videos in **mpv** |
 | r | Re-scan files and refresh thumbnails (when search is closed) |
 | q | Quit (when search is closed) |
 
@@ -89,7 +93,7 @@ chmod +x hallward
 # move onto PATH, e.g. mkdir -p ~/.local/bin && mv hallward ~/.local/bin/
 ```
 
-The macOS binary is unsigned; if Gatekeeper blocks it, allow it in System Settings → Privacy & Security. HEIC thumbnails still need `libheif` / `heif-convert`; video thumbnails need `ffmpeg` (see Prerequisites).
+The macOS binary is unsigned; if Gatekeeper blocks it, allow it in System Settings → Privacy & Security. HEIC thumbnails still need `libheif` / `heif-convert`; video thumbnails need `ffmpeg`; video **playback** needs **mpv** (`brew install mpv`). Do not use `ffplay` (see Prerequisites).
 
 From source (needs [Rust](https://rustup.rs/)):
 

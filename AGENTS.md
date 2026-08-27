@@ -5,7 +5,7 @@ This is a **Rust TUI photo library** (`hallward`). Photos stay ordinary files on
 ## Do
 
 - Browse with `cargo run -- --root medialibrary` (after `hallward init` if `.album/` is missing).
-- Index with `cargo run -- --root medialibrary init` or `index`. Video thumbs need `ffmpeg` on PATH; Live Photo detection uses `ffprobe`.
+- Index with `cargo run -- --root medialibrary init` or `index`. Video thumbs need `ffmpeg` on PATH; Live Photo detection uses `ffprobe`. On macOS, video playback needs **mpv** (`brew install mpv`); do not treat `ffplay` as the viewer.
 - Keep media as normal files under the library root. Never commit `medialibrary/` or `.album/`.
 - Ask before moving, renaming, or deleting media.
 - Shipping a version: use the `release` skill (`.cursor/skills/release/`). Do not tag by hand.
