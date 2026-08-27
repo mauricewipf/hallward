@@ -81,6 +81,24 @@ EXIF for the highlighted still is in the bottom-left pane.
 
 ## Install
 
+### Homebrew (macOS Apple Silicon, Linux x86_64)
+
+```bash
+brew install mauricewipf/hallward/hallward
+```
+
+Homebrew auto-taps on first install. You may need to trust the formula once:
+
+```bash
+brew trust --formula mauricewipf/hallward/hallward
+```
+
+This installs **hallward** plus `libheif`, `ffmpeg`, and `mpv`. On macOS, stills open in **Preview** (built in). On Linux, install a stills viewer separately (imv, nsxiv, feh, or swayimg). Sharp thumbnails still need Ghostty or Kitty (`brew install --cask ghostty`).
+
+Tap: [mauricewipf/homebrew-hallward](https://github.com/mauricewipf/homebrew-hallward).
+
+### GitHub Releases
+
 Download a binary from [Releases](https://github.com/mauricewipf/hallward/releases):
 
 - macOS Apple Silicon: `hallward-aarch64-apple-darwin.tar.gz`

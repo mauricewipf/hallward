@@ -74,3 +74,46 @@ jobs:
             Stills use **Preview** on macOS; imv / nsxiv / feh / swayimg on Linux.
             macOS binaries are unsigned (allow the app in System Settings → Privacy & Security if Gatekeeper blocks it).
             The Linux binary is glibc, built on Ubuntu 24.04.
+            Homebrew: `brew install mauricewipf/hallward/hallward`
+
+  homebrew:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Bump homebrew-hallward tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is not set on mauricewipf/hallward (fine-grained PAT with Contents write on homebrew-hallward)."
+            exit 1
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          test -n "$VERSION"
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern '*.sha256'
+          MAC_SHA=$(awk '{print $1}' hallward-aarch64-apple-darwin.tar.gz.sha256)
+          LINUX_SHA=$(awk '{print $1}' hallward-x86_64-unknown-linux-gnu.tar.gz.sha256)
+          TAP_DIR=$(mktemp -d)
+          git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/mauricewipf/homebrew-hallward.git" "$TAP_DIR"
+          FORMULA="$TAP_DIR/Formula/hallward.rb"
+          sed -i "s/^  version \".*\"/  version \"${VERSION}\"/" "$FORMULA"
+          sed -i "s|/releases/download/v[0-9.]*/|/releases/download/v${VERSION}/|g" "$FORMULA"
+          sed -i "/aarch64-apple-darwin.tar.gz\"/{n;s/sha256 \".*\"/sha256 \"${MAC_SHA}\"/;}" "$FORMULA"
+          sed -i "/x86_64-unknown-linux-gnu.tar.gz\"/{n;s/sha256 \".*\"/sha256 \"${LINUX_SHA}\"/;}" "$FORMULA"
+          cd "$TAP_DIR"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/hallward.rb
+          if git diff --staged --quiet; then
+            echo "Formula already at ${VERSION}; nothing to commit."
+            exit 0
+          fi
+          git commit -m "$(cat <<EOF
+hallward ${VERSION}
+
+Created by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+EOF
+)"
+          git push origin HEAD

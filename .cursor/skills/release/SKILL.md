@@ -60,4 +60,9 @@ git push origin "v$new_version"
 ```
 
 If push is denied, stop and say so. Do not pretend a Release exists.
-9. Print `https://github.com/mauricewipf/hallward/actions` and `https://github.com/mauricewipf/hallward/releases/tag/v$new_version`.
+9. Print:
+   - `https://github.com/mauricewipf/hallward/actions`
+   - `https://github.com/mauricewipf/hallward/releases/tag/v$new_version`
+   - `https://github.com/mauricewipf/homebrew-hallward` (tap; CI bumps the formula when `HOMEBREW_TAP_TOKEN` is set on the hallward repo)
+
+Do **not** edit `Formula/hallward.rb` by hand on release; CI updates version, URLs, and sha256. If the homebrew job failed, use the manual bump steps in the tap README.
