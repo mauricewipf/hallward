@@ -4,6 +4,8 @@ Terminal photo library: miller-style folders, a thumbnail grid for albums, and a
 
 v1 indexes **still images** and **standalone videos** (`.mov` / `.mp4`). iPhone Live Photo motion clips are detected via Apple's `com.apple.quicktime.content.identifier` metadata and ignored — only the HEIC still is cataloged.
 
+![Hallward TUI screenshot](screenshot.png)
+
 ## Prerequisites
 
 - **Ghostty**, **Kitty** or another graphic-supporting terminal. Other terminals fall back to coarse unicode blocks.
@@ -19,7 +21,7 @@ The status pane shows `thumbs: kitty` when the terminal is drawing real image pi
 
 **tmux** (3.3+), in `~/.tmux.conf`:
 
-```tmux
+```
 set -g allow-passthrough on
 ```
 
@@ -110,9 +112,11 @@ chmod +x hallward
 # move onto PATH, e.g. mkdir -p ~/.local/bin && mv hallward ~/.local/bin/
 ```
 
-The macOS binary is unsigned; if Gatekeeper blocks it, allow it in System Settings → Privacy & Security. HEIC thumbnails still need `libheif` / `heif-convert`; video thumbnails need `ffmpeg`; video **playback** needs **mpv** (`brew install mpv`). Do not use `ffplay` (see Prerequisites).
+The macOS binary is unsigned; if Gatekeeper blocks it, allow it in System Settings → Privacy & Security. HEIC thumbnails still need `libheif` / `heif-convert`; video thumbnails need `ffmpeg`; video **playback** needs **mpv** (`brew install mpv`). Do not use `ffplay` (see [Prerequisites](#prerequisites)).
 
-From source (needs [Rust](https://rustup.rs/)):
+### From source
+
+Needs [Rust](https://rustup.rs/):
 
 ```bash
 git clone https://github.com/mauricewipf/hallward.git
