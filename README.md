@@ -4,7 +4,7 @@ Terminal photo library: miller-style folders, a thumbnail grid for albums, and a
 
 v1 indexes **still images** and **standalone videos** (`.mov` / `.mp4`). iPhone Live Photo motion clips are detected via Apple's `com.apple.quicktime.content.identifier` metadata and ignored — only the HEIC still is cataloged.
 
-![Hallward TUI screenshot](screenshot.png)
+![Hallward TUI screenshot](screenshot-2026-08-28_17-09-57.png)
 
 ## Prerequisites
 
