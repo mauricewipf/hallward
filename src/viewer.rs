@@ -1,11 +1,12 @@
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 
-use crate::media::{is_image, is_video};
+use crate::media::{is_heic, is_image, is_video};
 
 const OPEN_BIN: &str = "/usr/bin/open";
 
@@ -195,7 +196,39 @@ fn open_images(files: &[PathBuf], start: usize) -> Result<()> {
         #[cfg(not(target_os = "macos"))]
         bail!("no image viewer found (tried imv, nsxiv, feh, swayimg)");
     };
+    if viewer == Viewer::Imv && files.iter().any(|path| is_heic(path)) {
+        let (_temp, files) = prepare_heif_for_imv(files)?;
+        return spawn(&argv(viewer, &files, start), viewer.spawn_name());
+    }
     spawn(&argv(viewer, files, start), viewer.spawn_name())
+}
+
+fn prepare_heif_for_imv(files: &[PathBuf]) -> Result<(tempfile::TempDir, Vec<PathBuf>)> {
+    let temp = tempfile::tempdir().context("create temporary HEIF viewer directory")?;
+    let dir = temp.path();
+    let prepared = files
+        .par_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            if !is_heic(path) {
+                return Ok(path.clone());
+            }
+            let output = dir.join(format!("{index:06}.jpg"));
+            let status = Command::new("heif-convert")
+                .args(["--quiet", "--quality", "100"])
+                .arg(path)
+                .arg(&output)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .with_context(|| format!("convert {} for imv", path.display()))?;
+            if !status.success() {
+                bail!("heif-convert failed on {}", path.display());
+            }
+            Ok(output)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((temp, prepared))
 }
 
 fn open_video(files: &[PathBuf], start: usize) -> Result<()> {
@@ -353,5 +386,12 @@ mod tests {
             ]
         );
         assert_eq!(start, 0);
+    }
+
+    #[test]
+    fn imv_preparation_leaves_non_heif_files_in_place() {
+        let input = files();
+        let (_temp, prepared) = prepare_heif_for_imv(&input).unwrap();
+        assert_eq!(prepared, input);
     }
 }
