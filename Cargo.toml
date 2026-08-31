@@ -9,9 +9,11 @@ repository = "https://github.com/mauricewipf/hallward"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
 crossterm = "0.28"
 fuzzy-matcher = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "tiff"] }
+indicatif = "0.17"
 kamadak-exif = "0.6"
 ratatui = "0.29"
 ratatui-image = "8.0.2"

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -25,13 +26,26 @@ pub fn open(root: &Path, create: bool) -> Result<Connection> {
         std::fs::create_dir_all(&album).with_context(|| format!("create {}", album.display()))?;
         std::fs::create_dir_all(album.join("thumbs"))?;
     }
-    if !create && !db.exists() {
-        anyhow::bail!("no catalog at {} — run `hallward init`", db.display());
+    let empty_catalog = db.metadata().is_ok_and(|meta| meta.len() == 0);
+    if !create && (!db.exists() || empty_catalog) {
+        anyhow::bail!(
+            "no usable catalog at {} — run `hallward init`",
+            db.display()
+        );
+    }
+    // A previous failed initialization can leave a zero-byte database. Remove
+    // it before SQLite opens it: SMB/CIFS servers may reject the lock SQLite
+    // needs to initialize an existing empty file.
+    if create && empty_catalog {
+        std::fs::remove_file(&db).with_context(|| format!("remove empty {}", db.display()))?;
     }
     let conn = Connection::open(&db).with_context(|| format!("open {}", db.display()))?;
+    // Use SQLite's default rollback journal rather than WAL. WAL relies on
+    // shared-memory locking and is unreliable on SMB/CIFS mounts. The timeout
+    // handles a short-lived lock from another Hallward process.
+    conn.busy_timeout(Duration::from_secs(5))?;
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA foreign_keys=ON;
+        "PRAGMA foreign_keys=ON;
          PRAGMA synchronous=NORMAL;",
     )?;
     if create {
@@ -65,49 +79,54 @@ pub fn get_mtime_size(conn: &Connection, relpath: &str) -> Result<Option<(i64, i
     Ok(row)
 }
 
-pub fn upsert(conn: &Connection, photo: &Photo) -> Result<()> {
-    conn.execute(
-        "INSERT INTO photos (relpath, album, filename, mtime, size, captured_at, camera, width, height)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-         ON CONFLICT(relpath) DO UPDATE SET
-            album=excluded.album,
-            filename=excluded.filename,
-            mtime=excluded.mtime,
-            size=excluded.size,
-            captured_at=excluded.captured_at,
-            camera=excluded.camera,
-            width=excluded.width,
-            height=excluded.height",
-        params![
-            photo.relpath,
-            photo.album,
-            photo.filename,
-            photo.mtime,
-            photo.size,
-            photo.captured_at,
-            photo.camera,
-            photo.width,
-            photo.height,
-        ],
-    )?;
-    Ok(())
-}
-
-pub fn delete_missing(conn: &Connection, keep: &[String]) -> Result<usize> {
+/// Atomically apply all catalog mutations after thumbnail generation.
+pub fn apply_index_changes(
+    conn: &mut Connection,
+    keep: &[String],
+    photos: &[Photo],
+) -> Result<usize> {
+    let tx = conn.transaction()?;
     let existing: Vec<String> = {
-        let mut stmt = conn.prepare("SELECT relpath FROM photos")?;
+        let mut stmt = tx.prepare("SELECT relpath FROM photos")?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     let keep: std::collections::HashSet<&str> = keep.iter().map(String::as_str).collect();
-    let mut n = 0;
+    let mut removed = 0;
     for rel in existing {
         if !keep.contains(rel.as_str()) {
-            conn.execute("DELETE FROM photos WHERE relpath = ?1", [&rel])?;
-            n += 1;
+            tx.execute("DELETE FROM photos WHERE relpath = ?1", [&rel])?;
+            removed += 1;
         }
     }
-    Ok(n)
+    for photo in photos {
+        tx.execute(
+            "INSERT INTO photos (relpath, album, filename, mtime, size, captured_at, camera, width, height)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(relpath) DO UPDATE SET
+                album=excluded.album,
+                filename=excluded.filename,
+                mtime=excluded.mtime,
+                size=excluded.size,
+                captured_at=excluded.captured_at,
+                camera=excluded.camera,
+                width=excluded.width,
+                height=excluded.height",
+            params![
+                photo.relpath,
+                photo.album,
+                photo.filename,
+                photo.mtime,
+                photo.size,
+                photo.captured_at,
+                photo.camera,
+                photo.width,
+                photo.height,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(removed)
 }
 
 pub fn photos_in_album(conn: &Connection, album: &str) -> Result<Vec<Photo>> {
@@ -177,4 +196,23 @@ pub fn photo_from_file(
 #[allow(dead_code)]
 pub fn abs_path(root: &Path, relpath: &str) -> PathBuf {
     root.join(relpath)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_catalog_requires_initialization_and_init_recovers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (album, db) = album_paths(dir.path());
+        std::fs::create_dir_all(album).unwrap();
+        std::fs::File::create(&db).unwrap();
+
+        let err = open(dir.path(), false).unwrap_err();
+        assert!(err.to_string().contains("no usable catalog"));
+
+        drop(open(dir.path(), true).unwrap());
+        assert!(db.metadata().unwrap().len() > 0);
+    }
 }

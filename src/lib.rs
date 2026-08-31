@@ -40,12 +40,12 @@ pub fn run() -> Result<()> {
 
     match cli.cmd {
         Some(Cmd::Init) => {
-            let stats = index::init_library(&start)?;
+            let stats = init_with_progress(&start)?;
             println!("initialized {} ({})", start.display(), stats.summary());
         }
         Some(Cmd::Index) => {
             let root = library::find_library_root(&start).unwrap_or(start);
-            let stats = index::index_library(&root)?;
+            let stats = index_with_progress(&root)?;
             println!("{}", stats.summary());
         }
         None => {
@@ -62,13 +62,45 @@ pub fn run() -> Result<()> {
                 if !matches!(line.trim(), "y" | "Y" | "yes" | "YES") {
                     anyhow::bail!("not a library (no .album/). Run `hallward init` first.");
                 }
-                let stats = index::init_library(&root)?;
+                let stats = init_with_progress(&root)?;
                 eprintln!("{}", stats.summary());
             }
             tui::run(root)?;
         }
     }
     Ok(())
+}
+
+fn init_with_progress(root: &std::path::Path) -> Result<index::IndexStats> {
+    let progress = index::CliProgress::new()?;
+    match index::init_library_with_progress(root, &progress) {
+        Ok(stats) => Ok(stats),
+        Err(_) if progress.cancelled() => {
+            progress.finish();
+            eprintln!("Indexing cancelled");
+            Err(anyhow::anyhow!("indexing cancelled"))
+        }
+        Err(err) => {
+            progress.finish();
+            Err(err)
+        }
+    }
+}
+
+fn index_with_progress(root: &std::path::Path) -> Result<index::IndexStats> {
+    let progress = index::CliProgress::new()?;
+    match index::index_library_with_progress(root, &progress) {
+        Ok(stats) => Ok(stats),
+        Err(_) if progress.cancelled() => {
+            progress.finish();
+            eprintln!("Indexing cancelled");
+            Err(anyhow::anyhow!("indexing cancelled"))
+        }
+        Err(err) => {
+            progress.finish();
+            Err(err)
+        }
+    }
 }
 
 #[cfg(test)]
