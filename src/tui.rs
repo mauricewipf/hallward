@@ -52,7 +52,7 @@ enum AskReply {
 }
 
 struct AskAi {
-    on_omarchy: bool,
+    agent: Option<String>,
     prompt: String,
     reply: Option<AskReply>,
     waiting_from: Option<Instant>,
@@ -63,9 +63,9 @@ struct AskAi {
 }
 
 impl AskAi {
-    fn new(on_omarchy: bool) -> Self {
+    fn new() -> Self {
         Self {
-            on_omarchy,
+            agent: ai::resolve_agent(),
             prompt: String::new(),
             reply: None,
             waiting_from: None,
@@ -209,14 +209,18 @@ impl App {
             hit: HitRegions::default(),
             last_grid_click: None,
             marked: HashSet::new(),
-            ask: AskAi::new(ai::is_omarchy()),
+            ask: AskAi::new(),
         };
         app.reload_photos();
         Ok(app)
     }
 
+    fn refresh_agent(&mut self) {
+        self.ask.agent = ai::resolve_agent();
+    }
+
     fn ask_active(&self) -> bool {
-        ai::ask_ai_active(self.ask.on_omarchy, &self.ask.selection)
+        ai::ask_ai_active(self.ask.agent.as_deref(), &self.ask.selection)
     }
 
     fn sync_ask_selection(&mut self) {
@@ -261,12 +265,17 @@ impl App {
             return;
         }
         let files = ai::abs_stills(&self.root, &stills);
+        self.refresh_agent();
+        let Some(agent) = self.ask.agent.clone() else {
+            self.ask.reply = Some(AskReply::Error(ai::no_agent_message()));
+            return;
+        };
         self.ask.generation = self.ask.generation.wrapping_add(1);
         self.ask.cancel_job();
         self.ask.reply = None;
         self.ask.waiting_from = Some(Instant::now());
         self.ask.scroll = 0;
-        self.ask.job = Some(ai::spawn(self.ask.generation, prompt, files));
+        self.ask.job = Some(ai::spawn(self.ask.generation, agent, prompt, files));
     }
 
     fn shutdown_ask(&mut self) {
@@ -1327,6 +1336,20 @@ fn protocol_name(picker: Option<&Picker>) -> &'static str {
     }
 }
 
+fn status_ai_label(agent: Option<&str>) -> String {
+    match agent {
+        Some(name) => format!("ai: {name}"),
+        None => "ai: none".into(),
+    }
+}
+
+fn status_tools_line(viewer: &str, video: &str, thumbs: &str, agent: Option<&str>) -> String {
+    format!(
+        "viewer: {viewer} · video: {video} · thumbs: {thumbs} · {}",
+        status_ai_label(agent)
+    )
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let viewer_name = viewer::detect()
         .map(|v| v.bin().to_string())
@@ -1336,8 +1359,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         .unwrap_or_else(|| "no player".into());
     let thumbs = protocol_name(app.picker.as_ref());
     let text = format!(
-        "{}\nviewer: {viewer_name} · video: {video_name} · thumbs: {thumbs}",
-        app.status
+        "{}\n{}",
+        app.status,
+        status_tools_line(&viewer_name, &video_name, thumbs, app.ask.agent.as_deref())
     );
     frame.render_widget(
         Paragraph::new(text)
@@ -1596,6 +1620,18 @@ mod tests {
     }
 
     #[test]
+    fn status_tools_line_includes_detected_ai() {
+        assert_eq!(
+            status_tools_line("Preview", "mpv", "kitty", Some("opencode")),
+            "viewer: Preview · video: mpv · thumbs: kitty · ai: opencode"
+        );
+        assert_eq!(
+            status_tools_line("no viewer", "no player", "halfblocks", None),
+            "viewer: no viewer · video: no player · thumbs: halfblocks · ai: none"
+        );
+    }
+
+    #[test]
     fn shift_tab_is_backtab_or_tab_with_shift() {
         assert!(is_shift_tab(&KeyEvent::new(
             KeyCode::BackTab,
@@ -1650,14 +1686,14 @@ mod tests {
         let video_only = HashSet::from(["clip.mov".into()]);
         let stills = ai::marked_still_rels(&photos, &video_only);
         assert!(stills.is_empty());
-        assert!(!ai::ask_ai_active(true, &stills));
+        assert!(!ai::ask_ai_active(None, &stills));
         let mixed = HashSet::from(["clip.mov".into(), "a.jpg".into()]);
         assert!(ai::ask_ai_active(
-            true,
+            Some("opencode"),
             &ai::marked_still_rels(&photos, &mixed)
         ));
         assert!(!ai::ask_ai_active(
-            false,
+            None,
             &ai::marked_still_rels(&photos, &mixed)
         ));
     }

@@ -72,7 +72,7 @@ hallward --root PATH   # library is PATH instead of cwd
 | Right on a collection | Open its subfolders |
 | Right on an album | Focus the thumbnail grid |
 | Left from the left edge of the grid | Back to the album column |
-| letters / digits | Filter collection and album **names** (not filenames). With stills marked on Omarchy, typing goes to **Ask AI** instead (`q` does not quit while stills are marked; Ctrl-C still quits) |
+| letters / digits | Filter collection and album **names** (not filenames). With stills marked and a supported agent available, typing goes to **Ask AI** instead (`q` does not quit while stills are marked; Ctrl-C still quits) |
 | Shift+Tab | Jump to the search field from Library, Folders, or Gallery (Ask AI when stills are marked) |
 | Tab | Jump to the filtered tree, or to Ask AI when it is active |
 | Space | Toggle a mark on the focused thumbnail |
@@ -83,15 +83,17 @@ hallward --root PATH   # library is PATH instead of cwd
 | r | Re-scan files and refresh thumbnails (when search / Ask AI is closed) |
 | q | Quit (when search / Ask AI is closed) |
 
-### Ask AI (Omarchy)
+### Ask AI
 
-On [Omarchy](https://omarchy.org/), Space-mark one or more **still images** and the search bar becomes **Ask AI**. Type a prompt and press Enter to send it to the default coding agent (`omarchy default agent`, stored in `~/.config/omarchy/defaults/agent`). Marked videos are omitted; video-only marks leave the Search bar unchanged.
+On [Omarchy](https://omarchy.org/) or **macOS**, Space-mark one or more **still images** and the search bar becomes **Ask AI** when Hallward can resolve a supported coding agent. Omarchy's `omarchy default agent` (stored in `~/.config/omarchy/defaults/agent`) wins when it is set. Otherwise Hallward auto-detects the first real install on `PATH`, in this order: **opencode**, **pi**, **omp**, **hermes**, **codex**, **claude**. Omarchy's lazy mise stubs are skipped so the first run does not trigger an install. The Status pane shows `ai: opencode` (or `ai: none`).
 
-Supported agents: **OpenCode**, **Pi**, **Oh My Pi**, **Hermes**, **Codex**, and **Claude Code**. Each uses its configured default model except OpenCode, which is pinned to `openrouter/google/gemini-2.5-flash`. That model must accept image input. Marked photos are uploaded to the agent's configured provider.
+Marked videos are omitted; video-only marks leave the Search bar unchanged. Each agent uses its configured default model except OpenCode, which is pinned to `openrouter/google/gemini-2.5-flash`. That model must accept image input. Marked photos are uploaded to the agent's configured provider.
 
 Tab leaves Ask AI and keeps the prompt and answer. Esc clears the thread and keeps the marks. While the request is in flight the second paragraph shows `Waiting` with an animated ellipsis.
 
 OpenCode's `run -f` flag currently attaches files as `text/plain` in some releases, so a vision model may not see pixels. Hallward keeps the requested command shape and shows any provider error as-is.
+
+Hallward does not install an agent for you. On macOS, install one yourself (for example OpenCode, Claude Code, or Codex) and keep it on `PATH`.
 
 The bottom-left pane shows photo and video counts for the current album while you navigate Library/Folders, and EXIF for the focused file once a thumbnail is selected.
 

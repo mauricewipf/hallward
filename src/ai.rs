@@ -1,6 +1,8 @@
-//! Omarchy Ask AI: resolve the default agent and run a headless image prompt.
+//! Headless Ask AI: resolve a vision-capable agent and run an image prompt.
 
 use std::collections::HashSet;
+use std::env;
+use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -20,6 +22,7 @@ const ERROR_CAP: usize = 800;
 const DOT_STEP: Duration = Duration::from_millis(400);
 
 const SUPPORTED: &[&str] = &["opencode", "pi", "omp", "hermes", "codex", "claude"];
+const STUB_MAX_BYTES: usize = 16 * 1024;
 
 /// Result of one headless Ask AI run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,7 +98,129 @@ fn unwrap_release_value(value: &str) -> &str {
     }
 }
 
-/// Canonical Omarchy default-agent name, or None when unset.
+/// Inputs for agent resolution (kept injectable so tests never touch PATH).
+#[derive(Debug, Clone, Default)]
+pub struct ResolveInput {
+    pub allow_path: bool,
+    pub omarchy_default: Option<String>,
+    pub real_on_path: Vec<String>,
+}
+
+/// Pick the Omarchy default when set, else the first real supported CLI on PATH.
+pub fn resolve_agent_from(input: &ResolveInput) -> Option<String> {
+    if let Some(name) = input
+        .omarchy_default
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(canonicalize_agent)
+    {
+        return Some(name);
+    }
+    if !input.allow_path {
+        return None;
+    }
+    SUPPORTED
+        .iter()
+        .find(|name| input.real_on_path.iter().any(|n| n == *name))
+        .map(|s| (*s).to_string())
+}
+
+pub fn ask_platform_ok(macos: bool, omarchy: bool) -> bool {
+    macos || omarchy
+}
+
+/// Resolve the agent Hallward should call. Cached by the TUI; refresh on send.
+pub fn resolve_agent() -> Option<String> {
+    let omarchy = is_omarchy();
+    resolve_agent_from(&ResolveInput {
+        allow_path: ask_platform_ok(cfg!(target_os = "macos"), omarchy),
+        omarchy_default: read_omarchy_default(),
+        real_on_path: SUPPORTED
+            .iter()
+            .copied()
+            .filter(|name| is_real_agent(name))
+            .map(str::to_string)
+            .collect(),
+    })
+}
+
+fn which_bin(bin: &str) -> Option<PathBuf> {
+    env::var_os("PATH").and_then(|paths| {
+        env::split_paths(&paths)
+            .map(|dir| dir.join(bin))
+            .find(|p| p.is_file())
+    })
+}
+
+fn omarchy_reports_missing(name: &str) -> bool {
+    if !bin_on_path("omarchy-cmd-missing") {
+        return false;
+    }
+    Command::new("omarchy-cmd-missing")
+        .arg(name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()
+        .is_some_and(|s| s.success())
+}
+
+pub fn looks_like_omarchy_stub(bytes: &[u8]) -> bool {
+    if bytes.len() > STUB_MAX_BYTES || bytes.starts_with(&[0x7f, b'E', b'L', b'F']) {
+        return false;
+    }
+    if bytes.len() >= 4 {
+        let magic = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if matches!(
+            magic,
+            0xfeed_face | 0xfeed_facf | 0xcafe_babe | 0xcffa_edfe | 0xcefa_edfe
+        ) {
+            return false;
+        }
+    }
+    let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+    text.contains("mise use")
+        || text.contains("mise exec")
+        || text.contains("mise x ")
+        || text.contains("omarchy-mise")
+        || text.contains("omarchy-install")
+        || text.contains("omarchy-cmd-missing")
+}
+
+fn is_real_agent(name: &str) -> bool {
+    if omarchy_reports_missing(name) {
+        return false;
+    }
+    let Some(path) = which_bin(name) else {
+        return false;
+    };
+    fs::read(&path)
+        .ok()
+        .is_some_and(|bytes| !looks_like_omarchy_stub(&bytes))
+}
+
+/// Read the Omarchy default agent from its config file, then `omarchy-default-agent`.
+pub fn read_omarchy_default() -> Option<String> {
+    if let Ok(contents) = fs::read_to_string(agent_file_path()) {
+        if let Some(name) = parse_agent_file(&contents) {
+            return Some(name);
+        }
+    }
+    let output = Command::new("omarchy-default-agent")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_agent_file(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Canonical agent name, or None when unset.
 pub fn canonicalize_agent(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -131,26 +256,7 @@ pub fn agent_file_path() -> PathBuf {
 }
 
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-
-/// Read the default agent from the Omarchy config file, then `omarchy-default-agent`.
-pub fn default_agent() -> Option<String> {
-    if let Ok(contents) = std::fs::read_to_string(agent_file_path()) {
-        if let Some(name) = parse_agent_file(&contents) {
-            return Some(name);
-        }
-    }
-    let output = Command::new("omarchy-default-agent")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_agent_file(&String::from_utf8_lossy(&output.stdout))
+    env::var_os("HOME").map(PathBuf::from)
 }
 
 pub fn marked_still_rels(photos: &[Photo], marked: &HashSet<String>) -> Vec<String> {
@@ -165,8 +271,8 @@ pub fn abs_stills(root: &Path, rels: &[String]) -> Vec<PathBuf> {
     rels.iter().map(|r| root.join(r)).collect()
 }
 
-pub fn ask_ai_active(omarchy: bool, stills: &[String]) -> bool {
-    omarchy && !stills.is_empty()
+pub fn ask_ai_active(agent: Option<&str>, stills: &[String]) -> bool {
+    agent.is_some() && !stills.is_empty()
 }
 
 pub fn waiting_text(started: Instant, now: Instant) -> String {
@@ -218,13 +324,32 @@ pub fn is_supported_agent(agent: &str) -> bool {
 }
 
 pub fn unsupported_message(agent: &str) -> String {
-    format!(
-        "Ask AI does not yet support {agent}. Set a vision-capable default with: omarchy default agent (opencode, pi, omp, hermes, codex, or claude)."
-    )
+    format!("Ask AI does not yet support {agent}. Use opencode, pi, omp, hermes, codex, or claude.")
 }
 
-pub fn no_default_agent_message() -> String {
-    "No Omarchy default agent. Set one with: omarchy default agent".into()
+pub fn no_agent_message() -> String {
+    no_agent_message_for(is_omarchy())
+}
+
+pub fn no_agent_message_for(omarchy: bool) -> String {
+    if omarchy {
+        "No vision-capable agent found. Set one with: omarchy default agent — or install opencode, pi, omp, hermes, codex, or claude.".into()
+    } else {
+        "No vision-capable agent found on PATH (opencode, pi, omp, hermes, codex, claude).".into()
+    }
+}
+
+pub fn not_installed_message(agent: &str) -> String {
+    not_installed_message_for(agent, is_omarchy())
+}
+
+pub fn not_installed_message_for(agent: &str, omarchy: bool) -> String {
+    let name = display_name(agent);
+    if omarchy {
+        format!("{name} is not installed. Choose an installed agent with: omarchy default agent")
+    } else {
+        format!("{name} is not installed. Install it and ensure it is on PATH.")
+    }
 }
 
 pub fn no_images_message() -> String {
@@ -503,12 +628,13 @@ fn kill_process_group(pid: u32) {
 fn kill_process_group(_pid: u32) {}
 
 /// Spawn a headless Ask AI request on a background thread.
-pub fn spawn(id: u64, prompt: String, files: Vec<PathBuf>) -> AskHandle {
-    spawn_with_timeout(id, prompt, files, ASK_TIMEOUT)
+pub fn spawn(id: u64, agent: String, prompt: String, files: Vec<PathBuf>) -> AskHandle {
+    spawn_with_timeout(id, agent, prompt, files, ASK_TIMEOUT)
 }
 
 fn spawn_with_timeout(
     id: u64,
+    agent: String,
     prompt: String,
     files: Vec<PathBuf>,
     timeout: Duration,
@@ -519,7 +645,7 @@ fn spawn_with_timeout(
     let cancel_t = cancel.clone();
     let slot_t = child_slot.clone();
     thread::spawn(move || {
-        let result = run_ask(&prompt, &files, &cancel_t, &slot_t, timeout);
+        let result = run_ask(&agent, &prompt, &files, &cancel_t, &slot_t, timeout);
         let _ = tx.send(AskOutcome { id, result });
     });
     AskHandle {
@@ -531,20 +657,18 @@ fn spawn_with_timeout(
 }
 
 fn run_ask(
+    agent: &str,
     prompt: &str,
     files: &[PathBuf],
     cancel: &AtomicBool,
     child_slot: &Mutex<Option<Child>>,
     timeout: Duration,
 ) -> Result<String, String> {
-    let Some(agent) = default_agent() else {
-        return Err(no_default_agent_message());
-    };
     if cancel.load(Ordering::SeqCst) {
         return Err("Ask AI cancelled.".into());
     }
-    let argv = build_argv(&agent, prompt, files)?;
-    execute_argv(&agent, &argv, cancel, child_slot, timeout)
+    let argv = build_argv(agent, prompt, files)?;
+    execute_argv(agent, &argv, cancel, child_slot, timeout)
 }
 
 fn execute_argv(
@@ -572,10 +696,7 @@ fn execute_argv(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(format!(
-                "{name} is not installed. Choose an installed agent with: omarchy default agent",
-                name = display_name(agent)
-            ));
+            return Err(not_installed_message(agent));
         }
         Err(e) => return Err(format!("Could not start {}: {e}", display_name(agent))),
     };
@@ -722,10 +843,96 @@ mod tests {
     }
 
     #[test]
-    fn ask_ai_active_needs_omarchy_and_stills() {
-        assert!(!ask_ai_active(false, &["a.jpg".into()]));
-        assert!(!ask_ai_active(true, &[]));
-        assert!(ask_ai_active(true, &["a.jpg".into()]));
+    fn ask_ai_active_needs_a_resolved_agent_and_stills() {
+        assert!(!ask_ai_active(None, &["a.jpg".into()]));
+        assert!(!ask_ai_active(Some("opencode"), &[]));
+        assert!(ask_ai_active(Some("opencode"), &["a.jpg".into()]));
+    }
+
+    #[test]
+    fn omarchy_default_beats_path_auto_detect() {
+        let input = ResolveInput {
+            allow_path: true,
+            omarchy_default: Some("claude".into()),
+            real_on_path: vec!["opencode".into(), "claude".into()],
+        };
+        assert_eq!(resolve_agent_from(&input).as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn empty_omarchy_default_falls_back_to_path_order() {
+        let input = ResolveInput {
+            allow_path: true,
+            omarchy_default: None,
+            real_on_path: vec!["claude".into(), "opencode".into()],
+        };
+        assert_eq!(resolve_agent_from(&input).as_deref(), Some("opencode"));
+        let none = ResolveInput {
+            allow_path: true,
+            omarchy_default: Some("  ".into()),
+            real_on_path: vec!["pi".into()],
+        };
+        assert_eq!(resolve_agent_from(&none).as_deref(), Some("pi"));
+    }
+
+    #[test]
+    fn path_detect_skips_when_platform_disallows() {
+        let input = ResolveInput {
+            allow_path: false,
+            omarchy_default: None,
+            real_on_path: vec!["opencode".into()],
+        };
+        assert_eq!(resolve_agent_from(&input), None);
+        assert!(!ask_platform_ok(false, false));
+        assert!(ask_platform_ok(true, false));
+        assert!(ask_platform_ok(false, true));
+    }
+
+    #[test]
+    fn macos_shaped_path_detect_picks_opencode() {
+        let input = ResolveInput {
+            allow_path: ask_platform_ok(true, false),
+            omarchy_default: None,
+            real_on_path: vec!["opencode".into()],
+        };
+        assert_eq!(resolve_agent_from(&input).as_deref(), Some("opencode"));
+        assert!(ask_ai_active(
+            resolve_agent_from(&input).as_deref(),
+            &["a.jpg".into()]
+        ));
+    }
+
+    #[test]
+    fn stub_skip_uses_next_real_binary() {
+        let stub =
+            b"#!/bin/bash\nmise use -g opencode\nexec mise exec opencode -- opencode \"$@\"\n";
+        assert!(looks_like_omarchy_stub(stub));
+        assert!(looks_like_omarchy_stub(
+            b"#!/bin/sh\nomarchy-cmd-missing claude\n"
+        ));
+        assert!(looks_like_omarchy_stub(
+            b"#!/bin/sh\nomarchy-install hermes\n"
+        ));
+        assert!(!looks_like_omarchy_stub(b"\x7fELFnot-a-stub"));
+        assert!(!looks_like_omarchy_stub(&[0xfe, 0xed, 0xfa, 0xce, b'x']));
+        let input = ResolveInput {
+            allow_path: true,
+            omarchy_default: None,
+            real_on_path: vec!["claude".into()],
+        };
+        assert_eq!(resolve_agent_from(&input).as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn unsupported_omarchy_default_still_resolves() {
+        let input = ResolveInput {
+            allow_path: true,
+            omarchy_default: Some("ori".into()),
+            real_on_path: vec!["opencode".into()],
+        };
+        assert_eq!(resolve_agent_from(&input).as_deref(), Some("ori"));
+        let err = build_argv("ori", "x", &[PathBuf::from("a.jpg")]).unwrap_err();
+        assert!(err.contains("ori"), "{err}");
     }
 
     #[test]
@@ -853,13 +1060,11 @@ mod tests {
         for agent in ["ori", "crush", "grok", "agy", "copilot"] {
             let err = build_argv(agent, "x", &[PathBuf::from("a.jpg")]).unwrap_err();
             assert!(err.contains(agent), "{err}");
-            assert!(err.contains("omarchy default agent"), "{err}");
+            assert!(err.contains("does not yet support"), "{err}");
         }
         assert_eq!(canonicalize_agent(""), None);
-        assert_eq!(
-            no_default_agent_message(),
-            "No Omarchy default agent. Set one with: omarchy default agent"
-        );
+        assert!(no_agent_message_for(false).contains("PATH"));
+        assert!(no_agent_message_for(true).contains("omarchy default agent"));
     }
 
     #[test]
