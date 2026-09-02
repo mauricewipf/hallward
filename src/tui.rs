@@ -314,8 +314,10 @@ fn handle_key(
         }
         KeyCode::Enter => open_viewer(app, terminal)?,
         KeyCode::Char(' ') => {
-            if let Some(p) = app.photos.get(app.grid_idx) {
-                toggle_mark(&mut app.marked, &p.relpath);
+            if app.focus == Focus::Grid {
+                if let Some(p) = app.photos.get(app.grid_idx) {
+                    toggle_mark(&mut app.marked, &p.relpath);
+                }
             }
         }
         KeyCode::Char(c) if !c.is_control() => {
@@ -487,6 +489,10 @@ fn viewer_playlist(
         .and_then(|p| rels.iter().position(|r| r == &p.relpath))
         .unwrap_or(0);
     (rels, start)
+}
+
+fn grid_cell_focused(focus: Focus, grid_idx: usize, idx: usize) -> bool {
+    focus == Focus::Grid && idx == grid_idx
 }
 
 fn grid_cell_border_style(focused: bool, marked: bool) -> Style {
@@ -877,7 +883,7 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
         if cell.width < 3 || cell.height < 3 {
             continue;
         }
-        let focused = idx == app.grid_idx;
+        let focused = grid_cell_focused(app.focus, app.grid_idx, idx);
         let marked = app.marked.contains(rel);
         let cell_block = Block::default()
             .borders(Borders::ALL)
@@ -1142,6 +1148,14 @@ mod tests {
         let (rels, start) = viewer_playlist(&photos, &marked, 0);
         assert_eq!(rels, vec!["a.jpg", "b.jpg"]);
         assert_eq!(start, 0);
+    }
+
+    #[test]
+    fn grid_cell_focused_only_when_grid_pane_is_active() {
+        assert!(grid_cell_focused(Focus::Grid, 0, 0));
+        assert!(!grid_cell_focused(Focus::Miller, 0, 0));
+        assert!(!grid_cell_focused(Focus::Search, 0, 0));
+        assert!(!grid_cell_focused(Focus::Grid, 0, 1));
     }
 
     #[test]
