@@ -148,6 +148,7 @@ pub fn mpv_argv(files: &[PathBuf], start: usize) -> Vec<OsString> {
         return args;
     }
     let start = start.min(files.len() - 1);
+    args.push(OsString::from("--autofit-larger=100%x100%"));
     args.push(OsString::from(format!("--playlist-start={start}")));
     args.extend(files.iter().map(|p| p.clone().into()));
     args
@@ -352,6 +353,7 @@ mod tests {
             a,
             vec![
                 "mpv",
+                "--autofit-larger=100%x100%",
                 "--playlist-start=1",
                 "/lib/clip.mov",
                 "/lib/other.mp4"
