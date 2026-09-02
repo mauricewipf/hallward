@@ -539,16 +539,11 @@ fn album_media_summary(photos: &[Photo]) -> Vec<String> {
         .iter()
         .filter(|p| is_video(Path::new(&p.relpath)))
         .count();
-    if photo_count == 0 && video_count == 0 {
-        return vec!["0 photos".into(), "0 videos".into()];
-    }
     let mut lines = Vec::new();
-    if photo_count > 0 {
+    if photo_count > 0 || video_count == 0 {
         lines.push(count_noun(photo_count, "photo", "photos"));
     }
-    if video_count > 0 {
-        lines.push(count_noun(video_count, "video", "videos"));
-    }
+    lines.push(count_noun(video_count, "video", "videos"));
     lines
 }
 
@@ -1261,7 +1256,7 @@ mod tests {
         );
         assert_eq!(
             album_media_summary(&[photo("a.jpg"), photo("b.HEIC"), photo("c.png")]),
-            vec!["3 photos".to_string()]
+            vec!["3 photos".to_string(), "0 videos".into()]
         );
         assert_eq!(
             album_media_summary(&[photo("clip.MOV")]),
