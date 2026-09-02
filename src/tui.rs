@@ -1040,8 +1040,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_search(frame: &mut Frame, app: &App, area: Rect, ask_ai: bool, second: Option<&str>) {
-    let title = search_pane_title(ask_ai, app.focus == Focus::Search);
-    let style = if app.focus == Focus::Search {
+    let focused = app.focus == Focus::Search;
+    let title = search_pane_title(ask_ai, focused);
+    let style = if focused {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default()
@@ -1051,17 +1052,21 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect, ask_ai: bool, second: O
             &app.ask.prompt,
             second,
             app.ask.second_is_error(),
-            app.focus == Focus::Search,
+            focused,
         )
     } else {
         vec![Line::from(app.query.clone())]
     };
     let max_scroll = ask_scroll_max(&app.ask.prompt, second, area);
     let scroll = app.ask.scroll.min(max_scroll);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(style)
+        .title(title);
     let mut p = Paragraph::new(text)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0))
-        .block(Block::default().borders(Borders::ALL).title(title));
+        .block(block);
     if !ask_ai {
         p = p.style(style);
     }
