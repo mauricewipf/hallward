@@ -82,7 +82,7 @@ hallward --root PATH   # library is PATH instead of cwd
 | r | Re-scan files and refresh thumbnails (when search is closed) |
 | q | Quit (when search is closed) |
 
-EXIF for the highlighted still is in the bottom-left pane.
+The bottom-left pane shows photo and video counts for the current album while you navigate Library/Folders, and EXIF for the focused file once a thumbnail is selected.
 
 ## Install
 

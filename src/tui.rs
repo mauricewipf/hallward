@@ -26,6 +26,7 @@ use rusqlite::Connection;
 use crate::catalog::{self, Photo};
 use crate::index;
 use crate::library::{self, Folder, Kind};
+use crate::media::{is_image, is_video};
 use crate::search;
 use crate::thumbs;
 use crate::viewer;
@@ -507,11 +508,55 @@ fn grid_cell_border_style(focused: bool, marked: bool) -> Style {
     }
 }
 
-fn album_grid_title(album_name: &str, pos: usize, total: usize, marked_count: usize) -> String {
-    if marked_count == 0 {
-        format!("Album {album_name}  {pos}/{total}")
+fn album_grid_heading(album_name: &str) -> String {
+    format!("Album {album_name}")
+}
+
+fn album_grid_footer(
+    pos: usize,
+    total: usize,
+    marked_count: usize,
+    photo_focused: bool,
+) -> Option<String> {
+    let marked = (marked_count > 0).then(|| format!("{marked_count} marked"));
+    if photo_focused {
+        let index = format!("{pos}/{total}");
+        Some(match marked {
+            Some(m) => format!("{index} · {m}"),
+            None => index,
+        })
     } else {
-        format!("Album {album_name}  {pos}/{total}  {marked_count} marked")
+        marked
+    }
+}
+
+fn album_media_summary(photos: &[Photo]) -> Vec<String> {
+    let photo_count = photos
+        .iter()
+        .filter(|p| is_image(Path::new(&p.relpath)))
+        .count();
+    let video_count = photos
+        .iter()
+        .filter(|p| is_video(Path::new(&p.relpath)))
+        .count();
+    if photo_count == 0 && video_count == 0 {
+        return vec!["0 photos".into(), "0 videos".into()];
+    }
+    let mut lines = Vec::new();
+    if photo_count > 0 {
+        lines.push(count_noun(photo_count, "photo", "photos"));
+    }
+    if video_count > 0 {
+        lines.push(count_noun(video_count, "video", "videos"));
+    }
+    lines
+}
+
+fn count_noun(n: usize, singular: &str, plural: &str) -> String {
+    if n == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{n} {plural}")
     }
 }
 
@@ -802,16 +847,20 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
         .current_album()
         .map(|a| a.display_name().to_string())
         .unwrap_or_else(|| "—".into());
+    let heading = album_grid_heading(&album_name);
     let pos = if app.photos.is_empty() {
         0
     } else {
         app.grid_idx + 1
     };
-    let title = album_grid_title(&album_name, pos, app.photos.len(), app.marked.len());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border)
-        .title(title);
+        .title(heading);
+    let block = match album_grid_footer(pos, app.photos.len(), app.marked.len(), focused) {
+        Some(footer) => block.title_bottom(footer),
+        None => block,
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -908,31 +957,50 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_exif(frame: &mut Frame, app: &App, area: Rect) {
-    let lines = if let Some(p) = app.selected_photo() {
-        vec![
-            Line::from(Span::styled(
-                p.filename.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(
-                p.captured_at
-                    .clone()
-                    .unwrap_or_else(|| "date unknown".into()),
-            ),
-            Line::from(p.camera.clone().unwrap_or_else(|| "camera unknown".into())),
-            Line::from(match (p.width, p.height) {
-                (Some(w), Some(h)) => format!("{w}×{h}"),
-                _ => String::new(),
-            }),
-            Line::from(p.relpath.clone()),
-        ]
+    let (title, lines) = if app.focus == Focus::Grid {
+        if let Some(p) = app.selected_photo() {
+            ("EXIF", exif_lines(p))
+        } else {
+            ("Album", album_pane_lines(app))
+        }
     } else {
-        vec![Line::from("No photo selected")]
+        ("Album", album_pane_lines(app))
     };
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("EXIF")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
+}
+
+fn exif_lines(p: &Photo) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            p.filename.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(
+            p.captured_at
+                .clone()
+                .unwrap_or_else(|| "date unknown".into()),
+        ),
+        Line::from(p.camera.clone().unwrap_or_else(|| "camera unknown".into())),
+        Line::from(match (p.width, p.height) {
+            (Some(w), Some(h)) => format!("{w}×{h}"),
+            _ => String::new(),
+        }),
+        Line::from(p.relpath.clone()),
+    ]
+}
+
+fn album_pane_lines(app: &App) -> Vec<Line<'static>> {
+    if app.current_album().is_none() {
+        vec![Line::from("Select an album")]
+    } else {
+        album_media_summary(&app.photos)
+            .into_iter()
+            .map(Line::from)
+            .collect()
+    }
 }
 
 fn protocol_name(picker: Option<&Picker>) -> &'static str {
@@ -1170,11 +1238,38 @@ mod tests {
     }
 
     #[test]
-    fn album_title_includes_mark_count() {
-        assert_eq!(album_grid_title("Trip", 3, 12, 0), "Album Trip  3/12");
+    fn album_heading_is_the_album_name() {
+        assert_eq!(album_grid_heading("Trip"), "Album Trip");
+    }
+
+    #[test]
+    fn album_footer_index_when_gallery_is_focused() {
+        assert_eq!(album_grid_footer(1, 3, 0, true), Some("1/3".into()));
         assert_eq!(
-            album_grid_title("Trip", 3, 12, 2),
-            "Album Trip  3/12  2 marked"
+            album_grid_footer(1, 3, 3, true),
+            Some("1/3 · 3 marked".into())
+        );
+        assert_eq!(album_grid_footer(1, 3, 0, false), None);
+        assert_eq!(album_grid_footer(1, 3, 3, false), Some("3 marked".into()));
+    }
+
+    #[test]
+    fn album_media_summary_counts_photos_and_videos() {
+        assert_eq!(
+            album_media_summary(&[]),
+            vec!["0 photos".to_string(), "0 videos".into()]
+        );
+        assert_eq!(
+            album_media_summary(&[photo("a.jpg"), photo("b.HEIC"), photo("c.png")]),
+            vec!["3 photos".to_string()]
+        );
+        assert_eq!(
+            album_media_summary(&[photo("clip.MOV")]),
+            vec!["1 video".to_string()]
+        );
+        assert_eq!(
+            album_media_summary(&[photo("a.jpg"), photo("clip.mp4"), photo("b.MOV")]),
+            vec!["1 photo".to_string(), "2 videos".into()]
         );
     }
 
