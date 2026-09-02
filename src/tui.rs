@@ -509,7 +509,7 @@ fn grid_cell_border_style(focused: bool, marked: bool) -> Style {
 }
 
 fn album_grid_heading(album_name: &str) -> String {
-    format!("Album {album_name}")
+    album_name.to_string()
 }
 
 fn album_grid_footer(
@@ -1239,7 +1239,7 @@ mod tests {
 
     #[test]
     fn album_heading_is_the_album_name() {
-        assert_eq!(album_grid_heading("Trip"), "Album Trip");
+        assert_eq!(album_grid_heading("Trip"), "Trip");
     }
 
     #[test]
