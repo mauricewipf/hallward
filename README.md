@@ -74,8 +74,11 @@ hallward --root PATH   # library is PATH instead of cwd
 | Left from the left edge of the grid | Back to the album column |
 | letters / digits | Filter collection and album **names** (not filenames) |
 | Tab | Jump to the filtered tree |
-| Esc | Clear search and show the full tree |
-| Enter / Space | Open a same-type playlist: images in **Preview** on macOS (selected photo first; Cmd-Q to return) or imv / nsxiv / feh / swayimg on Linux; videos in **mpv** |
+| Space | Toggle a mark on the focused thumbnail |
+| Esc | Clear marks; if none are marked, clear search and show the full tree |
+| Enter | Open marked photos in the external viewer (album order, focused file first if marked). If nothing is marked, open a same-type playlist of the album starting at the focused photo: images in **Preview** on macOS (Cmd-Q to return) or imv / nsxiv / feh / swayimg on Linux; videos in **mpv** |
+| click | Click a marked thumbnail to unmark it; click an unmarked thumbnail or empty grid padding to clear marks |
+| double-click | Open marked photos (or the album playlist if none are marked) |
 | r | Re-scan files and refresh thumbnails (when search is closed) |
 | q | Quit (when search is closed) |
 

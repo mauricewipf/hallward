@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -33,7 +33,7 @@ use crate::viewer;
 /// Inner image height in rows. Width is derived from the terminal font so the photo is square.
 const CELL_INNER_H: u16 = 6;
 const STATUS_HINT: &str =
-    "arrows move · click to select · double-click opens · type to search · Enter/Space opens viewer · r reindex · q quit";
+    "arrows move · Space mark · Esc unmark · Enter opens · click toggles mark · double-click opens · type to search · r reindex · q quit";
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -111,7 +111,8 @@ struct App {
     status: String,
     miller_states: Vec<ListState>,
     hit: HitRegions,
-    last_grid_click: Option<(usize, Instant)>,
+    last_grid_click: Option<(usize, Instant, bool)>,
+    marked: HashSet<String>,
 }
 
 impl App {
@@ -138,6 +139,7 @@ impl App {
             miller_states: Vec::new(),
             hit: HitRegions::default(),
             last_grid_click: None,
+            marked: HashSet::new(),
         };
         app.reload_photos();
         Ok(app)
@@ -202,6 +204,7 @@ impl App {
             self.grid_idx = self.photos.len() - 1;
         }
         self.grid_scroll = 0;
+        self.marked.clear();
     }
 
     fn apply_query(&mut self) {
@@ -297,7 +300,9 @@ fn handle_key(
         KeyCode::Char('q') => return Ok(true),
         KeyCode::Char('r') => reindex(app, terminal)?,
         KeyCode::Esc => {
-            if !app.query.is_empty() {
+            if !app.marked.is_empty() {
+                app.marked.clear();
+            } else if !app.query.is_empty() {
                 app.query.clear();
                 app.apply_query();
             }
@@ -307,7 +312,12 @@ fn handle_key(
                 app.focus = Focus::Search;
             }
         }
-        KeyCode::Enter | KeyCode::Char(' ') => open_viewer(app, terminal)?,
+        KeyCode::Enter => open_viewer(app, terminal)?,
+        KeyCode::Char(' ') => {
+            if let Some(p) = app.photos.get(app.grid_idx) {
+                toggle_mark(&mut app.marked, &p.relpath);
+            }
+        }
         KeyCode::Char(c) if !c.is_control() => {
             app.query.push(c);
             app.apply_query();
@@ -350,16 +360,28 @@ fn handle_mouse(
     if let Some(hit) = app.hit.grid {
         if let Some(idx) = grid_index_at(hit, pos, app.photos.len()) {
             let now = Instant::now();
-            if is_double_click(app.last_grid_click, idx, now, DOUBLE_CLICK) {
+            let last = app.last_grid_click.map(|(i, t, _)| (i, t));
+            if is_double_click(last, idx, now, DOUBLE_CLICK) {
+                let was_marked = app.last_grid_click.map(|(_, _, m)| m).unwrap_or(false);
                 app.last_grid_click = None;
                 app.grid_idx = idx;
                 app.focus = Focus::Grid;
+                if was_marked {
+                    if let Some(rel) = app.photos.get(idx).map(|p| p.relpath.as_str()) {
+                        restore_mark_for_double_click(&mut app.marked, rel);
+                    }
+                }
                 open_viewer(app, terminal)?;
             } else {
-                app.last_grid_click = Some((idx, now));
+                let rel = app.photos.get(idx).map(|p| p.relpath.clone());
+                let was_marked = rel.as_deref().is_some_and(|r| app.marked.contains(r));
+                app.last_grid_click = Some((idx, now, was_marked));
                 app.grid_idx = idx;
                 app.focus = Focus::Grid;
+                apply_grid_click(&mut app.marked, rel.as_deref());
             }
+        } else if hit.inner.contains(pos) {
+            apply_grid_click(&mut app.marked, None);
         }
     }
     Ok(())
@@ -418,6 +440,72 @@ fn is_double_click(
     match last {
         Some((last_idx, last_time)) if last_idx == idx => now.duration_since(last_time) < threshold,
         _ => false,
+    }
+}
+
+fn toggle_mark(marked: &mut HashSet<String>, rel: &str) {
+    if !marked.remove(rel) {
+        marked.insert(rel.to_string());
+    }
+}
+
+fn apply_grid_click(marked: &mut HashSet<String>, clicked: Option<&str>) {
+    match clicked {
+        Some(rel) if marked.contains(rel) => {
+            marked.remove(rel);
+        }
+        _ => marked.clear(),
+    }
+}
+
+fn restore_mark_for_double_click(marked: &mut HashSet<String>, rel: &str) {
+    marked.insert(rel.to_string());
+}
+
+fn viewer_playlist(
+    photos: &[Photo],
+    marked: &HashSet<String>,
+    grid_idx: usize,
+) -> (Vec<String>, usize) {
+    if marked.is_empty() {
+        let rels: Vec<String> = photos.iter().map(|p| p.relpath.clone()).collect();
+        let start = if photos.is_empty() {
+            0
+        } else {
+            grid_idx.min(photos.len() - 1)
+        };
+        return (rels, start);
+    }
+    let rels: Vec<String> = photos
+        .iter()
+        .filter(|p| marked.contains(&p.relpath))
+        .map(|p| p.relpath.clone())
+        .collect();
+    let start = photos
+        .get(grid_idx)
+        .filter(|p| marked.contains(&p.relpath))
+        .and_then(|p| rels.iter().position(|r| r == &p.relpath))
+        .unwrap_or(0);
+    (rels, start)
+}
+
+fn grid_cell_border_style(focused: bool, marked: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else if marked {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::Rgb(40, 40, 40))
+    }
+}
+
+fn album_grid_title(album_name: &str, pos: usize, total: usize, marked_count: usize) -> String {
+    if marked_count == 0 {
+        format!("Album {album_name}  {pos}/{total}")
+    } else {
+        format!("Album {album_name}  {pos}/{total}  {marked_count} marked")
     }
 }
 
@@ -565,9 +653,12 @@ fn open_viewer(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>)
         app.status = "no photos in this album".into();
         return Ok(());
     }
-    let rels: Vec<String> = app.photos.iter().map(|p| p.relpath.clone()).collect();
+    let (rels, start) = viewer_playlist(&app.photos, &app.marked, app.grid_idx);
+    if rels.is_empty() {
+        app.status = "no photos in this album".into();
+        return Ok(());
+    }
     let files = viewer::abs_files(&app.root, &rels);
-    let start = app.grid_idx;
 
     disable_raw_mode()?;
     leave_tui(terminal.backend_mut())?;
@@ -710,7 +801,7 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         app.grid_idx + 1
     };
-    let title = format!("Album {album_name}  {pos}/{}", app.photos.len());
+    let title = album_grid_title(&album_name, pos, app.photos.len(), app.marked.len());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border)
@@ -786,16 +877,11 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
         if cell.width < 3 || cell.height < 3 {
             continue;
         }
-        let selected = idx == app.grid_idx;
+        let focused = idx == app.grid_idx;
+        let marked = app.marked.contains(rel);
         let cell_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(if selected {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Rgb(40, 40, 40))
-            });
+            .border_style(grid_cell_border_style(focused, marked));
         let img_area = cell_block.inner(cell);
         frame.render_widget(cell_block, cell);
         if let Some(proto) = app.protocols.get_mut(rel) {
@@ -972,5 +1058,116 @@ mod tests {
             now,
             DOUBLE_CLICK
         ));
+    }
+
+    fn photo(rel: &str) -> Photo {
+        Photo {
+            relpath: rel.into(),
+            album: "album".into(),
+            filename: rel.into(),
+            mtime: 0,
+            size: 0,
+            captured_at: None,
+            camera: None,
+            width: None,
+            height: None,
+        }
+    }
+
+    fn album() -> Vec<Photo> {
+        vec![photo("a.jpg"), photo("b.jpg"), photo("c.jpg")]
+    }
+
+    #[test]
+    fn viewer_playlist_empty_marks_is_full_album() {
+        let photos = album();
+        let marked = HashSet::new();
+        let (rels, start) = viewer_playlist(&photos, &marked, 2);
+        assert_eq!(rels, vec!["a.jpg", "b.jpg", "c.jpg"]);
+        assert_eq!(start, 2);
+    }
+
+    #[test]
+    fn viewer_playlist_marks_keep_album_order_and_remap_start() {
+        let photos = album();
+        let marked = HashSet::from(["c.jpg".into(), "a.jpg".into()]);
+        let (rels, start) = viewer_playlist(&photos, &marked, 2);
+        assert_eq!(rels, vec!["a.jpg", "c.jpg"]);
+        assert_eq!(start, 1);
+    }
+
+    #[test]
+    fn viewer_playlist_unmarked_focus_starts_at_first_mark() {
+        let photos = album();
+        let marked = HashSet::from(["c.jpg".into(), "a.jpg".into()]);
+        let (rels, start) = viewer_playlist(&photos, &marked, 1);
+        assert_eq!(rels, vec!["a.jpg", "c.jpg"]);
+        assert_eq!(start, 0);
+    }
+
+    #[test]
+    fn toggle_mark_adds_then_removes_without_touching_others() {
+        let mut marked = HashSet::from(["a.jpg".into()]);
+        toggle_mark(&mut marked, "b.jpg");
+        assert_eq!(marked, HashSet::from(["a.jpg".into(), "b.jpg".into()]));
+        toggle_mark(&mut marked, "b.jpg");
+        assert_eq!(marked, HashSet::from(["a.jpg".into()]));
+    }
+
+    #[test]
+    fn apply_grid_click_unmarks_only_the_clicked_mark() {
+        let mut marked = HashSet::from(["a.jpg".into(), "b.jpg".into(), "c.jpg".into()]);
+        apply_grid_click(&mut marked, Some("b.jpg"));
+        assert_eq!(marked, HashSet::from(["a.jpg".into(), "c.jpg".into()]));
+    }
+
+    #[test]
+    fn apply_grid_click_outside_clears_all_marks() {
+        let mut marked = HashSet::from(["a.jpg".into(), "b.jpg".into()]);
+        apply_grid_click(&mut marked, Some("c.jpg"));
+        assert!(marked.is_empty());
+        marked = HashSet::from(["a.jpg".into()]);
+        apply_grid_click(&mut marked, None);
+        assert!(marked.is_empty());
+    }
+
+    #[test]
+    fn restore_mark_after_click_unmark_keeps_the_set() {
+        let mut marked = HashSet::from(["a.jpg".into(), "b.jpg".into()]);
+        apply_grid_click(&mut marked, Some("a.jpg"));
+        assert_eq!(marked, HashSet::from(["b.jpg".into()]));
+        restore_mark_for_double_click(&mut marked, "a.jpg");
+        assert_eq!(marked, HashSet::from(["a.jpg".into(), "b.jpg".into()]));
+        let photos = album();
+        let (rels, start) = viewer_playlist(&photos, &marked, 0);
+        assert_eq!(rels, vec!["a.jpg", "b.jpg"]);
+        assert_eq!(start, 0);
+    }
+
+    #[test]
+    fn grid_cell_border_focus_wins_over_mark() {
+        let focused = grid_cell_border_style(true, true);
+        assert_eq!(focused.fg, Some(Color::Yellow));
+        assert!(focused.add_modifier.contains(Modifier::BOLD));
+        let marked = grid_cell_border_style(false, true);
+        assert_eq!(marked.fg, Some(Color::Cyan));
+        let idle = grid_cell_border_style(false, false);
+        assert_eq!(idle.fg, Some(Color::Rgb(40, 40, 40)));
+    }
+
+    #[test]
+    fn album_title_includes_mark_count() {
+        assert_eq!(album_grid_title("Trip", 3, 12, 0), "Album Trip  3/12");
+        assert_eq!(
+            album_grid_title("Trip", 3, 12, 2),
+            "Album Trip  3/12  2 marked"
+        );
+    }
+
+    #[test]
+    fn status_hint_describes_mark_and_enter() {
+        assert!(STATUS_HINT.contains("Space mark"));
+        assert!(STATUS_HINT.contains("Esc unmark"));
+        assert!(STATUS_HINT.contains("Enter opens"));
     }
 }
