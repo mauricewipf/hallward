@@ -12,10 +12,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 use crate::catalog::Photo;
 use crate::media::{bin_on_path, is_image};
+use crate::thumbs;
 
-pub const OPENCODE_MODEL: &str = "openrouter/google/gemini-2.5-flash";
+pub const OPENCODE_MODEL: &str = "opencode/gemini-3-flash";
 pub const ASK_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(50);
 const ERROR_CAP: usize = 800;
@@ -356,6 +359,15 @@ pub fn no_images_message() -> String {
     "Videos can't be sent to the AI. Mark a photo and try again.".into()
 }
 
+fn opencode_prompt(prompt: &str) -> String {
+    format!(
+        "You are a photo Q&A assistant. Analyze only the attached images themselves. \
+Do not inspect files, databases, metadata, paths, or the working directory. \
+Do not use or mention tools. Do not reveal reasoning or narrate your process. \
+Return only the direct final answer to the user's question.\n\nUser question:\n{prompt}"
+    )
+}
+
 /// Headless argv for a verified image-capable Omarchy agent.
 pub fn build_argv(agent: &str, prompt: &str, files: &[PathBuf]) -> Result<Vec<String>, String> {
     if files.is_empty() {
@@ -369,9 +381,11 @@ pub fn build_argv(agent: &str, prompt: &str, files: &[PathBuf]) -> Result<Vec<St
             let mut argv = vec![
                 "opencode".into(),
                 "run".into(),
-                prompt.to_string(),
+                opencode_prompt(prompt),
                 "-m".into(),
                 OPENCODE_MODEL.into(),
+                "--format".into(),
+                "json".into(),
             ];
             for f in files {
                 argv.push("-f".into());
@@ -667,8 +681,30 @@ fn run_ask(
     if cancel.load(Ordering::SeqCst) {
         return Err("Ask AI cancelled.".into());
     }
-    let argv = build_argv(agent, prompt, files)?;
+    let (_preview_dir, prepared_files) = prepare_agent_files(agent, files)?;
+    let argv = build_argv(agent, prompt, &prepared_files)?;
     execute_argv(agent, &argv, cancel, child_slot, timeout)
+}
+
+fn prepare_agent_files(
+    agent: &str,
+    files: &[PathBuf],
+) -> Result<(Option<tempfile::TempDir>, Vec<PathBuf>), String> {
+    if agent != "opencode" {
+        return Ok((None, files.to_vec()));
+    }
+
+    let dir = tempfile::tempdir()
+        .map_err(|error| format!("Could not create Ask AI image previews: {error}"))?;
+    let mut previews = Vec::with_capacity(files.len());
+    for (index, source) in files.iter().enumerate() {
+        let destination = dir.path().join(format!("image-{index:03}.jpg"));
+        thumbs::write_ai_preview(source, &destination).map_err(|error| {
+            format!("Could not prepare {} for Ask AI: {error}", source.display())
+        })?;
+        previews.push(destination);
+    }
+    Ok((Some(dir), previews))
 }
 
 fn execute_argv(
@@ -742,6 +778,24 @@ fn execute_argv(
     let stderr = stderr_h.join().unwrap_or_default();
     let stdout = strip_ansi(&stdout);
     let stderr = strip_ansi(&stderr);
+    if agent == "opencode" && !stdout.trim().is_empty() {
+        match parse_opencode_events(&stdout) {
+            Ok(answer) if status.success() => {
+                if looks_like_auth_error(&answer) || looks_like_vision_error(&answer) {
+                    return Err(map_error_text(agent, &answer));
+                }
+                return Ok(answer);
+            }
+            Ok(answer) => {
+                let error = combine_output(&answer, &stderr);
+                return Err(map_error_text(agent, &error));
+            }
+            Err(error) => {
+                let error = combine_output(&error, &stderr);
+                return Err(map_error_text(agent, &error));
+            }
+        }
+    }
     if status.success() && !stdout.trim().is_empty() {
         if looks_like_auth_error(&stdout) || looks_like_vision_error(&stdout) {
             return Err(map_error_text(agent, &stdout));
@@ -756,6 +810,62 @@ fn execute_argv(
         format!("{}\n{}", stdout.trim(), stderr.trim())
     };
     Err(map_error_text(agent, &combined))
+}
+
+fn parse_opencode_events(stream: &str) -> Result<String, String> {
+    let mut step_text = Vec::new();
+    let mut final_answer = None;
+    let mut error = None;
+
+    for line in stream.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("step_start") => step_text.clear(),
+            Some("text") => {
+                if let Some(text) = event
+                    .get("part")
+                    .and_then(|part| part.get("text"))
+                    .and_then(Value::as_str)
+                {
+                    step_text.push(text.to_string());
+                }
+            }
+            Some("step_finish") => {
+                let stopped = event
+                    .get("part")
+                    .and_then(|part| part.get("reason"))
+                    .and_then(Value::as_str)
+                    == Some("stop");
+                if stopped && !step_text.is_empty() {
+                    final_answer = Some(step_text.concat());
+                }
+            }
+            Some("error") => {
+                error = event
+                    .get("error")
+                    .and_then(|value| value.get("data"))
+                    .and_then(|value| value.get("message"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            _ => {}
+        }
+    }
+
+    final_answer
+        .map(|answer| answer.trim().to_string())
+        .filter(|answer| !answer.is_empty())
+        .ok_or_else(|| error.unwrap_or_else(|| "OpenCode returned no final answer.".into()))
+}
+
+fn combine_output(primary: &str, secondary: &str) -> String {
+    match (primary.trim(), secondary.trim()) {
+        ("", secondary) => secondary.to_string(),
+        (primary, "") => primary.to_string(),
+        (primary, secondary) => format!("{primary}\n{secondary}"),
+    }
 }
 
 fn read_pipe(pipe: Option<impl Read>) -> String {
@@ -939,20 +1049,75 @@ mod tests {
     fn opencode_argv_matches_requested_shape() {
         let files = [PathBuf::from("/lib/a.png"), PathBuf::from("/lib/b.jpg")];
         let argv = build_argv("opencode", "what is this?", &files).unwrap();
+        assert!(argv[2].contains("Return only the direct final answer"));
+        assert!(argv[2].ends_with("User question:\nwhat is this?"));
+        assert_eq!(&argv[..2], ["opencode", "run"]);
         assert_eq!(
-            argv,
-            vec![
-                "opencode",
-                "run",
-                "what is this?",
+            &argv[3..],
+            [
                 "-m",
                 OPENCODE_MODEL,
+                "--format",
+                "json",
                 "-f",
                 "/lib/a.png",
                 "-f",
                 "/lib/b.jpg",
             ]
         );
+    }
+
+    #[test]
+    fn opencode_json_keeps_only_the_final_step_text() {
+        let events = concat!(
+            r#"{"type":"step_start","part":{"type":"step-start"}}"#,
+            "\n",
+            r#"{"type":"text","part":{"type":"text","text":"I'll inspect the files."}}"#,
+            "\n",
+            r#"{"type":"step_finish","part":{"reason":"tool-calls"}}"#,
+            "\n",
+            r#"{"type":"step_start","part":{"type":"step-start"}}"#,
+            "\n",
+            r#"{"type":"text","part":{"type":"text","text":"Salta, "}}"#,
+            "\n",
+            r#"{"type":"text","part":{"type":"text","text":"Argentina"}}"#,
+            "\n",
+            r#"{"type":"step_finish","part":{"reason":"stop"}}"#,
+        );
+        assert_eq!(parse_opencode_events(events).unwrap(), "Salta, Argentina");
+    }
+
+    #[test]
+    fn opencode_json_returns_clean_error_message() {
+        let event = r#"{"type":"error","error":{"name":"UnknownError","data":{"message":"Model not found"}}}"#;
+        assert_eq!(parse_opencode_events(event).unwrap_err(), "Model not found");
+    }
+
+    #[test]
+    fn opencode_files_become_metadata_free_jpeg_previews() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("photo.png");
+        image::RgbImage::from_pixel(40, 20, image::Rgb([20, 40, 60]))
+            .save(&source)
+            .unwrap();
+
+        let (preview_dir, files) = prepare_agent_files("opencode", &[source]).unwrap();
+
+        assert!(preview_dir.is_some());
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].extension().and_then(|ext| ext.to_str()),
+            Some("jpg")
+        );
+        assert_eq!(image::image_dimensions(&files[0]).unwrap(), (40, 20));
+    }
+
+    #[test]
+    fn non_opencode_agents_keep_original_files() {
+        let files = vec![PathBuf::from("/library/photo.heic")];
+        let (preview_dir, prepared) = prepare_agent_files("claude", &files).unwrap();
+        assert!(preview_dir.is_none());
+        assert_eq!(prepared, files);
     }
 
     #[test]
@@ -1128,7 +1293,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let slot = Mutex::new(None);
         let argv = vec!["echo".into(), "hello-ask".into()];
-        let out = execute_argv("opencode", &argv, &cancel, &slot, Duration::from_secs(5)).unwrap();
+        let out = execute_argv("pi", &argv, &cancel, &slot, Duration::from_secs(5)).unwrap();
         assert_eq!(out.trim(), "hello-ask");
     }
 

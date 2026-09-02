@@ -12,6 +12,7 @@ use crate::media::{is_dng, is_heic, is_video};
 use crate::meta;
 
 pub const THUMB_SIZE: u32 = 256;
+pub const AI_PREVIEW_MAX_SIZE: u32 = 1600;
 
 pub fn thumbs_dir(root: &Path) -> PathBuf {
     root.join(ALBUM_DIR).join("thumbs")
@@ -55,6 +56,20 @@ pub fn generate_thumb(root: &Path, abs: &Path, relpath: &str) -> Result<PathBuf>
         .save_with_format(&out, ImageFormat::Jpeg)
         .with_context(|| format!("write {}", out.display()))?;
     Ok(out)
+}
+
+pub fn write_ai_preview(source: &Path, destination: &Path) -> Result<()> {
+    let image =
+        load_image(source).with_context(|| format!("decode Ask AI image {}", source.display()))?;
+    let image = if image.width() > AI_PREVIEW_MAX_SIZE || image.height() > AI_PREVIEW_MAX_SIZE {
+        image.thumbnail(AI_PREVIEW_MAX_SIZE, AI_PREVIEW_MAX_SIZE)
+    } else {
+        image
+    };
+    image
+        .to_rgb8()
+        .save_with_format(destination, ImageFormat::Jpeg)
+        .with_context(|| format!("write Ask AI preview {}", destination.display()))
 }
 
 fn crop_square(img: DynamicImage) -> DynamicImage {
@@ -186,6 +201,20 @@ mod tests {
         let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(20, 40, Rgb([0, 255, 0])));
         let thumb = crop_square(img);
         assert_eq!((thumb.width(), thumb.height()), (THUMB_SIZE, THUMB_SIZE));
+    }
+
+    #[test]
+    fn ai_preview_preserves_aspect_ratio_and_strips_to_jpeg() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.png");
+        let destination = dir.path().join("preview.jpg");
+        RgbImage::from_pixel(400, 200, Rgb([0, 128, 255]))
+            .save(&source)
+            .unwrap();
+
+        write_ai_preview(&source, &destination).unwrap();
+
+        assert_eq!(image::image_dimensions(destination).unwrap(), (400, 200));
     }
 
     #[test]
