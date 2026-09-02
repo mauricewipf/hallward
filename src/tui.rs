@@ -37,7 +37,7 @@ const STATUS_HINT: &str =
     "arrows move · Space mark · Esc unmark · Enter opens · click toggles mark · double-click opens · type to search · r reindex · q quit";
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Focus {
     Search,
     Miller,
@@ -267,6 +267,11 @@ fn handle_key(
         return Ok(true);
     }
 
+    if is_shift_tab(&key) {
+        app.focus = shift_tab_focus(app.focus);
+        return Ok(false);
+    }
+
     if app.focus == Focus::Search {
         match key.code {
             KeyCode::Esc => {
@@ -308,11 +313,6 @@ fn handle_key(
                 app.apply_query();
             }
         }
-        KeyCode::Tab => {
-            if !app.query.is_empty() {
-                app.focus = Focus::Search;
-            }
-        }
         KeyCode::Enter => open_viewer(app, terminal)?,
         KeyCode::Char(' ') => {
             if app.focus == Focus::Grid {
@@ -333,6 +333,17 @@ fn handle_key(
         _ => {}
     }
     Ok(false)
+}
+
+fn is_shift_tab(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::BackTab)
+        || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
+fn shift_tab_focus(from: Focus) -> Focus {
+    match from {
+        Focus::Miller | Focus::Grid | Focus::Search => Focus::Search,
+    }
 }
 
 fn handle_mouse(
@@ -772,7 +783,7 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
     let title = if app.focus == Focus::Search {
         "Search (Tab tree · Esc clear)"
     } else {
-        "Search (type to filter albums)"
+        "Search (Shift+Tab · type to filter albums)"
     };
     let style = if app.focus == Focus::Search {
         Style::default().fg(Color::Yellow)
@@ -1273,5 +1284,26 @@ mod tests {
         assert!(STATUS_HINT.contains("Space mark"));
         assert!(STATUS_HINT.contains("Esc unmark"));
         assert!(STATUS_HINT.contains("Enter opens"));
+    }
+
+    #[test]
+    fn shift_tab_is_backtab_or_tab_with_shift() {
+        assert!(is_shift_tab(&KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)));
+        assert!(is_shift_tab(&KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::SHIFT
+        )));
+        assert!(!is_shift_tab(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(!is_shift_tab(&KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::SHIFT
+        )));
+    }
+
+    #[test]
+    fn shift_tab_focuses_search_from_library_folders_and_gallery() {
+        for from in [Focus::Miller, Focus::Grid, Focus::Search] {
+            assert_eq!(shift_tab_focus(from), Focus::Search);
+        }
     }
 }

@@ -73,6 +73,7 @@ hallward --root PATH   # library is PATH instead of cwd
 | Right on an album | Focus the thumbnail grid |
 | Left from the left edge of the grid | Back to the album column |
 | letters / digits | Filter collection and album **names** (not filenames) |
+| Shift+Tab | Jump to the search field from Library, Folders, or Gallery |
 | Tab | Jump to the filtered tree |
 | Space | Toggle a mark on the focused thumbnail |
 | Esc | Clear marks; if none are marked, clear search and show the full tree |
