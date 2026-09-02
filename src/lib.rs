@@ -1,3 +1,4 @@
+mod ai;
 mod catalog;
 mod index;
 mod library;
