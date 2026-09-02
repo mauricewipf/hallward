@@ -19,6 +19,7 @@ Terminal photo library: miller-style folders, a thumbnail grid for albums, an **
 - `libheif` / `heif-convert` for HEIC thumbnails (Arch: `pacman -S libheif`)
 - **ffmpeg** (ships `ffprobe`) for video **thumbnails** and Live Photo detection — not a player
 - A video player: **mpv**
+- (Optional) For AI use, install an agent CLI (OpenCode, Claude Code, or Codex).
 
 **macOS:** still images open in built-in **Preview** (no extra install). Quit Preview (Cmd-Q) to return to Hallward, same as mpv. Video playback requires **mpv** (`brew install mpv`). FFmpeg’s `ffplay` is a terminal player: it tears down the TUI, dumps decoder logs to the shell, and is not an acceptable viewer. If the status pane says `video: ffplay` or `video: no player`, install mpv and restart Hallward until it shows `video: mpv`.
 
@@ -76,16 +77,6 @@ hallward --root PATH   # library is PATH instead of cwd
 Mark with `Space` key one or more **images** and the search bar becomes **Ask AI**. On Omarchy set a default agent. On Mac install any of these agent CLIs: opencode, pi, omp, hermes, codex, claude.
 
 ![Ask AI](assets/2026-09-02_ai-chat.png)
-
-Marked videos are omitted; video-only marks leave the Search bar unchanged. Each agent uses its configured default model. Marked photos are uploaded to the agent's configured provider.
-
-Tab leaves Ask AI and keeps the prompt and answer. Esc clears the thread and keeps the marks. While the request is in flight the second paragraph shows `Waiting` with an animated ellipsis.
-
-For OpenCode, Hallward converts marked stills—including HEIC files—to metadata-free JPEG previews before attaching them. The model receives the image content without the original file path or EXIF metadata, and Hallward displays only its final answer.
-
-Hallward does not install an agent for you. On macOS, install one yourself (for example OpenCode, Claude Code, or Codex) and keep it on `PATH`.
-
-The bottom-left pane shows photo and video counts for the current album while you navigate Library/Folders, and EXIF for the focused file once a thumbnail is selected.
 
 ## Install
 

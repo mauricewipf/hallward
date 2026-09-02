@@ -18,7 +18,6 @@ use crate::catalog::Photo;
 use crate::media::{bin_on_path, is_image};
 use crate::thumbs;
 
-pub const OPENCODE_MODEL: &str = "opencode/gemini-3-flash";
 pub const ASK_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(50);
 const ERROR_CAP: usize = 800;
@@ -359,13 +358,19 @@ pub fn no_images_message() -> String {
     "Videos can't be sent to the AI. Mark a photo and try again.".into()
 }
 
-fn opencode_prompt(prompt: &str) -> String {
+fn photo_qa_prompt(user_prompt: &str) -> String {
     format!(
         "You are a photo Q&A assistant. Analyze only the attached images themselves. \
 Do not inspect files, databases, metadata, paths, or the working directory. \
 Do not use or mention tools. Do not reveal reasoning or narrate your process. \
-Return only the direct final answer to the user's question.\n\nUser question:\n{prompt}"
+Return only the direct final answer to the user's question.\n\nUser question:\n{user_prompt}"
     )
+}
+
+fn attachment_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// Headless argv for a verified image-capable Omarchy agent.
@@ -381,15 +386,13 @@ pub fn build_argv(agent: &str, prompt: &str, files: &[PathBuf]) -> Result<Vec<St
             let mut argv = vec![
                 "opencode".into(),
                 "run".into(),
-                opencode_prompt(prompt),
-                "-m".into(),
-                OPENCODE_MODEL.into(),
+                photo_qa_prompt(prompt),
                 "--format".into(),
                 "json".into(),
             ];
             for f in files {
                 argv.push("-f".into());
-                argv.push(f.display().to_string());
+                argv.push(attachment_name(f));
             }
             argv
         }
@@ -402,10 +405,10 @@ pub fn build_argv(agent: &str, prompt: &str, files: &[PathBuf]) -> Result<Vec<St
                 "--no-session".into(),
             ];
             for f in files {
-                argv.push(format!("@{}", f.display()));
+                argv.push(format!("@{}", attachment_name(f)));
             }
             argv.push("--".into());
-            argv.push(prompt.to_string());
+            argv.push(photo_qa_prompt(prompt));
             argv
         }
         "omp" => {
@@ -416,10 +419,10 @@ pub fn build_argv(agent: &str, prompt: &str, files: &[PathBuf]) -> Result<Vec<St
                 "--no-session".into(),
             ];
             for f in files {
-                argv.push(format!("@{}", f.display()));
+                argv.push(format!("@{}", attachment_name(f)));
             }
             argv.push("--".into());
-            argv.push(prompt.to_string());
+            argv.push(photo_qa_prompt(prompt));
             argv
         }
         "hermes" => {
@@ -432,10 +435,10 @@ pub fn build_argv(agent: &str, prompt: &str, files: &[PathBuf]) -> Result<Vec<St
             ];
             for f in files {
                 argv.push("--image".into());
-                argv.push(f.display().to_string());
+                argv.push(attachment_name(f));
             }
             argv.push("-q".into());
-            argv.push(prompt.to_string());
+            argv.push(photo_qa_prompt(prompt));
             argv
         }
         "codex" => {
@@ -445,22 +448,22 @@ pub fn build_argv(agent: &str, prompt: &str, files: &[PathBuf]) -> Result<Vec<St
                 "--ephemeral".into(),
                 "--sandbox".into(),
                 "read-only".into(),
-                prompt.to_string(),
+                photo_qa_prompt(prompt),
             ];
             for f in files {
                 argv.push("-i".into());
-                argv.push(f.display().to_string());
+                argv.push(attachment_name(f));
             }
             argv
         }
         "claude" => {
             let mut body = String::from("Look at these images:\n");
             for f in files {
-                body.push_str(&f.display().to_string());
+                body.push_str(&attachment_name(f));
                 body.push('\n');
             }
             body.push('\n');
-            body.push_str(prompt);
+            body.push_str(&photo_qa_prompt(prompt));
             vec![
                 "claude".into(),
                 "-p".into(),
@@ -681,19 +684,21 @@ fn run_ask(
     if cancel.load(Ordering::SeqCst) {
         return Err("Ask AI cancelled.".into());
     }
-    let (_preview_dir, prepared_files) = prepare_agent_files(agent, files)?;
+    let (preview_dir, prepared_files) = prepare_agent_files(files)?;
     let argv = build_argv(agent, prompt, &prepared_files)?;
-    execute_argv(agent, &argv, cancel, child_slot, timeout)
+    execute_argv(
+        agent,
+        &argv,
+        preview_dir.path(),
+        cancel,
+        child_slot,
+        timeout,
+    )
 }
 
 fn prepare_agent_files(
-    agent: &str,
     files: &[PathBuf],
-) -> Result<(Option<tempfile::TempDir>, Vec<PathBuf>), String> {
-    if agent != "opencode" {
-        return Ok((None, files.to_vec()));
-    }
-
+) -> Result<(tempfile::TempDir, Vec<PathBuf>), String> {
     let dir = tempfile::tempdir()
         .map_err(|error| format!("Could not create Ask AI image previews: {error}"))?;
     let mut previews = Vec::with_capacity(files.len());
@@ -704,20 +709,20 @@ fn prepare_agent_files(
         })?;
         previews.push(destination);
     }
-    Ok((Some(dir), previews))
+    Ok((dir, previews))
 }
 
 fn execute_argv(
     agent: &str,
     argv: &[String],
+    work_dir: &Path,
     cancel: &AtomicBool,
     child_slot: &Mutex<Option<Child>>,
     timeout: Duration,
 ) -> Result<String, String> {
-    let tmp = tempfile::tempdir().map_err(|e| format!("Could not create a temp directory: {e}"))?;
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
-        .current_dir(tmp.path())
+        .current_dir(work_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -778,8 +783,8 @@ fn execute_argv(
     let stderr = stderr_h.join().unwrap_or_default();
     let stdout = strip_ansi(&stdout);
     let stderr = strip_ansi(&stderr);
-    if agent == "opencode" && !stdout.trim().is_empty() {
-        match parse_opencode_events(&stdout) {
+    if !stdout.trim().is_empty() {
+        match finalize_answer(agent, &stdout) {
             Ok(answer) if status.success() => {
                 if looks_like_auth_error(&answer) || looks_like_vision_error(&answer) {
                     return Err(map_error_text(agent, &answer));
@@ -796,12 +801,6 @@ fn execute_argv(
             }
         }
     }
-    if status.success() && !stdout.trim().is_empty() {
-        if looks_like_auth_error(&stdout) || looks_like_vision_error(&stdout) {
-            return Err(map_error_text(agent, &stdout));
-        }
-        return Ok(stdout.trim().to_string());
-    }
     let combined = if stderr.trim().is_empty() {
         stdout
     } else if stdout.trim().is_empty() {
@@ -810,6 +809,30 @@ fn execute_argv(
         format!("{}\n{}", stdout.trim(), stderr.trim())
     };
     Err(map_error_text(agent, &combined))
+}
+
+fn finalize_answer(agent: &str, stdout: &str) -> Result<String, String> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{} returned no answer.", display_name(agent)));
+    }
+    match agent {
+        "opencode" => parse_opencode_events(trimmed).or_else(|_| Ok(finalize_plain_answer(trimmed))),
+        _ => Ok(finalize_plain_answer(trimmed)),
+    }
+}
+
+fn finalize_plain_answer(stdout: &str) -> String {
+    let paragraphs: Vec<&str> = stdout
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|paragraph| !paragraph.is_empty())
+        .collect();
+    match paragraphs.as_slice() {
+        [] => stdout.trim().to_string(),
+        [only] => (*only).to_string(),
+        _ => paragraphs.last().copied().unwrap_or("").to_string(),
+    }
 }
 
 fn parse_opencode_events(stream: &str) -> Result<String, String> {
@@ -1055,14 +1078,12 @@ mod tests {
         assert_eq!(
             &argv[3..],
             [
-                "-m",
-                OPENCODE_MODEL,
                 "--format",
                 "json",
                 "-f",
-                "/lib/a.png",
+                "a.png",
                 "-f",
-                "/lib/b.jpg",
+                "b.jpg",
             ]
         );
     }
@@ -1094,17 +1115,70 @@ mod tests {
     }
 
     #[test]
-    fn opencode_files_become_metadata_free_jpeg_previews() {
+    fn finalize_plain_answer_keeps_a_single_paragraph() {
+        assert_eq!(
+            finalize_plain_answer("Salta, Argentina"),
+            "Salta, Argentina"
+        );
+    }
+
+    #[test]
+    fn finalize_plain_answer_keeps_the_last_paragraph() {
+        let text = "Let me inspect the image.\n\nSalta, Argentina";
+        assert_eq!(finalize_plain_answer(text), "Salta, Argentina");
+    }
+
+    #[test]
+    fn finalize_answer_uses_opencode_json_steps() {
+        let events = concat!(
+            r#"{"type":"text","part":{"type":"text","text":"thinking"}}"#,
+            "\n",
+            r#"{"type":"step_finish","part":{"reason":"stop"}}"#,
+        );
+        assert_eq!(
+            finalize_answer("opencode", events).unwrap(),
+            "thinking"
+        );
+    }
+
+    #[test]
+    fn finalize_answer_plain_agents_drop_leading_reasoning() {
+        let text = "I'll look at the photo.\n\nA red car.";
+        assert_eq!(finalize_answer("pi", text).unwrap(), "A red car.");
+    }
+
+    #[test]
+    fn all_agents_receive_photo_qa_prompt() {
+        let files = [PathBuf::from("image-000.jpg")];
+        for agent in ["pi", "omp", "hermes", "codex", "claude", "opencode"] {
+            let argv = build_argv(agent, "what car?", &files).unwrap();
+            let prompt = match agent {
+                "opencode" => &argv[2],
+                "claude" => argv.last().unwrap(),
+                "codex" => &argv[5],
+                "hermes" => argv.last().unwrap(),
+                _ => argv.last().unwrap(),
+            };
+            assert!(prompt.contains("Return only the direct final answer"), "{agent}");
+            assert!(prompt.ends_with("User question:\nwhat car?"), "{agent}");
+        }
+    }
+
+    #[test]
+    fn marked_stills_become_metadata_free_jpeg_previews() {
         let source_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("photo.png");
         image::RgbImage::from_pixel(40, 20, image::Rgb([20, 40, 60]))
             .save(&source)
             .unwrap();
 
-        let (preview_dir, files) = prepare_agent_files("opencode", &[source]).unwrap();
+        let (_preview_dir, files) = prepare_agent_files(&[source]).unwrap();
 
-        assert!(preview_dir.is_some());
         assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].file_name().and_then(|name| name.to_str()),
+            Some("image-000.jpg")
+        );
         assert_eq!(
             files[0].extension().and_then(|ext| ext.to_str()),
             Some("jpg")
@@ -1113,11 +1187,18 @@ mod tests {
     }
 
     #[test]
-    fn non_opencode_agents_keep_original_files() {
-        let files = vec![PathBuf::from("/library/photo.heic")];
-        let (preview_dir, prepared) = prepare_agent_files("claude", &files).unwrap();
-        assert!(preview_dir.is_none());
-        assert_eq!(prepared, files);
+    fn large_stills_are_downscaled_for_ask_ai() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("large.png");
+        image::RgbImage::from_pixel(3200, 2400, image::Rgb([10, 20, 30]))
+            .save(&source)
+            .unwrap();
+
+        let (_preview_dir, files) = prepare_agent_files(&[source]).unwrap();
+
+        let (width, height) = image::image_dimensions(&files[0]).unwrap();
+        assert!(width <= thumbs::AI_PREVIEW_MAX_SIZE);
+        assert!(height <= thumbs::AI_PREVIEW_MAX_SIZE);
     }
 
     #[test]
@@ -1132,9 +1213,9 @@ mod tests {
                 "--no-tools",
                 "--no-context-files",
                 "--no-session",
-                "@/p/one.jpg",
+                "@one.jpg",
                 "--",
-                "describe",
+                &photo_qa_prompt("describe"),
             ]
         );
     }
@@ -1152,7 +1233,7 @@ mod tests {
                 "--no-session",
                 "@shot.png",
                 "--",
-                "hi"
+                &photo_qa_prompt("hi"),
             ]
         );
     }
@@ -1174,7 +1255,7 @@ mod tests {
                 "--image",
                 "b.jpg",
                 "-q",
-                "compare",
+                &photo_qa_prompt("compare"),
             ]
         );
     }
@@ -1191,19 +1272,19 @@ mod tests {
                 "--ephemeral",
                 "--sandbox",
                 "read-only",
-                "look",
+                &photo_qa_prompt("look"),
                 "-i",
                 "a.png",
             ]
         );
-        let prompt_at = argv.iter().position(|a| a == "look").unwrap();
+        let prompt_at = argv.iter().position(|a| a.contains("User question:\nlook")).unwrap();
         let image_at = argv.iter().position(|a| a == "-i").unwrap();
         assert!(prompt_at < image_at);
     }
 
     #[test]
-    fn claude_argv_embeds_absolute_paths_and_read_only_tools() {
-        let files = [PathBuf::from("/abs/x.jpg")];
+    fn claude_argv_embeds_preview_names_and_read_only_tools() {
+        let files = [PathBuf::from("/tmp/ask-ai/image-000.jpg")];
         let argv = build_argv("claude", "caption", &files).unwrap();
         assert_eq!(
             &argv[..6],
@@ -1216,7 +1297,8 @@ mod tests {
                 "dontAsk"
             ]
         );
-        assert!(argv[7].contains("/abs/x.jpg"));
+        assert!(argv[7].contains("image-000.jpg"));
+        assert!(!argv[7].contains("/tmp/ask-ai"));
         assert!(argv[7].contains("caption"));
     }
 
@@ -1293,7 +1375,15 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let slot = Mutex::new(None);
         let argv = vec!["echo".into(), "hello-ask".into()];
-        let out = execute_argv("pi", &argv, &cancel, &slot, Duration::from_secs(5)).unwrap();
+        let out = execute_argv(
+            "pi",
+            &argv,
+            Path::new("."),
+            &cancel,
+            &slot,
+            Duration::from_secs(5),
+        )
+        .unwrap();
         assert_eq!(out.trim(), "hello-ask");
     }
 
@@ -1306,8 +1396,15 @@ mod tests {
             "-c".into(),
             "echo 'No auth credentials found' >&2; exit 1".into(),
         ];
-        let err =
-            execute_argv("opencode", &argv, &cancel, &slot, Duration::from_secs(5)).unwrap_err();
+        let err = execute_argv(
+            "opencode",
+            &argv,
+            Path::new("."),
+            &cancel,
+            &slot,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
         assert!(err.contains("opencode auth login"), "{err}");
     }
 
@@ -1323,6 +1420,7 @@ mod tests {
                 let result = execute_argv(
                     "pi",
                     &["sleep".into(), "30".into()],
+                    Path::new("."),
                     &cancel_t,
                     &slot_t,
                     Duration::from_secs(30),
@@ -1361,6 +1459,7 @@ mod tests {
         let err = execute_argv(
             "pi",
             &["sleep".into(), "30".into()],
+            Path::new("."),
             &cancel,
             &slot,
             Duration::from_millis(200),
