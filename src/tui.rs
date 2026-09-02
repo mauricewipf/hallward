@@ -23,6 +23,7 @@ use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 use rusqlite::Connection;
 
+use crate::ai::{self, AskHandle};
 use crate::catalog::{self, Photo};
 use crate::index;
 use crate::library::{self, Folder, Kind};
@@ -42,6 +43,71 @@ enum Focus {
     Search,
     Miller,
     Grid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AskReply {
+    Text(String),
+    Error(String),
+}
+
+struct AskAi {
+    agent: Option<String>,
+    prompt: String,
+    reply: Option<AskReply>,
+    waiting_from: Option<Instant>,
+    job: Option<AskHandle>,
+    generation: u64,
+    selection: Vec<String>,
+    scroll: u16,
+}
+
+impl AskAi {
+    fn new() -> Self {
+        Self {
+            agent: ai::resolve_agent(),
+            prompt: String::new(),
+            reply: None,
+            waiting_from: None,
+            job: None,
+            generation: 0,
+            selection: Vec::new(),
+            scroll: 0,
+        }
+    }
+
+    fn waiting(&self) -> bool {
+        self.waiting_from.is_some()
+    }
+
+    fn cancel_job(&mut self) {
+        if let Some(job) = self.job.take() {
+            job.cancel();
+        }
+        self.waiting_from = None;
+    }
+
+    fn clear_thread(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.cancel_job();
+        self.prompt.clear();
+        self.reply = None;
+        self.scroll = 0;
+    }
+
+    fn second_paragraph(&self, now: Instant) -> Option<String> {
+        if let Some(started) = self.waiting_from {
+            return Some(ai::waiting_text(started, now));
+        }
+        match &self.reply {
+            Some(AskReply::Text(t) | AskReply::Error(t)) => Some(t.clone()),
+            None => None,
+        }
+    }
+
+    fn second_is_error(&self) -> bool {
+        self.waiting_from.is_none() && matches!(self.reply, Some(AskReply::Error(_)))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -78,6 +144,7 @@ pub fn run(root: PathBuf) -> Result<()> {
     app.picker =
         Some(Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((10, 20))));
     let result = event_loop(&mut terminal, &mut app);
+    app.shutdown_ask();
     disable_raw_mode()?;
     leave_tui(terminal.backend_mut())?;
     terminal.show_cursor()?;
@@ -114,6 +181,7 @@ struct App {
     hit: HitRegions,
     last_grid_click: Option<(usize, Instant, bool)>,
     marked: HashSet<String>,
+    ask: AskAi,
 }
 
 impl App {
@@ -141,9 +209,78 @@ impl App {
             hit: HitRegions::default(),
             last_grid_click: None,
             marked: HashSet::new(),
+            ask: AskAi::new(),
         };
         app.reload_photos();
         Ok(app)
+    }
+
+    fn refresh_agent(&mut self) {
+        self.ask.agent = ai::resolve_agent();
+    }
+
+    fn ask_active(&self) -> bool {
+        ai::ask_ai_active(self.ask.agent.as_deref(), &self.ask.selection)
+    }
+
+    fn sync_ask_selection(&mut self) {
+        let stills = ai::marked_still_rels(&self.photos, &self.marked);
+        if stills == self.ask.selection {
+            return;
+        }
+        self.ask.generation = self.ask.generation.wrapping_add(1);
+        self.ask.cancel_job();
+        self.ask.reply = None;
+        self.ask.scroll = 0;
+        self.ask.selection = stills;
+    }
+
+    fn poll_ask(&mut self) {
+        let outcome = self.ask.job.as_mut().and_then(|job| job.try_recv());
+        let Some(outcome) = outcome else {
+            return;
+        };
+        self.ask.job = None;
+        if ask_outcome_is_stale(self.ask.generation, outcome.id) {
+            return;
+        }
+        self.ask.waiting_from = None;
+        self.ask.reply = Some(match outcome.result {
+            Ok(text) => AskReply::Text(text),
+            Err(err) => AskReply::Error(err),
+        });
+    }
+
+    fn send_ask(&mut self) {
+        if self.ask.waiting() {
+            return;
+        }
+        let prompt = self.ask.prompt.trim().to_string();
+        if prompt.is_empty() {
+            return;
+        }
+        let stills = ai::marked_still_rels(&self.photos, &self.marked);
+        if stills.is_empty() {
+            self.ask.reply = Some(AskReply::Error(ai::no_images_message()));
+            return;
+        }
+        let files = ai::abs_stills(&self.root, &stills);
+        self.refresh_agent();
+        let Some(agent) = self.ask.agent.clone() else {
+            self.ask.reply = Some(AskReply::Error(ai::no_agent_message()));
+            return;
+        };
+        self.ask.generation = self.ask.generation.wrapping_add(1);
+        self.ask.cancel_job();
+        self.ask.reply = None;
+        self.ask.waiting_from = Some(Instant::now());
+        self.ask.scroll = 0;
+        self.ask.job = Some(ai::spawn(self.ask.generation, agent, prompt, files));
+    }
+
+    fn shutdown_ask(&mut self) {
+        self.ask.generation = self.ask.generation.wrapping_add(1);
+        self.ask.cancel_job();
     }
 
     fn miller_columns(&self) -> Vec<Vec<&Folder>> {
@@ -206,6 +343,7 @@ impl App {
         }
         self.grid_scroll = 0;
         self.marked.clear();
+        self.sync_ask_selection();
     }
 
     fn apply_query(&mut self) {
@@ -238,6 +376,8 @@ impl App {
 
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     loop {
+        app.sync_ask_selection();
+        app.poll_ask();
         terminal.draw(|f| draw(f, app))?;
         if !event::poll(Duration::from_millis(200))? {
             continue;
@@ -273,44 +413,55 @@ fn handle_key(
     }
 
     if app.focus == Focus::Search {
-        match key.code {
-            KeyCode::Esc => {
-                app.query.clear();
-                app.focus = Focus::Miller;
-                app.apply_query();
+        if app.ask_active() {
+            handle_ask_ai_key(app, key.code);
+        } else {
+            match key.code {
+                KeyCode::Esc => {
+                    app.query.clear();
+                    app.focus = Focus::Miller;
+                    app.apply_query();
+                }
+                KeyCode::Tab => {
+                    app.focus = Focus::Miller;
+                    app.miller_focus = 0;
+                }
+                KeyCode::Enter => {
+                    app.focus = Focus::Miller;
+                    open_viewer(app, terminal)?;
+                }
+                KeyCode::Backspace => {
+                    app.query.pop();
+                    app.apply_query();
+                    app.focus = Focus::Search;
+                }
+                KeyCode::Char(c) => {
+                    app.query.push(c);
+                    app.apply_query();
+                    app.focus = Focus::Search;
+                }
+                _ => {}
             }
-            KeyCode::Tab => {
-                app.focus = Focus::Miller;
-                app.miller_focus = 0;
-            }
-            KeyCode::Enter => {
-                app.focus = Focus::Miller;
-                open_viewer(app, terminal)?;
-            }
-            KeyCode::Backspace => {
-                app.query.pop();
-                app.apply_query();
-                app.focus = Focus::Search;
-            }
-            KeyCode::Char(c) => {
-                app.query.push(c);
-                app.apply_query();
-                app.focus = Focus::Search;
-            }
-            _ => {}
         }
         return Ok(false);
     }
 
+    let ask_ai = app.ask_active();
     match key.code {
-        KeyCode::Char('q') => return Ok(true),
-        KeyCode::Char('r') => reindex(app, terminal)?,
+        KeyCode::Char('q') if !ask_ai => return Ok(true),
+        KeyCode::Char('r') if !ask_ai => reindex(app, terminal)?,
         KeyCode::Esc => {
             if !app.marked.is_empty() {
                 app.marked.clear();
+                app.sync_ask_selection();
             } else if !app.query.is_empty() {
                 app.query.clear();
                 app.apply_query();
+            }
+        }
+        KeyCode::Tab => {
+            if library_tab_focuses_ask(ask_ai, !app.query.is_empty()) {
+                app.focus = Focus::Search;
             }
         }
         KeyCode::Enter => open_viewer(app, terminal)?,
@@ -318,13 +469,20 @@ fn handle_key(
             if app.focus == Focus::Grid {
                 if let Some(p) = app.photos.get(app.grid_idx) {
                     toggle_mark(&mut app.marked, &p.relpath);
+                    app.sync_ask_selection();
                 }
             }
         }
         KeyCode::Char(c) if !c.is_control() => {
-            app.query.push(c);
-            app.apply_query();
-            app.focus = Focus::Search;
+            if ask_ai {
+                let waiting = app.ask.waiting();
+                type_into_ask_prompt(&mut app.ask.prompt, waiting, c);
+                app.focus = Focus::Search;
+            } else {
+                app.query.push(c);
+                app.apply_query();
+                app.focus = Focus::Search;
+            }
         }
         KeyCode::Up => move_up(app),
         KeyCode::Down => move_down(app),
@@ -333,6 +491,104 @@ fn handle_key(
         _ => {}
     }
     Ok(false)
+}
+
+fn handle_ask_ai_key(app: &mut App, code: KeyCode) {
+    let waiting = app.ask.waiting();
+    match classify_ask_field_key(code, waiting) {
+        AskFieldKey::ExitClear => {
+            app.ask.clear_thread();
+            app.focus = Focus::Miller;
+            app.miller_focus = 0;
+        }
+        AskFieldKey::ExitKeep => {
+            app.focus = Focus::Miller;
+            app.miller_focus = 0;
+        }
+        AskFieldKey::Send => app.send_ask(),
+        AskFieldKey::Backspace => {
+            app.ask.prompt.pop();
+        }
+        AskFieldKey::Char(c) => {
+            app.ask.prompt.push(c);
+        }
+        AskFieldKey::ScrollUp
+        | AskFieldKey::ScrollDown
+        | AskFieldKey::PageUp
+        | AskFieldKey::PageDown => {
+            let max = ask_scroll_max(
+                &app.ask.prompt,
+                app.ask.second_paragraph(Instant::now()).as_deref(),
+                app.hit.search,
+            );
+            let page = ask_scroll_page(app.hit.search.height);
+            app.ask.scroll = apply_ask_scroll(
+                app.ask.scroll,
+                classify_ask_field_key(code, waiting),
+                page,
+                max,
+            );
+        }
+        AskFieldKey::Ignore => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AskFieldKey {
+    ExitKeep,
+    ExitClear,
+    Send,
+    Backspace,
+    Char(char),
+    ScrollUp,
+    ScrollDown,
+    PageUp,
+    PageDown,
+    Ignore,
+}
+
+fn classify_ask_field_key(code: KeyCode, waiting: bool) -> AskFieldKey {
+    match code {
+        KeyCode::Esc => AskFieldKey::ExitClear,
+        KeyCode::Tab => AskFieldKey::ExitKeep,
+        KeyCode::Enter => AskFieldKey::Send,
+        KeyCode::Backspace if !waiting => AskFieldKey::Backspace,
+        KeyCode::Char(c) if !waiting => AskFieldKey::Char(c),
+        KeyCode::Up => AskFieldKey::ScrollUp,
+        KeyCode::Down => AskFieldKey::ScrollDown,
+        KeyCode::PageUp => AskFieldKey::PageUp,
+        KeyCode::PageDown => AskFieldKey::PageDown,
+        _ => AskFieldKey::Ignore,
+    }
+}
+
+fn ask_scroll_page(pane_height: u16) -> u16 {
+    pane_height.saturating_sub(3).max(1)
+}
+
+fn library_tab_focuses_ask(ask_active: bool, query_nonempty: bool) -> bool {
+    ask_active || query_nonempty
+}
+
+fn type_into_ask_prompt(prompt: &mut String, waiting: bool, c: char) {
+    if !waiting {
+        prompt.push(c);
+    }
+}
+
+fn apply_ask_scroll(scroll: u16, key: AskFieldKey, page: u16, max: u16) -> u16 {
+    let next = match key {
+        AskFieldKey::ScrollUp => scroll.saturating_sub(1),
+        AskFieldKey::ScrollDown => scroll.saturating_add(1),
+        AskFieldKey::PageUp => scroll.saturating_sub(page),
+        AskFieldKey::PageDown => scroll.saturating_add(page),
+        _ => scroll,
+    };
+    next.min(max)
+}
+
+fn ask_outcome_is_stale(generation: u64, outcome_id: u64) -> bool {
+    generation != outcome_id
 }
 
 fn is_shift_tab(key: &KeyEvent) -> bool {
@@ -397,6 +653,7 @@ fn handle_mouse(
         } else if hit.inner.contains(pos) {
             apply_grid_click(&mut app.marked, None);
         }
+        app.sync_ask_selection();
     }
     Ok(())
 }
@@ -736,17 +993,20 @@ fn open_viewer(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>)
 fn draw(frame: &mut Frame, app: &mut App) {
     app.hit = HitRegions::default();
     let area = frame.area();
+    let ask = app.ask_active();
+    let second = app.ask.second_paragraph(Instant::now());
+    let top_h = ai::search_pane_height(ask, &app.ask.prompt, second.as_deref(), area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(top_h),
             Constraint::Min(8),
             Constraint::Length(7),
         ])
         .split(area);
 
     app.hit.search = chunks[0];
-    draw_search(frame, app, chunks[0]);
+    draw_search(frame, app, chunks[0], ask, second.as_deref());
 
     let col_count = app.miller_columns().len();
     let n_miller = col_count.max(1);
@@ -779,21 +1039,79 @@ fn draw(frame: &mut Frame, app: &mut App) {
     draw_status(frame, app, bottom[1]);
 }
 
-fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
-    let title = if app.focus == Focus::Search {
-        "Search (Tab tree · Esc clear)"
-    } else {
-        "Search (Shift+Tab · type to filter albums)"
-    };
+fn draw_search(frame: &mut Frame, app: &App, area: Rect, ask_ai: bool, second: Option<&str>) {
+    let title = search_pane_title(ask_ai, app.focus == Focus::Search);
     let style = if app.focus == Focus::Search {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default()
     };
-    let p = Paragraph::new(app.query.clone())
-        .style(style)
+    let text = if ask_ai {
+        ask_ai_lines(
+            &app.ask.prompt,
+            second,
+            app.ask.second_is_error(),
+            app.focus == Focus::Search,
+        )
+    } else {
+        vec![Line::from(app.query.clone())]
+    };
+    let max_scroll = ask_scroll_max(&app.ask.prompt, second, area);
+    let scroll = app.ask.scroll.min(max_scroll);
+    let mut p = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0))
         .block(Block::default().borders(Borders::ALL).title(title));
+    if !ask_ai {
+        p = p.style(style);
+    }
     frame.render_widget(p, area);
+}
+
+fn search_pane_title(ask_ai: bool, focused: bool) -> &'static str {
+    match (ask_ai, focused) {
+        (true, true) => "Ask AI (Enter send · Tab tree · Esc clear)",
+        (true, false) => "Ask AI (Shift+Tab · type to prompt)",
+        (false, true) => "Search (Tab tree · Esc clear)",
+        (false, false) => "Search (Shift+Tab · type to filter albums)",
+    }
+}
+
+fn ask_ai_lines(
+    prompt: &str,
+    second: Option<&str>,
+    is_error: bool,
+    focused: bool,
+) -> Vec<Line<'static>> {
+    let prompt_style = if focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let mut lines = vec![Line::from(Span::styled(prompt.to_string(), prompt_style))];
+    if let Some(s) = second {
+        lines.push(Line::from(""));
+        let style = if is_error {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        };
+        for part in s.split('\n') {
+            lines.push(Line::from(Span::styled(part.to_string(), style)));
+        }
+    }
+    lines
+}
+
+fn ask_scroll_max(prompt: &str, second: Option<&str>, area: Rect) -> u16 {
+    let inner_w = area.width.saturating_sub(2).max(1);
+    let inner_h = area.height.saturating_sub(2).max(1);
+    let prompt_lines = ai::wrap_line_count(prompt, inner_w);
+    let extra = match second {
+        None => 0,
+        Some(s) => 1 + ai::wrap_line_count(s, inner_w),
+    };
+    (prompt_lines + extra).saturating_sub(inner_h)
 }
 
 fn draw_miller_col(frame: &mut Frame, app: &mut App, col: usize, area: Rect) {
@@ -1018,6 +1336,20 @@ fn protocol_name(picker: Option<&Picker>) -> &'static str {
     }
 }
 
+fn status_ai_label(agent: Option<&str>) -> String {
+    match agent {
+        Some(name) => format!("ai: {name}"),
+        None => "ai: none".into(),
+    }
+}
+
+fn status_tools_line(viewer: &str, video: &str, thumbs: &str, agent: Option<&str>) -> String {
+    format!(
+        "viewer: {viewer} · video: {video} · thumbs: {thumbs} · {}",
+        status_ai_label(agent)
+    )
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let viewer_name = viewer::detect()
         .map(|v| v.bin().to_string())
@@ -1027,8 +1359,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         .unwrap_or_else(|| "no player".into());
     let thumbs = protocol_name(app.picker.as_ref());
     let text = format!(
-        "{}\nviewer: {viewer_name} · video: {video_name} · thumbs: {thumbs}",
-        app.status
+        "{}\n{}",
+        app.status,
+        status_tools_line(&viewer_name, &video_name, thumbs, app.ask.agent.as_deref())
     );
     frame.render_widget(
         Paragraph::new(text)
@@ -1287,13 +1620,31 @@ mod tests {
     }
 
     #[test]
+    fn status_tools_line_includes_detected_ai() {
+        assert_eq!(
+            status_tools_line("Preview", "mpv", "kitty", Some("opencode")),
+            "viewer: Preview · video: mpv · thumbs: kitty · ai: opencode"
+        );
+        assert_eq!(
+            status_tools_line("no viewer", "no player", "halfblocks", None),
+            "viewer: no viewer · video: no player · thumbs: halfblocks · ai: none"
+        );
+    }
+
+    #[test]
     fn shift_tab_is_backtab_or_tab_with_shift() {
-        assert!(is_shift_tab(&KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)));
+        assert!(is_shift_tab(&KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::NONE
+        )));
         assert!(is_shift_tab(&KeyEvent::new(
             KeyCode::Tab,
             KeyModifiers::SHIFT
         )));
-        assert!(!is_shift_tab(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(!is_shift_tab(&KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE
+        )));
         assert!(!is_shift_tab(&KeyEvent::new(
             KeyCode::Char('q'),
             KeyModifiers::SHIFT
@@ -1305,5 +1656,115 @@ mod tests {
         for from in [Focus::Miller, Focus::Grid, Focus::Search] {
             assert_eq!(shift_tab_focus(from), Focus::Search);
         }
+    }
+
+    #[test]
+    fn ask_ai_pane_title_switches_from_search() {
+        assert_eq!(
+            search_pane_title(true, true),
+            "Ask AI (Enter send · Tab tree · Esc clear)"
+        );
+        assert_eq!(
+            search_pane_title(true, false),
+            "Ask AI (Shift+Tab · type to prompt)"
+        );
+        assert!(search_pane_title(false, true).starts_with("Search"));
+    }
+
+    #[test]
+    fn ask_ai_lines_are_two_paragraphs() {
+        let lines = ask_ai_lines("describe this", Some("Waiting..."), false, false);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].spans[0].content, "describe this");
+        assert_eq!(lines[1].spans.len(), 0);
+        assert_eq!(lines[2].spans[0].content, "Waiting...");
+    }
+
+    #[test]
+    fn video_only_marks_do_not_activate_ask_ai() {
+        let photos = vec![photo("clip.mov"), photo("a.jpg")];
+        let video_only = HashSet::from(["clip.mov".into()]);
+        let stills = ai::marked_still_rels(&photos, &video_only);
+        assert!(stills.is_empty());
+        assert!(!ai::ask_ai_active(None, &stills));
+        let mixed = HashSet::from(["clip.mov".into(), "a.jpg".into()]);
+        assert!(ai::ask_ai_active(
+            Some("opencode"),
+            &ai::marked_still_rels(&photos, &mixed)
+        ));
+        assert!(!ai::ask_ai_active(
+            None,
+            &ai::marked_still_rels(&photos, &mixed)
+        ));
+    }
+
+    #[test]
+    fn typing_with_ask_ai_does_not_change_query() {
+        let mut query = "rome".to_string();
+        let mut prompt = String::new();
+        type_into_ask_prompt(&mut prompt, false, 'w');
+        assert_eq!(prompt, "w");
+        assert_eq!(query, "rome");
+        type_into_ask_prompt(&mut prompt, true, 'x');
+        assert_eq!(prompt, "w");
+        query.push('x');
+        assert_eq!(query, "romex");
+    }
+
+    #[test]
+    fn tab_from_tree_focuses_ask_ai_even_when_prompt_is_empty() {
+        assert!(library_tab_focuses_ask(true, false));
+        assert!(library_tab_focuses_ask(true, true));
+        assert!(library_tab_focuses_ask(false, true));
+        assert!(!library_tab_focuses_ask(false, false));
+    }
+
+    #[test]
+    fn ask_field_tab_keeps_thread_esc_clears() {
+        assert_eq!(
+            classify_ask_field_key(KeyCode::Tab, false),
+            AskFieldKey::ExitKeep
+        );
+        assert_eq!(
+            classify_ask_field_key(KeyCode::Esc, false),
+            AskFieldKey::ExitClear
+        );
+        assert_eq!(
+            classify_ask_field_key(KeyCode::Esc, true),
+            AskFieldKey::ExitClear
+        );
+        assert_eq!(
+            classify_ask_field_key(KeyCode::Enter, false),
+            AskFieldKey::Send
+        );
+        assert_eq!(
+            classify_ask_field_key(KeyCode::Backspace, true),
+            AskFieldKey::Ignore
+        );
+        assert_eq!(
+            classify_ask_field_key(KeyCode::Char('a'), true),
+            AskFieldKey::Ignore
+        );
+        assert_eq!(
+            classify_ask_field_key(KeyCode::Backspace, false),
+            AskFieldKey::Backspace
+        );
+    }
+
+    #[test]
+    fn changed_selection_invalidates_stale_ask_output() {
+        assert!(ask_outcome_is_stale(2, 1));
+        assert!(!ask_outcome_is_stale(2, 2));
+    }
+
+    #[test]
+    fn ask_response_scrolling_clamps_to_content() {
+        assert_eq!(apply_ask_scroll(0, AskFieldKey::ScrollUp, 4, 10), 0);
+        assert_eq!(apply_ask_scroll(0, AskFieldKey::ScrollDown, 4, 10), 1);
+        assert_eq!(apply_ask_scroll(8, AskFieldKey::PageDown, 4, 10), 10);
+        assert_eq!(apply_ask_scroll(3, AskFieldKey::PageUp, 4, 10), 0);
+        let area = Rect::new(0, 0, 20, 8);
+        let long = "line\n".repeat(20);
+        assert!(ask_scroll_max("prompt", Some(&long), area) > 0);
     }
 }
