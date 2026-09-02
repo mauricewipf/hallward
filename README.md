@@ -1,10 +1,17 @@
 # Hallward
 
-Terminal photo library: miller-style folders, a thumbnail grid for albums, and an **external** image viewer. Photos stay ordinary files on disk. Hallward only adds a `.album/` directory (SQLite catalog + JPEG thumbs).
+Terminal photo library: miller-style folders, a thumbnail grid for albums, an **external** image viewer, and **Ask AI** over marked stills. Photos stay ordinary files on disk. Hallward only adds a `.album/` directory (SQLite catalog + JPEG thumbs).
 
-v1 indexes **still images** and **standalone videos** (`.mov` / `.mp4`). iPhone Live Photo motion clips are detected via Apple's `com.apple.quicktime.content.identifier` metadata and ignored — only the HEIC still is cataloged.
+![Hallward TUI screenshot](assets/2026-08-28_screenshot.png)
 
-![Hallward TUI screenshot](screenshot-2026-08-28_17-09-57.png)
+## Features
+
+- Browse photos and videos from the Terminal
+- Point Hallward on a remote or mounted file system and it works as well
+- **Ask AI** questions about photos: "Which car is this?"
+- View photos and videos in external viewer
+- First-class [Omarchy](https://omarchy.org/) support
+- More is coming. Stay tuned!
 
 ## Prerequisites
 
@@ -64,30 +71,13 @@ hallward               # open the TUI
 hallward --root PATH   # library is PATH instead of cwd
 ```
 
-### Keyboard
-
-| Key | Action |
-|-----|--------|
-| arrows | Miller columns; in an album grid, move the selection frame |
-| Right on a collection | Open its subfolders |
-| Right on an album | Focus the thumbnail grid |
-| Left from the left edge of the grid | Back to the album column |
-| letters / digits | Filter collection and album **names** (not filenames). With stills marked and a supported agent available, typing goes to **Ask AI** instead (`q` does not quit while stills are marked; Ctrl-C still quits) |
-| Shift+Tab | Jump to the search field from Library, Folders, or Gallery (Ask AI when stills are marked) |
-| Tab | Jump to the filtered tree, or to Ask AI when it is active |
-| Space | Toggle a mark on the focused thumbnail |
-| Esc | Clear marks; if none are marked, clear search and show the full tree. In Ask AI, clear the prompt and answer, leave the field, and **keep marks** |
-| Enter | Open marked photos in the external viewer (album order, focused file first if marked). If nothing is marked, open a same-type playlist of the album starting at the focused photo: images in **Preview** on macOS (Cmd-Q to return) or imv / nsxiv / feh / swayimg on Linux; videos in **mpv**. In Ask AI, send the prompt |
-| click | Click a marked thumbnail to unmark it; click an unmarked thumbnail or empty grid padding to clear marks |
-| double-click | Open marked photos (or the album playlist if none are marked) |
-| r | Re-scan files and refresh thumbnails (when search / Ask AI is closed) |
-| q | Quit (when search / Ask AI is closed) |
-
 ### Ask AI
 
-On [Omarchy](https://omarchy.org/) or **macOS**, Space-mark one or more **still images** and the search bar becomes **Ask AI** when Hallward can resolve a supported coding agent. Omarchy's `omarchy default agent` (stored in `~/.config/omarchy/defaults/agent`) wins when it is set. Otherwise Hallward auto-detects the first real install on `PATH`, in this order: **opencode**, **pi**, **omp**, **hermes**, **codex**, **claude**. Omarchy's lazy mise stubs are skipped so the first run does not trigger an install. The Status pane shows `ai: opencode` (or `ai: none`).
+Mark with `Space` key one or more **images** and the search bar becomes **Ask AI**. On Omarchy set a default agent. On Mac install any of these agent CLIs: opencode, pi, omp, hermes, codex, claude.
 
-Marked videos are omitted; video-only marks leave the Search bar unchanged. Each agent uses its configured default model except OpenCode, which is pinned to the image-capable `opencode/gemini-3-flash`. Marked photos are uploaded to the agent's configured provider.
+![Ask AI](assets/2026-09-02_ai-chat.png)
+
+Marked videos are omitted; video-only marks leave the Search bar unchanged. Each agent uses its configured default model. Marked photos are uploaded to the agent's configured provider.
 
 Tab leaves Ask AI and keeps the prompt and answer. Esc clears the thread and keeps the marks. While the request is in flight the second paragraph shows `Waiting` with an animated ellipsis.
 
@@ -146,6 +136,25 @@ Or without installing:
 cargo build --release
 # binary: target/release/hallward
 ```
+
+## Keyboard
+
+| Key                                 | Action                                                                                                                                                                                                                                                                                                                     |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| arrows                              | Miller columns; in an album grid, move the selection frame                                                                                                                                                                                                                                                                 |
+| Right on a collection               | Open its subfolders                                                                                                                                                                                                                                                                                                        |
+| Right on an album                   | Focus the thumbnail grid                                                                                                                                                                                                                                                                                                   |
+| Left from the left edge of the grid | Back to the album column                                                                                                                                                                                                                                                                                                   |
+| letters / digits                    | Filter collection and album **names** (not filenames). With stills marked and a supported agent available, typing goes to **Ask AI** instead (`q` does not quit while stills are marked; Ctrl-C still quits)                                                                                                               |
+| Shift+Tab                           | Jump to the search field from Library, Folders, or Gallery (Ask AI when stills are marked)                                                                                                                                                                                                                                 |
+| Tab                                 | Jump to the filtered tree, or to Ask AI when it is active                                                                                                                                                                                                                                                                  |
+| Space                               | Toggle a mark on the focused thumbnail                                                                                                                                                                                                                                                                                     |
+| Esc                                 | Clear marks; if none are marked, clear search and show the full tree. In Ask AI, clear the prompt and answer, leave the field, and **keep marks**                                                                                                                                                                          |
+| Enter                               | Open marked photos in the external viewer (album order, focused file first if marked). If nothing is marked, open a same-type playlist of the album starting at the focused photo: images in **Preview** on macOS (Cmd-Q to return) or imv / nsxiv / feh / swayimg on Linux; videos in **mpv**. In Ask AI, send the prompt |
+| click                               | Click a marked thumbnail to unmark it; click an unmarked thumbnail or empty grid padding to clear marks                                                                                                                                                                                                                    |
+| double-click                        | Open marked photos (or the album playlist if none are marked)                                                                                                                                                                                                                                                              |
+| r                                   | Re-scan files and refresh thumbnails (when search / Ask AI is closed)                                                                                                                                                                                                                                                      |
+| q                                   | Quit (when search / Ask AI is closed)                                                                                                                                                                                                                                                                                      |
 
 ## Dev (this repo)
 
