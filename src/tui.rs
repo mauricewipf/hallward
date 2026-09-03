@@ -44,7 +44,7 @@ use crate::viewer;
 /// Inner image height in rows. Width is derived from the terminal font so the photo is square.
 const CELL_INNER_H: u16 = 6;
 const STATUS_HINT: &str =
-    "arrows move · Space mark · Esc unmark · Enter opens · click toggles mark · double-click opens · type to search · c copy · x cut · p paste · d delete · r reindex · q quit";
+    "arrows move · Space mark · Esc unmark · Enter opens · click toggles mark · double-click opens · Shift+Tab search · c copy · x cut · p paste · d delete · r reindex · q quit";
 const DASHED_BORDER: border::Set = border::Set {
     top_left: "┌",
     top_right: "┐",
@@ -684,16 +684,10 @@ fn handle_key(
                 }
             }
         }
-        KeyCode::Char(c) if !c.is_control() => {
-            if ask_ai {
-                let waiting = app.ask.waiting();
-                type_into_ask_prompt(&mut app.ask.prompt, waiting, c);
-                app.focus = Focus::Search;
-            } else {
-                app.query.push(c);
-                app.apply_query();
-                app.focus = Focus::Search;
-            }
+        KeyCode::Char(c) if !c.is_control() && ask_ai => {
+            let waiting = app.ask.waiting();
+            type_into_ask_prompt(&mut app.ask.prompt, waiting, c);
+            app.focus = Focus::Search;
         }
         KeyCode::Up => move_up(app),
         KeyCode::Down => move_down(app),
@@ -1513,7 +1507,7 @@ fn search_pane_title(ask_ai: bool, focused: bool) -> &'static str {
         (true, true) => "Ask AI (Enter send · Tab tree · Esc clear)",
         (true, false) => "Ask AI (Shift+Tab · type to prompt)",
         (false, true) => "Search (Tab tree · Esc clear)",
-        (false, false) => "Search (Shift+Tab · type to filter albums)",
+        (false, false) => "Search (Shift+Tab)",
     }
 }
 
@@ -2538,6 +2532,7 @@ mod tests {
         assert!(STATUS_HINT.contains("Space mark"));
         assert!(STATUS_HINT.contains("Esc unmark"));
         assert!(STATUS_HINT.contains("Enter opens"));
+        assert!(STATUS_HINT.contains("Shift+Tab search"));
         assert!(STATUS_HINT.contains("d delete"));
         assert!(STATUS_HINT.contains("c copy"));
         assert!(STATUS_HINT.contains("x cut"));
@@ -2692,7 +2687,8 @@ mod tests {
             search_pane_title(true, false),
             "Ask AI (Shift+Tab · type to prompt)"
         );
-        assert!(search_pane_title(false, true).starts_with("Search"));
+        assert_eq!(search_pane_title(false, true), "Search (Tab tree · Esc clear)");
+        assert_eq!(search_pane_title(false, false), "Search (Shift+Tab)");
     }
 
     #[test]
