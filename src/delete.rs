@@ -1,13 +1,15 @@
-//! Permanently unlink cataloged media, Live Photo companions, and thumbs.
+//! Permanently unlink cataloged media, folders, Live Photo companions, and thumbs.
 
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Result};
+use walkdir::WalkDir;
 
 use crate::catalog::Photo;
-use crate::media::{is_image, VIDEO_EXTS};
+use crate::library::ALBUM_DIR;
+use crate::media::{is_hidden, is_image, is_media_ext, VIDEO_EXTS};
 use crate::thumbs;
 
 pub fn delete_rels(
@@ -32,16 +34,30 @@ pub fn delete_rels(
 }
 
 pub fn confirm_prompt(rels: &[String]) -> String {
+    confirm_prompt_kind(rels, false)
+}
+
+pub fn confirm_prompt_at(root: &Path, rels: &[String]) -> String {
+    let folder = matches!(rels, [one] if root.join(one).is_dir());
+    confirm_prompt_kind(rels, folder)
+}
+
+fn confirm_prompt_kind(rels: &[String], folder: bool) -> String {
     match rels {
-        [one] => {
-            let name = Path::new(one)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(one);
-            format!("Delete {name} permanently?")
+        [one] if folder => {
+            let name = display_name(one);
+            format!("Delete {name} and everything in it?")
         }
+        [one] => format!("Delete {} permanently?", display_name(one)),
         many => format!("Delete {} items permanently?", many.len()),
     }
+}
+
+fn display_name(rel: &str) -> &str {
+    Path::new(rel)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(rel)
 }
 
 pub const CONFIRM_HINT: &str = "y yes · n/Esc cancel";
@@ -62,8 +78,15 @@ pub fn unlink_media(root: &Path, rels: &[String]) -> Result<()> {
         check_rel(rel)?;
     }
     let root = root.canonicalize()?;
-    for path in paths_to_unlink(&root, rels) {
-        unlink_inside(&root, &path)?;
+    for rel in rels {
+        let path = root.join(rel);
+        if path.is_dir() {
+            unlink_tree(&root, rel)?;
+        } else {
+            for path in paths_to_unlink(&root, std::slice::from_ref(rel)) {
+                unlink_inside(&root, &path)?;
+            }
+        }
     }
     Ok(())
 }
@@ -110,6 +133,48 @@ fn check_rel(rel: &str) -> Result<()> {
             .any(|c| !matches!(c, Component::Normal(_)));
     if unsafe_rel {
         bail!("refusing to delete {rel} (outside library)");
+    }
+    Ok(())
+}
+
+fn unlink_tree(root: &Path, rel: &str) -> Result<()> {
+    let dir = root.join(rel);
+    if !dir.exists() {
+        return Ok(());
+    }
+    let canonical = dir.canonicalize()?;
+    if canonical.strip_prefix(root).is_err() || canonical == *root {
+        bail!("refusing to delete {} (outside library)", dir.display());
+    }
+    remove_thumbs_under(root, &canonical)?;
+    match fs::remove_dir_all(&canonical) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+pub(crate) fn remove_thumbs_under(root: &Path, dir: &Path) -> Result<()> {
+    for entry in WalkDir::new(dir).into_iter().filter_entry(|e| {
+        let name = e.file_name().to_string_lossy();
+        if e.file_type().is_dir() {
+            name != ALBUM_DIR && !is_hidden(&name)
+        } else {
+            !is_hidden(&name)
+        }
+    }) {
+        let entry = entry?;
+        if !entry.file_type().is_file() || !is_media_ext(entry.path()) {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let thumb = thumbs::thumb_path(root, &rel);
+        if thumb.is_file() {
+            let _ = fs::remove_file(&thumb);
+        }
     }
     Ok(())
 }
@@ -193,6 +258,16 @@ mod tests {
     }
 
     #[test]
+    fn confirm_prompt_names_a_folder_and_warns_it_is_recursive() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("Rome")).unwrap();
+        assert_eq!(
+            confirm_prompt_at(dir.path(), &["Rome".into()]),
+            "Delete Rome and everything in it?"
+        );
+    }
+
+    #[test]
     fn companion_paths_include_same_stem_motion() {
         let dir = tempfile::tempdir().unwrap();
         let still = dir.path().join("IMG_1.HEIC");
@@ -262,6 +337,31 @@ mod tests {
         unlink_media(&root, &["Rome/IMG_1.jpg".into()]).unwrap();
         assert!(!still.exists());
         assert!(!motion.exists());
+        assert!(!thumb.exists());
+
+        index::index_library(&root).unwrap();
+        let conn = catalog::open(&root, false).unwrap();
+        assert_eq!(catalog::count(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn unlink_folder_removes_nested_media_thumbs_and_the_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("library");
+        let album = root.join("2024/Rome");
+        fs::create_dir_all(&album).unwrap();
+        catalog::open(&root, true).unwrap();
+        let still = album.join("IMG_1.jpg");
+        RgbImage::from_pixel(32, 24, Rgb([10, 20, 30]))
+            .save(&still)
+            .unwrap();
+        fs::write(album.join("IMG_1.MOV"), b"motion").unwrap();
+        index::index_library(&root).unwrap();
+        let thumb = thumbs::thumb_path(&root, "2024/Rome/IMG_1.jpg");
+        assert!(thumb.is_file());
+
+        unlink_media(&root, &["2024".into()]).unwrap();
+        assert!(!root.join("2024").exists());
         assert!(!thumb.exists());
 
         index::index_library(&root).unwrap();

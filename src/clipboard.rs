@@ -1,4 +1,4 @@
-//! In-session copy/cut clipboard and paste into another album.
+//! In-session copy/cut clipboard and paste into another album or folder.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -7,6 +7,8 @@ use anyhow::{bail, Context, Result};
 
 use crate::catalog;
 use crate::delete;
+use crate::library::ALBUM_DIR;
+use crate::media::is_hidden;
 use crate::thumbs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,15 +104,24 @@ pub fn unique_dest(dir: &Path, filename: &str) -> Result<PathBuf> {
 }
 
 pub fn paste(root: &Path, clipboard: &Clipboard, dest_album: &str) -> Result<PasteResult> {
+    paste_into(root, clipboard, Some(dest_album), dest_album)
+}
+
+pub fn paste_into(
+    root: &Path,
+    clipboard: &Clipboard,
+    dest_files: Option<&str>,
+    dest_folders: &str,
+) -> Result<PasteResult> {
     for rel in &clipboard.rels {
         check_rel(rel)?;
     }
-    check_album(dest_album)?;
+    if let Some(dest) = dest_files {
+        check_album(dest)?;
+    }
+    check_album(dest_folders)?;
     if clipboard.op == ClipboardOp::Cut
-        && clipboard
-            .rels
-            .iter()
-            .all(|rel| catalog::album_relpath(rel) == dest_album)
+        && same_location_cut(root, clipboard, dest_files, dest_folders)
     {
         return Ok(PasteResult {
             pasted: Vec::new(),
@@ -120,45 +131,168 @@ pub fn paste(root: &Path, clipboard: &Clipboard, dest_album: &str) -> Result<Pas
     }
 
     let root = root.canonicalize()?;
-    let dest_dir = dest_album_dir(&root, dest_album);
-    fs::create_dir_all(&dest_dir)
-        .with_context(|| format!("create album {}", dest_dir.display()))?;
+    if let Some(dest) = dest_files {
+        fs::create_dir_all(dest_album_dir(&root, dest))
+            .with_context(|| format!("create album {}", dest))?;
+    }
+    fs::create_dir_all(dest_album_dir(&root, dest_folders))
+        .with_context(|| format!("create folder {}", dest_folders))?;
 
     let mut pasted = Vec::new();
     let mut skipped = 0;
+    let cut = clipboard.op == ClipboardOp::Cut;
     for rel in &clipboard.rels {
         let src = root.join(rel);
-        if !src.is_file() {
+        if src.is_dir() {
+            pasted.push(paste_folder(&root, rel, &src, dest_folders, cut)?);
+        } else if src.is_file() {
+            let Some(dest_album) = dest_files else {
+                skipped += 1;
+                continue;
+            };
+            match paste_file(&root, rel, &src, dest_album, cut)? {
+                Some(dest_rel) => pasted.push(dest_rel),
+                None => skipped += 1,
+            }
+        } else {
             skipped += 1;
-            continue;
         }
-        let filename = src
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow::anyhow!("could not paste {rel}"))?;
-        let companions = delete::live_motion_paths_for_still(&src);
-        let (dest, companion_dests) = plan_dest(&dest_dir, filename, &companions)?;
-        ensure_inside(&root, &dest)?;
-        transfer_file(&src, &dest, clipboard.op == ClipboardOp::Cut)?;
-        for (companion, companion_dest) in companions.iter().zip(&companion_dests) {
-            ensure_inside(&root, companion_dest)?;
-            if companion.is_file() {
-                transfer_file(companion, companion_dest, clipboard.op == ClipboardOp::Cut)?;
-            }
-        }
-        if clipboard.op == ClipboardOp::Cut {
-            let thumb = thumbs::thumb_path(&root, rel);
-            if thumb.is_file() {
-                let _ = fs::remove_file(&thumb);
-            }
-        }
-        pasted.push(relpath_in(&root, &dest)?);
     }
     Ok(PasteResult {
         pasted,
         skipped,
         same_album_cut: false,
     })
+}
+
+fn same_location_cut(
+    root: &Path,
+    clipboard: &Clipboard,
+    dest_files: Option<&str>,
+    dest_folders: &str,
+) -> bool {
+    clipboard.rels.iter().all(|rel| {
+        let src = root.join(rel);
+        if src.is_dir() {
+            catalog::album_relpath(rel) == dest_folders
+        } else if src.is_file() {
+            dest_files.is_some_and(|dest| catalog::album_relpath(rel) == dest)
+        } else {
+            true
+        }
+    })
+}
+
+fn dest_is_inside_src(src_rel: &str, dest_parent: &str) -> bool {
+    dest_parent == src_rel || dest_parent.starts_with(&format!("{src_rel}/"))
+}
+
+fn paste_file(
+    root: &Path,
+    rel: &str,
+    src: &Path,
+    dest_album: &str,
+    cut: bool,
+) -> Result<Option<String>> {
+    let dest_dir = dest_album_dir(root, dest_album);
+    let filename = src
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("could not paste {rel}"))?;
+    let companions = delete::live_motion_paths_for_still(src);
+    let (dest, companion_dests) = plan_dest(&dest_dir, filename, &companions)?;
+    ensure_inside(root, &dest)?;
+    transfer_file(src, &dest, cut)?;
+    for (companion, companion_dest) in companions.iter().zip(&companion_dests) {
+        ensure_inside(root, companion_dest)?;
+        if companion.is_file() {
+            transfer_file(companion, companion_dest, cut)?;
+        }
+    }
+    if cut {
+        let thumb = thumbs::thumb_path(root, rel);
+        if thumb.is_file() {
+            let _ = fs::remove_file(&thumb);
+        }
+    }
+    Ok(Some(relpath_in(root, &dest)?))
+}
+
+fn paste_folder(
+    root: &Path,
+    rel: &str,
+    src: &Path,
+    dest_parent: &str,
+    cut: bool,
+) -> Result<String> {
+    if dest_is_inside_src(rel, dest_parent) {
+        bail!("cannot paste {rel} into itself");
+    }
+    let dest_dir = dest_album_dir(root, dest_parent);
+    let name = src
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("could not paste {rel}"))?;
+    let dest = unique_dir_dest(&dest_dir, name)?;
+    ensure_inside(root, &dest)?;
+    if cut {
+        delete::remove_thumbs_under(root, src)?;
+    }
+    transfer_dir(src, &dest, cut)?;
+    relpath_in(root, &dest)
+}
+
+fn unique_dir_dest(parent: &Path, name: &str) -> Result<PathBuf> {
+    for n in 0..10_000u32 {
+        let candidate = if n == 0 {
+            name.to_string()
+        } else if n == 1 {
+            continue;
+        } else {
+            format!("{name}-{n}")
+        };
+        let dest = parent.join(&candidate);
+        if !dest.exists() {
+            return Ok(dest);
+        }
+    }
+    bail!("could not choose a free folder name for {name}");
+}
+
+fn transfer_dir(src: &Path, dest: &Path, cut: bool) -> Result<()> {
+    if dest.exists() {
+        bail!("destination already exists: {}", dest.display());
+    }
+    if cut && fs::rename(src, dest).is_ok() {
+        return Ok(());
+    }
+    copy_dir_recursive(src, dest)?;
+    if cut {
+        fs::remove_dir_all(src).with_context(|| format!("remove {}", src.display()))?;
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
+    for entry in fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if is_hidden(&name) || name == ALBUM_DIR {
+            continue;
+        }
+        let from = entry.path();
+        let to = dest.join(name.as_ref());
+        if from.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)
+                .with_context(|| format!("copy {} → {}", from.display(), to.display()))?;
+        }
+    }
+    Ok(())
 }
 
 fn dest_album_dir(root: &Path, album: &str) -> PathBuf {
@@ -547,5 +681,99 @@ mod tests {
         let paris = catalog::photos_in_album(&conn, "Paris").unwrap();
         assert_eq!(paris.len(), 1);
         assert_eq!(paris[0].relpath, "Paris/IMG_1.jpg");
+    }
+
+    #[test]
+    fn copy_folder_into_another_collection() {
+        let (_tmp, root) = mini_library();
+        fs::create_dir_all(root.join("2024")).unwrap();
+        write_still(&root.join("Rome/photo.jpg"));
+        index::index_library(&root).unwrap();
+        let clip = Clipboard {
+            op: ClipboardOp::Copy,
+            rels: vec!["Rome".into()],
+        };
+        let result = paste_into(&root, &clip, None, "2024").unwrap();
+        assert_eq!(result.pasted, vec!["2024/Rome"]);
+        assert!(root.join("Rome/photo.jpg").is_file());
+        assert!(root.join("2024/Rome/photo.jpg").is_file());
+        index::index_library(&root).unwrap();
+        let conn = catalog::open(&root, false).unwrap();
+        assert_eq!(catalog::count(&conn).unwrap(), 2);
+    }
+
+    #[test]
+    fn copy_folder_into_occupied_name_yields_dash_two() {
+        let (_tmp, root) = mini_library();
+        write_still(&root.join("Rome/a.jpg"));
+        write_still(&root.join("Paris/b.jpg"));
+        let clip = Clipboard {
+            op: ClipboardOp::Copy,
+            rels: vec!["Rome".into()],
+        };
+        let result = paste_into(&root, &clip, None, ".").unwrap();
+        assert_eq!(result.pasted, vec!["Rome-2"]);
+        assert!(root.join("Rome/a.jpg").is_file());
+        assert!(root.join("Rome-2/a.jpg").is_file());
+    }
+
+    #[test]
+    fn cut_folder_moves_nested_media_then_reindex() {
+        let (_tmp, root) = mini_library();
+        fs::create_dir_all(root.join("2024")).unwrap();
+        write_still(&root.join("Rome/IMG_1.jpg"));
+        fs::write(root.join("Rome/IMG_1.MOV"), b"motion").unwrap();
+        index::index_library(&root).unwrap();
+        let clip = Clipboard {
+            op: ClipboardOp::Cut,
+            rels: vec!["Rome".into()],
+        };
+        let result = paste_into(&root, &clip, None, "2024").unwrap();
+        assert_eq!(result.pasted, vec!["2024/Rome"]);
+        assert!(!root.join("Rome").exists());
+        assert!(root.join("2024/Rome/IMG_1.jpg").is_file());
+        assert!(root.join("2024/Rome/IMG_1.MOV").is_file());
+        index::index_library(&root).unwrap();
+        let conn = catalog::open(&root, false).unwrap();
+        assert_eq!(catalog::count(&conn).unwrap(), 1);
+        let photos = catalog::photos_in_album(&conn, "2024/Rome").unwrap();
+        assert_eq!(photos[0].relpath, "2024/Rome/IMG_1.jpg");
+    }
+
+    #[test]
+    fn same_parent_folder_cut_is_a_noop() {
+        let (_tmp, root) = mini_library();
+        write_still(&root.join("Rome/a.jpg"));
+        let clip = Clipboard {
+            op: ClipboardOp::Cut,
+            rels: vec!["Rome".into()],
+        };
+        let result = paste_into(&root, &clip, None, ".").unwrap();
+        assert!(result.same_album_cut);
+        assert!(root.join("Rome/a.jpg").is_file());
+    }
+
+    #[test]
+    fn refuses_pasting_a_folder_into_itself() {
+        let (_tmp, root) = mini_library();
+        fs::create_dir_all(root.join("2024/Rome")).unwrap();
+        write_still(&root.join("2024/Rome/a.jpg"));
+        let clip = Clipboard {
+            op: ClipboardOp::Copy,
+            rels: vec!["2024".into()],
+        };
+        let err = paste_into(&root, &clip, None, "2024").unwrap_err();
+        assert!(err.to_string().contains("into itself"));
+        let err = paste_into(&root, &clip, None, "2024/Rome").unwrap_err();
+        assert!(err.to_string().contains("into itself"));
+    }
+
+    #[test]
+    fn dest_inside_src_detects_self_and_descendants() {
+        assert!(dest_is_inside_src("2024", "2024"));
+        assert!(dest_is_inside_src("2024", "2024/Rome"));
+        assert!(!dest_is_inside_src("2024", "."));
+        assert!(!dest_is_inside_src("2024", "2025"));
+        assert!(!dest_is_inside_src("Rome", "2024"));
     }
 }

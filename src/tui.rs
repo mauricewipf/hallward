@@ -5,11 +5,11 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use crossterm::cursor::MoveTo;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use crossterm::cursor::MoveTo;
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -354,13 +354,7 @@ impl App {
         self.pending_ask = None;
         self.gemini_key_overlay = None;
         self.ask.waiting_from = Some(Instant::now());
-        self.ask.job = Some(ai::spawn(
-            generation,
-            prompt,
-            files,
-            self.root.clone(),
-            key,
-        ));
+        self.ask.job = Some(ai::spawn(generation, prompt, files, self.root.clone(), key));
     }
 
     fn dismiss_gemini_key_overlay(&mut self) {
@@ -803,12 +797,34 @@ fn classify_esc(has_marks: bool, has_clipboard: bool, has_query: bool) -> EscTar
 }
 
 fn selected_targets(app: &App) -> Vec<String> {
-    delete::delete_rels(
+    let photos = delete::delete_rels(
         &app.photos,
         &app.marked,
         app.focus == Focus::Grid,
         app.grid_idx,
-    )
+    );
+    if !photos.is_empty() {
+        return photos;
+    }
+    miller_folder_target(app.focus, app.selected_folder().map(App::album_key))
+        .into_iter()
+        .collect()
+}
+
+fn miller_folder_target(focus: Focus, folder_key: Option<String>) -> Option<String> {
+    if focus != Focus::Miller {
+        return None;
+    }
+    folder_key.filter(|key| key != ".")
+}
+
+fn folder_dest_key(rel: &Path) -> String {
+    let s = rel.to_string_lossy().replace('\\', "/");
+    if s.is_empty() {
+        ".".into()
+    } else {
+        s
+    }
 }
 
 fn set_clipboard(app: &mut App, op: ClipboardOp) {
@@ -843,16 +859,17 @@ fn paste_clipboard(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdou
     let Some(clip) = app.clipboard.clone() else {
         return Ok(());
     };
-    let dest = match app.gallery_folder() {
-        Some(folder) => App::album_key(folder),
-        None => {
-            app.status = "select an album to paste".into();
-            return Ok(());
-        }
-    };
-    match clipboard::paste(&app.root, &clip, &dest) {
+    let dest_files = app.gallery_folder().map(App::album_key);
+    let dest_folders = folder_dest_key(&create_folder_parent(app));
+    let has_folder = clip.rels.iter().any(|rel| app.root.join(rel).is_dir());
+    let has_file = clip.rels.iter().any(|rel| app.root.join(rel).is_file());
+    if has_file && dest_files.is_none() && !has_folder {
+        app.status = "select an album to paste".into();
+        return Ok(());
+    }
+    match clipboard::paste_into(&app.root, &clip, dest_files.as_deref(), &dest_folders) {
         Ok(result) if result.same_album_cut => {
-            app.status = "already in this album".into();
+            app.status = "already here".into();
         }
         Ok(result) if result.pasted.is_empty() => {
             app.status = "nothing to paste".into();
@@ -1357,12 +1374,20 @@ fn reindex_focusing(
             } else {
                 search::filter_tree(&app.full_tree, &app.query)
             };
-            clamp_cursor(app);
+            if let Some(rel) = focus_rel.filter(|rel| app.root.join(rel).is_dir()) {
+                focus_folder_path(app, Path::new(rel));
+            } else {
+                clamp_cursor(app);
+            }
         }
         Err(e) => app.status = format!("{} · tree scan failed: {e:#}", app.status),
     }
     app.protocols.clear();
-    app.reload_photos_focusing(focus_rel);
+    if focus_rel.is_some_and(|rel| app.root.join(rel).is_dir()) {
+        app.reload_photos();
+    } else {
+        app.reload_photos_focusing(focus_rel);
+    }
     Ok(())
 }
 
@@ -1461,7 +1486,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     draw_exif(frame, app, bottom[0]);
     draw_status(frame, app, bottom[1]);
     if let Some(rels) = app.pending_delete.as_deref() {
-        draw_delete_confirm(frame, rels);
+        draw_delete_confirm(frame, &app.root, rels);
     }
     if app.gemini_key_overlay.is_some() {
         draw_gemini_key_overlay(frame, app);
@@ -1559,7 +1584,13 @@ fn draw_miller_col(frame: &mut Frame, app: &mut App, col: usize, area: Rect) {
                 Kind::Collection => "▸ ",
                 Kind::Album => "  ",
             };
-            ListItem::new(format!("{mark}{}", f.display_name()))
+            let rel = App::album_key(f);
+            let clip = clipboard_op_for(app.clipboard.as_ref(), &rel);
+            let style = match clip {
+                Some(_) => Style::default().fg(Color::Cyan),
+                None => Style::default(),
+            };
+            ListItem::new(format!("{mark}{}", f.display_name())).style(style)
         })
         .collect();
     let focused = app.focus == Focus::Miller && app.miller_focus == col;
@@ -1793,13 +1824,17 @@ fn status_tools_line(viewer: &str, video: &str, thumbs: &str) -> String {
     )
 }
 
-fn draw_delete_confirm(frame: &mut Frame, rels: &[String]) {
+fn draw_delete_confirm(frame: &mut Frame, root: &Path, rels: &[String]) {
     let area = frame.area();
     let width = area.width.min(52).max(28.min(area.width));
     let height = 5.min(area.height);
     let popup = centered_rect(width, height, area);
     frame.render_widget(Clear, popup);
-    let text = format!("{}\n{}", delete::confirm_prompt(rels), delete::CONFIRM_HINT);
+    let text = format!(
+        "{}\n{}",
+        delete::confirm_prompt_at(root, rels),
+        delete::CONFIRM_HINT
+    );
     frame.render_widget(
         Paragraph::new(text).alignment(Alignment::Center).block(
             Block::default()
@@ -1813,8 +1848,7 @@ fn draw_delete_confirm(frame: &mut Frame, rels: &[String]) {
 
 const GEMINI_KEY_URL: &str = "https://openrouter.ai/keys";
 
-const GEMINI_KEY_HINT: &str =
-    "Photos are sent to OpenRouter and may use paid quota.\n\
+const GEMINI_KEY_HINT: &str = "Photos are sent to OpenRouter and may use paid quota.\n\
 Paste a key from\n\
 https://openrouter.ai/keys";
 
@@ -1846,7 +1880,7 @@ fn draw_gemini_key_overlay(frame: &mut Frame, app: &mut App) {
             Constraint::Length(1), // gap
             Constraint::Length(3), // input field
             Constraint::Length(1), // keybindings
-            Constraint::Min(0),   // error
+            Constraint::Min(0),    // error
         ])
         .split(inner);
 
@@ -2554,17 +2588,11 @@ mod tests {
             CreateFolderKey::Char('a')
         );
         assert_eq!(
-            classify_create_folder_key(KeyEvent::new(
-                KeyCode::Char('A'),
-                KeyModifiers::SHIFT
-            )),
+            classify_create_folder_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
             CreateFolderKey::Char('A')
         );
         assert_eq!(
-            classify_create_folder_key(KeyEvent::new(
-                KeyCode::Char('a'),
-                KeyModifiers::CONTROL
-            )),
+            classify_create_folder_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
             CreateFolderKey::Ignore
         );
     }
@@ -2580,10 +2608,7 @@ mod tests {
             GeminiKeyKey::Cancel
         );
         assert_eq!(
-            classify_gemini_key_key(KeyEvent::new(
-                KeyCode::Char('o'),
-                KeyModifiers::CONTROL
-            )),
+            classify_gemini_key_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
             GeminiKeyKey::Open
         );
         assert_eq!(
@@ -2591,10 +2616,7 @@ mod tests {
             GeminiKeyKey::Char('o')
         );
         assert_eq!(
-            classify_gemini_key_key(KeyEvent::new(
-                KeyCode::Char('v'),
-                KeyModifiers::SUPER
-            )),
+            classify_gemini_key_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER)),
             GeminiKeyKey::Ignore
         );
         assert_eq!(
@@ -2639,6 +2661,28 @@ mod tests {
         assert_eq!(classify_esc(false, true, true), EscTarget::Clipboard);
         assert_eq!(classify_esc(false, false, true), EscTarget::Query);
         assert_eq!(classify_esc(false, false, false), EscTarget::None);
+    }
+
+    #[test]
+    fn miller_folder_target_is_the_focused_folder_when_the_tree_has_focus() {
+        assert_eq!(
+            miller_folder_target(Focus::Miller, Some("2024/Rome".into())).as_deref(),
+            Some("2024/Rome")
+        );
+        assert_eq!(miller_folder_target(Focus::Grid, Some("Rome".into())), None);
+        assert_eq!(
+            miller_folder_target(Focus::Search, Some("Rome".into())),
+            None
+        );
+        assert_eq!(miller_folder_target(Focus::Miller, Some(".".into())), None);
+        assert_eq!(miller_folder_target(Focus::Miller, None), None);
+    }
+
+    #[test]
+    fn folder_dest_key_uses_dot_for_the_library_root() {
+        assert_eq!(folder_dest_key(Path::new("")), ".");
+        assert_eq!(folder_dest_key(Path::new("2024")), "2024");
+        assert_eq!(folder_dest_key(Path::new("2024/Rome")), "2024/Rome");
     }
 
     #[test]
@@ -2687,7 +2731,10 @@ mod tests {
             search_pane_title(true, false),
             "Ask AI (Shift+Tab · type to prompt)"
         );
-        assert_eq!(search_pane_title(false, true), "Search (Tab tree · Esc clear)");
+        assert_eq!(
+            search_pane_title(false, true),
+            "Search (Tab tree · Esc clear)"
+        );
         assert_eq!(search_pane_title(false, false), "Search (Shift+Tab)");
     }
 
