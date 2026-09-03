@@ -68,7 +68,7 @@ pub fn unlink_media(root: &Path, rels: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn live_motion_paths_for_still(still: &Path) -> Vec<PathBuf> {
+pub(crate) fn live_motion_paths_for_still(still: &Path) -> Vec<PathBuf> {
     if !is_image(still) {
         return Vec::new();
     }

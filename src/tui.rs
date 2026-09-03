@@ -15,8 +15,11 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use ratatui::{Frame, Terminal};
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
@@ -25,6 +28,7 @@ use rusqlite::Connection;
 
 use crate::ai::{self, AskHandle};
 use crate::catalog::{self, Photo};
+use crate::clipboard::{self, ClipboardOp};
 use crate::delete;
 use crate::image_edit;
 use crate::index;
@@ -37,7 +41,17 @@ use crate::viewer;
 /// Inner image height in rows. Width is derived from the terminal font so the photo is square.
 const CELL_INNER_H: u16 = 6;
 const STATUS_HINT: &str =
-    "arrows move · Space mark · Esc unmark · Enter opens · click toggles mark · double-click opens · type to search · d delete · r reindex · q quit";
+    "arrows move · Space mark · Esc unmark · Enter opens · click toggles mark · double-click opens · type to search · c copy · x cut · p paste · d delete · r reindex · q quit";
+const DASHED_BORDER: border::Set = border::Set {
+    top_left: "┌",
+    top_right: "┐",
+    bottom_left: "└",
+    bottom_right: "┘",
+    vertical_left: "╎",
+    vertical_right: "╎",
+    horizontal_top: "╌",
+    horizontal_bottom: "╌",
+};
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +203,7 @@ struct App {
     last_grid_click: Option<(usize, Instant, bool)>,
     marked: HashSet<String>,
     pending_delete: Option<Vec<String>>,
+    clipboard: Option<clipboard::Clipboard>,
     ask: AskAi,
 }
 
@@ -218,6 +233,7 @@ impl App {
             last_grid_click: None,
             marked: HashSet::new(),
             pending_delete: None,
+            clipboard: None,
             ask: AskAi::new(),
         };
         app.reload_photos();
@@ -493,18 +509,35 @@ fn handle_key(
     match key.code {
         KeyCode::Char('q') if !ask_ai => return Ok(true),
         KeyCode::Char('r') if !ask_ai => reindex(app, terminal)?,
-        KeyCode::Char('d') if !delete_targets(app).is_empty() => {
-            app.pending_delete = Some(delete_targets(app));
+        KeyCode::Char('d') if !selected_targets(app).is_empty() => {
+            app.pending_delete = Some(selected_targets(app));
         }
-        KeyCode::Esc => {
-            if !app.marked.is_empty() {
+        KeyCode::Char('c') if !selected_targets(app).is_empty() => {
+            set_clipboard(app, ClipboardOp::Copy);
+        }
+        KeyCode::Char('x') if !selected_targets(app).is_empty() => {
+            set_clipboard(app, ClipboardOp::Cut);
+        }
+        KeyCode::Char('p') if app.clipboard.is_some() => paste_clipboard(app, terminal)?,
+        KeyCode::Esc => match classify_esc(
+            !app.marked.is_empty(),
+            app.clipboard.is_some(),
+            !app.query.is_empty(),
+        ) {
+            EscTarget::Marks => {
                 app.marked.clear();
                 app.sync_ask_selection();
-            } else if !app.query.is_empty() {
+            }
+            EscTarget::Clipboard => {
+                app.clipboard = None;
+                app.status = STATUS_HINT.into();
+            }
+            EscTarget::Query => {
                 app.query.clear();
                 app.apply_query();
             }
-        }
+            EscTarget::None => {}
+        },
         KeyCode::Tab => {
             if library_tab_focuses_ask(ask_ai, !app.query.is_empty()) {
                 app.focus = Focus::Search;
@@ -623,13 +656,91 @@ fn classify_confirm_key(code: KeyCode) -> ConfirmKey {
     }
 }
 
-fn delete_targets(app: &App) -> Vec<String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscTarget {
+    Marks,
+    Clipboard,
+    Query,
+    None,
+}
+
+fn classify_esc(has_marks: bool, has_clipboard: bool, has_query: bool) -> EscTarget {
+    if has_marks {
+        EscTarget::Marks
+    } else if has_clipboard {
+        EscTarget::Clipboard
+    } else if has_query {
+        EscTarget::Query
+    } else {
+        EscTarget::None
+    }
+}
+
+fn selected_targets(app: &App) -> Vec<String> {
     delete::delete_rels(
         &app.photos,
         &app.marked,
         app.focus == Focus::Grid,
         app.grid_idx,
     )
+}
+
+fn set_clipboard(app: &mut App, op: ClipboardOp) {
+    let extra = selected_targets(app);
+    app.clipboard = clipboard::Clipboard::from_key(app.clipboard.take(), extra, op);
+    app.marked.clear();
+    app.sync_ask_selection();
+    let Some(clip) = app.clipboard.as_ref() else {
+        app.status = STATUS_HINT.into();
+        return;
+    };
+    app.status = match clip.op {
+        ClipboardOp::Copy => clipboard::copied_message(clip.rels.len()),
+        ClipboardOp::Cut => clipboard::cut_message(clip.rels.len()),
+    };
+}
+
+fn absorb_marks_into_clipboard(app: &mut App) {
+    if app.marked.is_empty() {
+        return;
+    }
+    let extra = selected_targets(app);
+    if let Some(clip) = app.clipboard.take() {
+        app.clipboard = Some(clip.absorbing_marks(&extra));
+    }
+    app.marked.clear();
+    app.sync_ask_selection();
+}
+
+fn paste_clipboard(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    absorb_marks_into_clipboard(app);
+    let Some(clip) = app.clipboard.clone() else {
+        return Ok(());
+    };
+    let dest = match app.current_album() {
+        Some(album) => App::album_key(album),
+        None => {
+            app.status = "select an album to paste".into();
+            return Ok(());
+        }
+    };
+    match clipboard::paste(&app.root, &clip, &dest) {
+        Ok(result) if result.same_album_cut => {
+            app.status = "already in this album".into();
+        }
+        Ok(result) if result.pasted.is_empty() => {
+            app.status = "nothing to paste".into();
+        }
+        Ok(result) => {
+            if clip.op == ClipboardOp::Cut {
+                app.clipboard = None;
+            }
+            let focus = result.pasted.first().cloned();
+            reindex_focusing(app, terminal, focus.as_deref())?;
+        }
+        Err(e) => app.status = format!("paste failed: {e:#}"),
+    }
+    Ok(())
 }
 
 fn ask_scroll_page(pane_height: u16) -> u16 {
@@ -852,15 +963,54 @@ fn grid_cell_focused(focus: Focus, grid_idx: usize, idx: usize) -> bool {
     focus == Focus::Grid && idx == grid_idx
 }
 
-fn grid_cell_border_style(focused: bool, marked: bool) -> Style {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CellBorder {
+    Focus,
+    Copied,
+    Cut,
+    Marked,
+    Idle,
+}
+
+fn cell_border(focused: bool, clip: Option<ClipboardOp>, marked: bool) -> CellBorder {
     if focused {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
+        CellBorder::Focus
+    } else if clip == Some(ClipboardOp::Copy) {
+        CellBorder::Copied
+    } else if clip == Some(ClipboardOp::Cut) {
+        CellBorder::Cut
     } else if marked {
-        Style::default().fg(Color::Cyan)
+        CellBorder::Marked
     } else {
-        Style::default().fg(Color::Rgb(40, 40, 40))
+        CellBorder::Idle
+    }
+}
+
+fn clipboard_op_for(clip: Option<&clipboard::Clipboard>, rel: &str) -> Option<ClipboardOp> {
+    clip.filter(|c| c.rels.iter().any(|r| r == rel))
+        .map(|c| c.op)
+}
+
+fn grid_cell_border_style(kind: CellBorder) -> Style {
+    match kind {
+        CellBorder::Focus => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        CellBorder::Copied | CellBorder::Cut | CellBorder::Marked => {
+            Style::default().fg(Color::Cyan)
+        }
+        CellBorder::Idle => Style::default().fg(Color::Rgb(40, 40, 40)),
+    }
+}
+
+fn grid_cell_block(kind: CellBorder) -> Block<'static> {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(grid_cell_border_style(kind));
+    match kind {
+        CellBorder::Copied => block.border_type(BorderType::Double),
+        CellBorder::Cut => block.border_set(DASHED_BORDER),
+        _ => block,
     }
 }
 
@@ -872,18 +1022,39 @@ fn album_grid_footer(
     pos: usize,
     total: usize,
     marked_count: usize,
+    clip_label: Option<String>,
     photo_focused: bool,
 ) -> Option<String> {
-    let marked = (marked_count > 0).then(|| format!("{marked_count} marked"));
+    let mut parts: Vec<String> = Vec::new();
     if photo_focused {
-        let index = format!("{pos}/{total}");
-        Some(match marked {
-            Some(m) => format!("{index} · {m}"),
-            None => index,
-        })
-    } else {
-        marked
+        parts.push(format!("{pos}/{total}"));
     }
+    if marked_count > 0 {
+        parts.push(format!("{marked_count} marked"));
+    }
+    if let Some(clip) = clip_label {
+        parts.push(clip);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
+fn clipboard_footer_label(photos: &[Photo], clip: Option<&clipboard::Clipboard>) -> Option<String> {
+    let clip = clip?;
+    let n = photos
+        .iter()
+        .filter(|photo| clip.rels.iter().any(|rel| rel == &photo.relpath))
+        .count();
+    if n == 0 {
+        return None;
+    }
+    Some(match clip.op {
+        ClipboardOp::Copy => format!("{n} copied"),
+        ClipboardOp::Cut => format!("{n} cut"),
+    })
 }
 
 fn album_media_summary(photos: &[Photo]) -> Vec<String> {
@@ -1020,6 +1191,14 @@ fn confirm_pending_delete(
 }
 
 fn reindex(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    reindex_focusing(app, terminal, None)
+}
+
+fn reindex_focusing(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    focus_rel: Option<&str>,
+) -> Result<()> {
     app.status = "indexing…".into();
     terminal.draw(|f| draw(f, app))?;
     match index::index_library(&app.root) {
@@ -1041,7 +1220,7 @@ fn reindex(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> 
         Err(e) => app.status = format!("{} · tree scan failed: {e:#}", app.status),
     }
     app.protocols.clear();
-    app.reload_photos();
+    app.reload_photos_focusing(focus_rel);
     Ok(())
 }
 
@@ -1286,7 +1465,9 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border)
         .title(heading);
-    let block = match album_grid_footer(pos, app.photos.len(), app.marked.len(), focused) {
+    let clip_label = clipboard_footer_label(&app.photos, app.clipboard.as_ref());
+    let block =
+        match album_grid_footer(pos, app.photos.len(), app.marked.len(), clip_label, focused) {
         Some(footer) => block.title_bottom(footer),
         None => block,
     };
@@ -1363,9 +1544,8 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         let focused = grid_cell_focused(app.focus, app.grid_idx, idx);
         let marked = app.marked.contains(rel);
-        let cell_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(grid_cell_border_style(focused, marked));
+        let clip = clipboard_op_for(app.clipboard.as_ref(), rel);
+        let cell_block = grid_cell_block(cell_border(focused, clip, marked));
         let img_area = cell_block.inner(cell);
         frame.render_widget(cell_block, cell);
         if let Some(proto) = app.protocols.get_mut(rel) {
@@ -1699,13 +1879,33 @@ mod tests {
 
     #[test]
     fn grid_cell_border_focus_wins_over_mark() {
-        let focused = grid_cell_border_style(true, true);
+        let focused = grid_cell_border_style(CellBorder::Focus);
         assert_eq!(focused.fg, Some(Color::Yellow));
         assert!(focused.add_modifier.contains(Modifier::BOLD));
-        let marked = grid_cell_border_style(false, true);
+        let marked = grid_cell_border_style(CellBorder::Marked);
         assert_eq!(marked.fg, Some(Color::Cyan));
-        let idle = grid_cell_border_style(false, false);
+        let idle = grid_cell_border_style(CellBorder::Idle);
         assert_eq!(idle.fg, Some(Color::Rgb(40, 40, 40)));
+    }
+
+    #[test]
+    fn cell_border_copy_is_double_cut_is_dashed() {
+        assert_eq!(
+            cell_border(false, Some(ClipboardOp::Copy), true),
+            CellBorder::Copied
+        );
+        assert_eq!(
+            cell_border(false, Some(ClipboardOp::Cut), true),
+            CellBorder::Cut
+        );
+        assert_eq!(
+            cell_border(true, Some(ClipboardOp::Cut), true),
+            CellBorder::Focus
+        );
+        assert_eq!(DASHED_BORDER.horizontal_top, "╌");
+        assert_eq!(DASHED_BORDER.vertical_left, "╎");
+        let _copied = grid_cell_block(CellBorder::Copied);
+        let _cut = grid_cell_block(CellBorder::Cut);
     }
 
     #[test]
@@ -1715,13 +1915,24 @@ mod tests {
 
     #[test]
     fn album_footer_index_when_gallery_is_focused() {
-        assert_eq!(album_grid_footer(1, 3, 0, true), Some("1/3".into()));
+        assert_eq!(album_grid_footer(1, 3, 0, None, true), Some("1/3".into()));
         assert_eq!(
-            album_grid_footer(1, 3, 3, true),
+            album_grid_footer(1, 3, 3, None, true),
             Some("1/3 · 3 marked".into())
         );
-        assert_eq!(album_grid_footer(1, 3, 0, false), None);
-        assert_eq!(album_grid_footer(1, 3, 3, false), Some("3 marked".into()));
+        assert_eq!(album_grid_footer(1, 3, 0, None, false), None);
+        assert_eq!(
+            album_grid_footer(1, 3, 3, None, false),
+            Some("3 marked".into())
+        );
+        assert_eq!(
+            album_grid_footer(1, 3, 0, Some("2 copied".into()), true),
+            Some("1/3 · 2 copied".into())
+        );
+        assert_eq!(
+            album_grid_footer(1, 3, 2, Some("2 cut".into()), true),
+            Some("1/3 · 2 marked · 2 cut".into())
+        );
     }
 
     #[test]
@@ -1750,6 +1961,9 @@ mod tests {
         assert!(STATUS_HINT.contains("Esc unmark"));
         assert!(STATUS_HINT.contains("Enter opens"));
         assert!(STATUS_HINT.contains("d delete"));
+        assert!(STATUS_HINT.contains("c copy"));
+        assert!(STATUS_HINT.contains("x cut"));
+        assert!(STATUS_HINT.contains("p paste"));
     }
 
     #[test]
@@ -1761,6 +1975,14 @@ mod tests {
         assert_eq!(classify_confirm_key(KeyCode::Esc), ConfirmKey::No);
         assert_eq!(classify_confirm_key(KeyCode::Char('d')), ConfirmKey::Ignore);
         assert_eq!(classify_confirm_key(KeyCode::Enter), ConfirmKey::Ignore);
+    }
+
+    #[test]
+    fn esc_clears_marks_then_clipboard_then_search() {
+        assert_eq!(classify_esc(true, true, true), EscTarget::Marks);
+        assert_eq!(classify_esc(false, true, true), EscTarget::Clipboard);
+        assert_eq!(classify_esc(false, false, true), EscTarget::Query);
+        assert_eq!(classify_esc(false, false, false), EscTarget::None);
     }
 
     #[test]
