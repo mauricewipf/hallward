@@ -2335,9 +2335,10 @@ mod tests {
 
     #[test]
     fn status_tools_line_includes_openrouter_models() {
+        let (ask, edit) = credentials::effective_models();
         assert_eq!(
             status_tools_line("Preview", "mpv", "kitty"),
-            "viewer: Preview · video: mpv · thumbs: kitty · ask: google/gemini-3.8-flash · edit: google/gemini-3.1-flash-image"
+            format!("viewer: Preview · video: mpv · thumbs: kitty · ask: {ask} · edit: {edit}")
         );
     }
 

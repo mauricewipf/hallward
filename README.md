@@ -77,9 +77,9 @@ hallward --root PATH   # library is PATH instead of cwd
 
 Mark with `Space` key one or more **images** and the search bar becomes **Ask AI**.
 
-Type a question and press Enter: "Which car is this?" OpenRouter answers in the pane (`google/gemini-3.8-flash`).
+Type a question and press Enter: "Which car is this?" OpenRouter answers in the pane (`google/gemini-3.5-flash-lite`).
 
-If the prompt is an edit instruction such as "Remove the persons in the background.", Hallward classifies it with OpenRouter, then edits with `google/gemini-3.1-flash-image`. The first Ask AI request may ask for an OpenRouter API key in a popup; you can also set `OPENROUTER_API_KEY` or save a key in `~/.config/hallward/credentials`. The edited photo is saved as a new sibling file (`photo-edited.png`, then `photo-edited-2.png`, …). The original is never overwritten. Editing needs **exactly one** marked still. Esc cancels an in-flight request.
+If the prompt is an edit instruction such as "Remove the persons in the background.", Hallward classifies it with OpenRouter, then edits with `google/gemini-3.1-flash-lite-image`. The first Ask AI request may ask for an OpenRouter API key in a popup; you can also set `OPENROUTER_API_KEY` or save a key in `~/.config/hallward/credentials`. The edited photo is saved as a new sibling file (`photo-edited.png`, then `photo-edited-2.png`, …). The original is never overwritten. Editing needs **exactly one** marked still. Esc cancels an in-flight request.
 
 ![Ask AI](assets/2026-09-02_ai-chat.png)
 
