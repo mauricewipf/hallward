@@ -348,7 +348,7 @@ pub fn ask_ai_active(agent: Option<&str>, stills: &[String]) -> bool {
 
 pub fn waiting_text(phase: AskProgress, started: Instant, now: Instant) -> String {
     let base = match phase {
-        AskProgress::Analyzing => "Analyzing prompt",
+        AskProgress::Analyzing => "Waiting",
         AskProgress::Editing => "Editing image",
         AskProgress::Indexing => "Indexing result",
     };
@@ -1601,13 +1601,10 @@ mod tests {
     #[test]
     fn waiting_dots_cycle_through_three_then_none() {
         let t0 = Instant::now();
-        assert_eq!(
-            waiting_text(AskProgress::Analyzing, t0, t0),
-            "Analyzing prompt"
-        );
+        assert_eq!(waiting_text(AskProgress::Analyzing, t0, t0), "Waiting");
         assert_eq!(
             waiting_text(AskProgress::Analyzing, t0, t0 + Duration::from_millis(400)),
-            "Analyzing prompt."
+            "Waiting."
         );
         assert_eq!(
             waiting_text(AskProgress::Editing, t0, t0 + Duration::from_millis(800)),
@@ -1619,7 +1616,7 @@ mod tests {
         );
         assert_eq!(
             waiting_text(AskProgress::Analyzing, t0, t0 + Duration::from_millis(1600)),
-            "Analyzing prompt"
+            "Waiting"
         );
     }
 

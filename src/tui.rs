@@ -1817,11 +1817,11 @@ mod tests {
 
     #[test]
     fn ask_ai_lines_are_two_paragraphs() {
-        let lines = ask_ai_lines("describe this", Some("Analyzing prompt..."), false, false);
+        let lines = ask_ai_lines("describe this", Some("Waiting..."), false, false);
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].spans[0].content, "describe this");
         assert_eq!(lines[1].spans.len(), 0);
-        assert_eq!(lines[2].spans[0].content, "Analyzing prompt...");
+        assert_eq!(lines[2].spans[0].content, "Waiting...");
     }
 
     #[test]
