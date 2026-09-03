@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::cursor::MoveTo;
 use crossterm::execute;
@@ -71,7 +71,6 @@ enum AskReply {
 }
 
 struct AskAi {
-    agent: Option<String>,
     prompt: String,
     reply: Option<AskReply>,
     waiting_from: Option<Instant>,
@@ -81,10 +80,11 @@ struct AskAi {
     scroll: u16,
 }
 
+/// Ask AI waiting on an OpenRouter API key before the first (or retried) request.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingGeminiEdit {
-    instruction: String,
-    source: PathBuf,
+struct PendingAsk {
+    prompt: String,
+    files: Vec<PathBuf>,
     generation: u64,
 }
 
@@ -96,7 +96,6 @@ struct GeminiKeyOverlay {
 impl AskAi {
     fn new() -> Self {
         Self {
-            agent: ai::resolve_agent(),
             prompt: String::new(),
             reply: None,
             waiting_from: None,
@@ -188,12 +187,22 @@ pub fn run(root: PathBuf) -> Result<()> {
 }
 
 fn enter_tui<W: std::io::Write>(out: &mut W) -> Result<()> {
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        out,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     Ok(())
 }
 
 fn leave_tui<W: std::io::Write>(out: &mut W) -> Result<()> {
-    execute!(out, DisableMouseCapture, LeaveAlternateScreen)?;
+    execute!(
+        out,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     Ok(())
 }
 
@@ -219,9 +228,11 @@ struct App {
     marked: HashSet<String>,
     pending_delete: Option<Vec<String>>,
     clipboard: Option<clipboard::Clipboard>,
-    pending_gemini_edit: Option<PendingGeminiEdit>,
+    pending_ask: Option<PendingAsk>,
     gemini_key_overlay: Option<GeminiKeyOverlay>,
     gemini_url_rect: Option<Rect>,
+    /// Screen cells where an OSC 8 URL was painted outside ratatui's buffer.
+    gemini_url_written: Option<Rect>,
     ask: AskAi,
 }
 
@@ -252,21 +263,18 @@ impl App {
             marked: HashSet::new(),
             pending_delete: None,
             clipboard: None,
-            pending_gemini_edit: None,
+            pending_ask: None,
             gemini_key_overlay: None,
             gemini_url_rect: None,
+            gemini_url_written: None,
             ask: AskAi::new(),
         };
         app.reload_photos();
         Ok(app)
     }
 
-    fn refresh_agent(&mut self) {
-        self.ask.agent = ai::resolve_agent();
-    }
-
     fn ask_active(&self) -> bool {
-        ai::ask_ai_active(self.ask.agent.as_deref(), &self.ask.selection)
+        ai::ask_ai_active(&self.ask.selection)
     }
 
     fn sync_ask_selection(&mut self) {
@@ -295,11 +303,8 @@ impl App {
             Ok(ai::AskValue::Answer(text)) => {
                 self.ask.reply = Some(AskReply::Text(text));
             }
-            Ok(ai::AskValue::Edit { instruction }) => {
-                self.begin_gemini_edit(instruction);
-            }
             Ok(ai::AskValue::Saved(saved)) => {
-                self.pending_gemini_edit = None;
+                self.pending_ask = None;
                 self.gemini_key_overlay = None;
                 self.focus_saved_edit(&saved.relpath);
                 let message = image_edit::saved_message(&saved.filename);
@@ -308,61 +313,50 @@ impl App {
             }
             Err(err) => {
                 if credentials::is_invalid_saved_key_error(&err) {
+                    let stills = ai::marked_still_rels(&self.photos, &self.marked);
+                    let files = ai::abs_stills(&self.root, &stills);
+                    self.pending_ask = Some(PendingAsk {
+                        prompt: self.ask.prompt.trim().to_string(),
+                        files,
+                        generation: self.ask.generation,
+                    });
                     self.gemini_key_overlay = Some(GeminiKeyOverlay {
                         input: String::new(),
-                        error: Some("Gemini rejected that key. Paste a new one.".into()),
+                        error: Some("OpenRouter rejected that key. Paste a new one.".into()),
                     });
                     return;
                 }
-                self.pending_gemini_edit = None;
+                self.pending_ask = None;
                 self.gemini_key_overlay = None;
                 self.ask.reply = Some(AskReply::Error(err));
             }
         }
     }
 
-    fn begin_gemini_edit(&mut self, instruction: String) {
-        let stills = ai::marked_still_rels(&self.photos, &self.marked);
-        if stills.len() != 1 {
-            self.ask.reply = Some(AskReply::Error(image_edit::edit_needs_one_photo_message()));
+    fn start_ask_job(
+        &mut self,
+        key: ResolvedKey,
+        prompt: String,
+        files: Vec<PathBuf>,
+        generation: u64,
+    ) {
+        if ask_outcome_is_stale(self.ask.generation, generation) {
             return;
         }
-        let source = self.root.join(&stills[0]);
-        self.pending_gemini_edit = Some(PendingGeminiEdit {
-            instruction,
-            source,
-            generation: self.ask.generation,
-        });
-        if let Some(key) = credentials::resolve() {
-            self.start_gemini_job(key);
-        } else {
-            self.gemini_key_overlay = Some(GeminiKeyOverlay {
-                input: String::new(),
-                error: None,
-            });
-        }
-    }
-
-    fn start_gemini_job(&mut self, key: ResolvedKey) {
-        let Some(pending) = self.pending_gemini_edit.clone() else {
-            return;
-        };
-        if ask_outcome_is_stale(self.ask.generation, pending.generation) {
-            return;
-        }
+        self.pending_ask = None;
+        self.gemini_key_overlay = None;
         self.ask.waiting_from = Some(Instant::now());
-        self.ask.job = Some(ai::spawn_edit(
-            pending.generation,
-            pending.instruction,
-            pending.source,
+        self.ask.job = Some(ai::spawn(
+            generation,
+            prompt,
+            files,
             self.root.clone(),
             key,
-            ai::Timeouts::default(),
         ));
     }
 
-    fn cancel_gemini_edit(&mut self) {
-        self.pending_gemini_edit = None;
+    fn dismiss_gemini_key_overlay(&mut self) {
+        self.pending_ask = None;
         self.gemini_key_overlay = None;
     }
 
@@ -380,23 +374,24 @@ impl App {
             return;
         }
         let files = ai::abs_stills(&self.root, &stills);
-        self.refresh_agent();
-        let Some(agent) = self.ask.agent.clone() else {
-            self.ask.reply = Some(AskReply::Error(ai::no_agent_message()));
-            return;
-        };
         self.ask.generation = self.ask.generation.wrapping_add(1);
         self.ask.cancel_job();
         self.ask.reply = None;
-        self.ask.waiting_from = Some(Instant::now());
         self.ask.scroll = 0;
-        self.ask.job = Some(ai::spawn(
-            self.ask.generation,
-            agent,
-            prompt,
-            files,
-            self.root.clone(),
-        ));
+        let generation = self.ask.generation;
+        if let Some(key) = credentials::resolve() {
+            self.start_ask_job(key, prompt, files, generation);
+        } else {
+            self.pending_ask = Some(PendingAsk {
+                prompt,
+                files,
+                generation,
+            });
+            self.gemini_key_overlay = Some(GeminiKeyOverlay {
+                input: String::new(),
+                error: None,
+            });
+        }
     }
 
     fn focus_saved_edit(&mut self, relpath: &str) {
@@ -506,8 +501,18 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
     loop {
         app.sync_ask_selection();
         app.poll_ask();
+        if app.gemini_key_overlay.is_none() {
+            if let Some(rect) = app.gemini_url_written.take() {
+                erase_gemini_url_hyperlink(rect);
+            }
+        }
         terminal.draw(|f| draw(f, app))?;
-        write_gemini_url_hyperlink(app);
+        if app.gemini_key_overlay.is_some() {
+            if let Some(rect) = app.gemini_url_rect {
+                paint_gemini_url_hyperlink(rect);
+                app.gemini_url_written = Some(rect);
+            }
+        }
         if !event::poll(Duration::from_millis(200))? {
             continue;
         }
@@ -540,7 +545,7 @@ fn handle_key(
     }
 
     if app.gemini_key_overlay.is_some() {
-        handle_gemini_key_overlay_key(app, key.code);
+        handle_gemini_key_overlay_key(app, key);
         return Ok(false);
     }
 
@@ -1412,6 +1417,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.gemini_key_overlay.is_some() {
         draw_gemini_key_overlay(frame, app);
+    } else {
+        app.gemini_url_rect = None;
     }
 }
 
@@ -1713,17 +1720,15 @@ fn protocol_name(picker: Option<&Picker>) -> &'static str {
     }
 }
 
-fn status_ai_label(agent: Option<&str>) -> String {
-    match agent {
-        Some(name) => format!("ai: {name}"),
-        None => "ai: none".into(),
-    }
+fn status_ai_models() -> String {
+    let (ask, edit) = credentials::effective_models();
+    format!("ask: {ask} · edit: {edit}")
 }
 
-fn status_tools_line(viewer: &str, video: &str, thumbs: &str, agent: Option<&str>) -> String {
+fn status_tools_line(viewer: &str, video: &str, thumbs: &str) -> String {
     format!(
         "viewer: {viewer} · video: {video} · thumbs: {thumbs} · {}",
-        status_ai_label(agent)
+        status_ai_models()
     )
 }
 
@@ -1745,14 +1750,14 @@ fn draw_delete_confirm(frame: &mut Frame, rels: &[String]) {
     );
 }
 
-const GEMINI_KEY_URL: &str = "https://aistudio.google.com/apikey";
+const GEMINI_KEY_URL: &str = "https://openrouter.ai/keys";
 
 const GEMINI_KEY_HINT: &str =
-    "The marked photo will be sent to Google Gemini for editing\n\
-and may use paid quota.\n\
-Paste a key from https://aistudio.google.com/apikey";
+    "Photos are sent to OpenRouter and may use paid quota.\n\
+Paste a key from\n\
+https://openrouter.ai/keys";
 
-const GEMINI_KEY_BIND: &str = "o open URL · Enter save · Esc cancel";
+const GEMINI_KEY_BIND: &str = "Ctrl+o open URL · Enter save · Esc cancel";
 
 fn draw_gemini_key_overlay(frame: &mut Frame, app: &mut App) {
     let Some(overlay) = app.gemini_key_overlay.as_ref() else {
@@ -1768,7 +1773,7 @@ fn draw_gemini_key_overlay(frame: &mut Frame, app: &mut App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Image editing")
+        .title("Ask AI")
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -1822,16 +1827,11 @@ fn draw_gemini_key_overlay(frame: &mut Frame, app: &mut App) {
 
 /// Screen position of the URL in the overlay hint, so the event loop can
 /// emit an OSC 8 hyperlink there after the frame is drawn. The URL is on
-/// the third line (index 2) of the hint, which starts at `inner.y`.
+/// its own line below "Paste a key from".
 fn gemini_url_screen_rect(popup: Rect, inner: Rect) -> Option<Rect> {
-    let prefix = "Paste a key from ";
     let url_len = GEMINI_KEY_URL.len() as u16;
-    let prefix_len = prefix.len() as u16;
-    let line = "Paste a key from https://aistudio.google.com/apikey";
-    let line_len = line.len() as u16;
-    let inner_width = inner.width;
-    let pad = inner_width.saturating_sub(line_len) / 2;
-    let x = inner.x + pad + prefix_len;
+    let pad = inner.width.saturating_sub(url_len) / 2;
+    let x = inner.x + pad;
     let y = inner.y + 2;
     if x + url_len > popup.x + popup.width {
         return None;
@@ -1839,19 +1839,21 @@ fn gemini_url_screen_rect(popup: Rect, inner: Rect) -> Option<Rect> {
     Some(Rect::new(x, y, url_len, 1))
 }
 
-fn handle_gemini_key_overlay_key(app: &mut App, code: KeyCode) {
+fn handle_gemini_key_overlay_key(app: &mut App, key: KeyEvent) {
     let Some(overlay) = app.gemini_key_overlay.as_mut() else {
         return;
     };
-    match classify_gemini_key_key(code) {
-        GeminiKeyKey::Cancel => app.cancel_gemini_edit(),
+    match classify_gemini_key_key(key) {
+        GeminiKeyKey::Cancel => app.dismiss_gemini_key_overlay(),
         GeminiKeyKey::Open => open_gemini_key_url(),
-        GeminiKeyKey::Save => match credentials::save_gemini_key(&overlay.input) {
+        GeminiKeyKey::Save => match credentials::save_api_key(&overlay.input) {
             Ok(()) => {
-                app.gemini_key_overlay = None;
                 if let Some(key) = credentials::resolve() {
-                    app.start_gemini_job(key);
+                    if let Some(pending) = app.pending_ask.take() {
+                        app.start_ask_job(key, pending.prompt, pending.files, pending.generation);
+                    }
                 }
+                app.gemini_key_overlay = None;
             }
             Err(error) => overlay.error = Some(error),
         },
@@ -1887,13 +1889,13 @@ enum GeminiKeyKey {
     Ignore,
 }
 
-fn classify_gemini_key_key(code: KeyCode) -> GeminiKeyKey {
-    match code {
-        KeyCode::Esc => GeminiKeyKey::Cancel,
-        KeyCode::Enter => GeminiKeyKey::Save,
-        KeyCode::Char('o') => GeminiKeyKey::Open,
-        KeyCode::Backspace => GeminiKeyKey::Backspace,
-        KeyCode::Char(c) => GeminiKeyKey::Char(c),
+fn classify_gemini_key_key(key: KeyEvent) -> GeminiKeyKey {
+    match key.code {
+        KeyCode::Esc if key.modifiers.is_empty() => GeminiKeyKey::Cancel,
+        KeyCode::Enter if key.modifiers.is_empty() => GeminiKeyKey::Save,
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => GeminiKeyKey::Open,
+        KeyCode::Backspace if key.modifiers.is_empty() => GeminiKeyKey::Backspace,
+        KeyCode::Char(c) if key.modifiers.is_empty() => GeminiKeyKey::Char(c),
         _ => GeminiKeyKey::Ignore,
     }
 }
@@ -1915,20 +1917,30 @@ fn open_command() -> &'static str {
     }
 }
 
-/// Emit an OSC 8 hyperlink over the URL text so modern terminals (iTerm2,
-/// Kitty, WezTerm, GNOME Terminal, …) render it as a Cmd/Ctrl+clickable
-/// link. Written after the frame draw so ratatui's buffer doesn't strip it.
-fn write_gemini_url_hyperlink(app: &App) {
-    let Some(rect) = app.gemini_url_rect else {
-        return;
-    };
+const OSC8_LINK_CLOSE: &str = "\x1b]8;;\x1b\\";
+
+/// Paint an OSC 8 hyperlink over the URL text so modern terminals (iTerm2,
+/// Kitty, WezTerm, GNOME Terminal, …) render it as a Cmd/Ctrl+clickable link.
+/// Written after the frame draw so ratatui's buffer doesn't strip it.
+fn paint_gemini_url_hyperlink(rect: Rect) {
     let mut out = std::io::stdout();
     let open = format!("\x1b]8;;{GEMINI_KEY_URL}\x1b\\");
-    let close = "\x1b]8;;\x1b\\";
     let _ = execute!(
         out,
         MoveTo(rect.x, rect.y),
-        crossterm::style::Print(format!("{open}{GEMINI_KEY_URL}{close}")),
+        crossterm::style::Print(format!("{open}{GEMINI_KEY_URL}{OSC8_LINK_CLOSE}")),
+    );
+}
+
+/// Remove a URL painted with [`paint_gemini_url_hyperlink`]. Must run before
+/// the next `terminal.draw` so ratatui can repaint those cells.
+fn erase_gemini_url_hyperlink(rect: Rect) {
+    let mut out = std::io::stdout();
+    let pad = " ".repeat(rect.width as usize);
+    let _ = execute!(
+        out,
+        MoveTo(rect.x, rect.y),
+        crossterm::style::Print(format!("{OSC8_LINK_CLOSE}{pad}")),
     );
 }
 
@@ -1956,7 +1968,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let text = format!(
         "{}\n{}",
         app.status,
-        status_tools_line(&viewer_name, &video_name, thumbs, app.ask.agent.as_deref())
+        status_tools_line(&viewer_name, &video_name, thumbs)
     );
     frame.render_widget(
         Paragraph::new(text)
@@ -2251,11 +2263,34 @@ mod tests {
 
     #[test]
     fn gemini_key_overlay_keys_save_cancel_and_mask() {
-        assert_eq!(classify_gemini_key_key(KeyCode::Enter), GeminiKeyKey::Save);
-        assert_eq!(classify_gemini_key_key(KeyCode::Esc), GeminiKeyKey::Cancel);
-        assert_eq!(classify_gemini_key_key(KeyCode::Char('o')), GeminiKeyKey::Open);
         assert_eq!(
-            classify_gemini_key_key(KeyCode::Char('a')),
+            classify_gemini_key_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            GeminiKeyKey::Save
+        );
+        assert_eq!(
+            classify_gemini_key_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            GeminiKeyKey::Cancel
+        );
+        assert_eq!(
+            classify_gemini_key_key(KeyEvent::new(
+                KeyCode::Char('o'),
+                KeyModifiers::CONTROL
+            )),
+            GeminiKeyKey::Open
+        );
+        assert_eq!(
+            classify_gemini_key_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
+            GeminiKeyKey::Char('o')
+        );
+        assert_eq!(
+            classify_gemini_key_key(KeyEvent::new(
+                KeyCode::Char('v'),
+                KeyModifiers::SUPER
+            )),
+            GeminiKeyKey::Ignore
+        );
+        assert_eq!(
+            classify_gemini_key_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
             GeminiKeyKey::Char('a')
         );
         assert_eq!(mask_gemini_key_input("secret"), "••••••");
@@ -2299,14 +2334,10 @@ mod tests {
     }
 
     #[test]
-    fn status_tools_line_includes_detected_ai() {
+    fn status_tools_line_includes_openrouter_models() {
         assert_eq!(
-            status_tools_line("Preview", "mpv", "kitty", Some("opencode")),
-            "viewer: Preview · video: mpv · thumbs: kitty · ai: opencode"
-        );
-        assert_eq!(
-            status_tools_line("no viewer", "no player", "halfblocks", None),
-            "viewer: no viewer · video: no player · thumbs: halfblocks · ai: none"
+            status_tools_line("Preview", "mpv", "kitty"),
+            "viewer: Preview · video: mpv · thumbs: kitty · ask: google/gemini-3.8-flash · edit: google/gemini-3.1-flash-image"
         );
     }
 
@@ -2365,16 +2396,9 @@ mod tests {
         let video_only = HashSet::from(["clip.mov".into()]);
         let stills = ai::marked_still_rels(&photos, &video_only);
         assert!(stills.is_empty());
-        assert!(!ai::ask_ai_active(None, &stills));
+        assert!(!ai::ask_ai_active(&stills));
         let mixed = HashSet::from(["clip.mov".into(), "a.jpg".into()]);
-        assert!(ai::ask_ai_active(
-            Some("opencode"),
-            &ai::marked_still_rels(&photos, &mixed)
-        ));
-        assert!(!ai::ask_ai_active(
-            None,
-            &ai::marked_still_rels(&photos, &mixed)
-        ));
+        assert!(ai::ask_ai_active(&ai::marked_still_rels(&photos, &mixed)));
     }
 
     #[test]

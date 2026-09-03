@@ -4,6 +4,7 @@ pub mod clipboard;
 pub mod credentials;
 pub mod delete;
 pub mod image_edit;
+pub mod openrouter;
 pub mod index;
 pub mod library;
 pub mod media;

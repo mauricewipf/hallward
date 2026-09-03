@@ -20,7 +20,7 @@ Terminal photo library: miller-style folders, a thumbnail grid for albums, an **
 - `libheif` / `heif-convert` for HEIC thumbnails (Arch: `pacman -S libheif`)
 - **ffmpeg** (ships `ffprobe`) for video **thumbnails** and Live Photo detection — not a player
 - A video player: **mpv**
-- (Optional) For AI use, install an agent CLI (OpenCode, Claude Code, or Codex). Image editing uses that same CLI.
+- An **OpenRouter API key** for Ask AI and image editing (`OPENROUTER_API_KEY` or paste in the TUI overlay on first use; legacy `GEMINI_API_KEY` still works)
 
 **macOS:** still images open in built-in **Preview** (no extra install). Quit Preview (Cmd-Q) to return to Hallward, same as mpv. Video playback requires **mpv** (`brew install mpv`). FFmpeg’s `ffplay` is a terminal player: it tears down the TUI, dumps decoder logs to the shell, and is not an acceptable viewer. If the status pane says `video: ffplay` or `video: no player`, install mpv and restart Hallward until it shows `video: mpv`.
 
@@ -75,11 +75,11 @@ hallward --root PATH   # library is PATH instead of cwd
 
 ### Ask AI
 
-Mark with `Space` key one or more **images** and the search bar becomes **Ask AI**. On Omarchy set a default agent. On Mac install any of these agent CLIs: opencode, pi, omp, hermes, codex, claude.
+Mark with `Space` key one or more **images** and the search bar becomes **Ask AI**.
 
-Type a question and press Enter: "Which car is this?" The agent answers in the pane.
+Type a question and press Enter: "Which car is this?" OpenRouter answers in the pane (`google/gemini-3.8-flash`).
 
-If the prompt is an edit instruction such as "Remove the persons in the background.", Hallward first uses your configured agent to classify the request. The edit itself calls Google Gemini (`gemini-3.1-flash-image`) directly. The first edit may ask for a Gemini API key in a popup; you can also set `GEMINI_API_KEY`. The edited photo is saved as a new sibling file (`photo-edited.png`, then `photo-edited-2.png`, …). The original is never overwritten. Editing needs **exactly one** marked still. Esc cancels an in-flight request.
+If the prompt is an edit instruction such as "Remove the persons in the background.", Hallward classifies it with OpenRouter, then edits with `google/gemini-3.1-flash-image`. The first Ask AI request may ask for an OpenRouter API key in a popup; you can also set `OPENROUTER_API_KEY` or save a key in `~/.config/hallward/credentials`. The edited photo is saved as a new sibling file (`photo-edited.png`, then `photo-edited-2.png`, …). The original is never overwritten. Editing needs **exactly one** marked still. Esc cancels an in-flight request.
 
 ![Ask AI](assets/2026-09-02_ai-chat.png)
 
@@ -141,7 +141,7 @@ cargo build --release
 | Right on a collection               | Open its subfolders                                                                                                                                                                                                                                                                                                        |
 | Right on an album                   | Focus the thumbnail grid                                                                                                                                                                                                                                                                                                   |
 | Left from the left edge of the grid | Back to the album column                                                                                                                                                                                                                                                                                                   |
-| letters / digits                    | Filter collection and album **names** (not filenames). With stills marked and a supported agent available, typing goes to **Ask AI** instead (`q` does not quit while stills are marked; Ctrl-C still quits)                                                                                                               |
+| letters / digits                    | Filter collection and album **names** (not filenames). With stills marked, typing goes to **Ask AI** instead (`q` does not quit while stills are marked; Ctrl-C still quits)                                                                                                               |
 | Shift+Tab                           | Jump to the search field from Library, Folders, or Gallery (Ask AI when stills are marked)                                                                                                                                                                                                                                 |
 | Tab                                 | Jump to the filtered tree, or to Ask AI when it is active                                                                                                                                                                                                                                                                  |
 | Space                               | Toggle a mark on the focused thumbnail                                                                                                                                                                                                                                                                                     |

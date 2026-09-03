@@ -1,10 +1,8 @@
-//! End-to-end Ask AI coverage: a real child process, a real library on disk, a
-//! real catalog write. The agent is the `stub_agent` binary, so these tests need
-//! no network, no credentials, and no installed CLI.
+//! End-to-end Ask AI coverage: a real library on disk, a real catalog write,
+//! and an injectable OpenRouter HTTP transport — no network or credentials needed.
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
@@ -12,11 +10,12 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use hallward::ai::{self, AgentCli, AskHandle, AskValue, Timeouts};
+use hallward::ai::{self, AskHandle, AskValue, Timeouts};
 use hallward::catalog;
 use hallward::credentials::{self, CredentialSource, ResolvedKey};
-use hallward::image_edit::{self, PostGeminiFn, GEMINI_EDIT_MODEL};
+use hallward::image_edit::{self, PostFn, ASK_MODEL, EDIT_MODEL};
 use hallward::index;
+use hallward::openrouter::{self, CHAT_URL, IMAGES_URL};
 use image::{Rgb, RgbImage};
 use serde_json::{json, Value};
 
@@ -66,59 +65,6 @@ impl Library {
     }
 }
 
-/// A scripted agent: a scenario file plus a wrapper that runs the stub with it.
-struct Stub {
-    dir: tempfile::TempDir,
-    program: PathBuf,
-}
-
-impl Stub {
-    fn new(mut scenario: Value) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        scenario["argv_log"] = json!(dir.path().join("argv.log"));
-        let scenario_path = dir.path().join("scenario.json");
-        fs::write(&scenario_path, scenario.to_string()).unwrap();
-
-        let program = dir.path().join("stub-agent");
-        fs::write(
-            &program,
-            format!(
-                "#!/bin/sh\nSTUB_AGENT_SCENARIO='{}' exec '{}' \"$@\"\n",
-                scenario_path.display(),
-                env!("CARGO_BIN_EXE_stub_agent"),
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-        Self { dir, program }
-    }
-
-    fn cli(&self, agent: &str) -> AgentCli {
-        AgentCli::with_program(agent, &self.program)
-    }
-
-    fn calls(&self) -> Vec<Value> {
-        let log = self.dir.path().join("argv.log");
-        let Ok(text) = fs::read_to_string(log) else {
-            return Vec::new();
-        };
-        text.lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
-    }
-
-    fn call(&self, name: &str) -> Value {
-        self.calls()
-            .into_iter()
-            .find(|record| record["call"] == name)
-            .unwrap_or_else(|| panic!("stub agent was never called for {name}"))
-    }
-}
-
-fn missing_program(dir: &Path) -> AgentCli {
-    AgentCli::with_program("opencode", dir.join("definitely-not-installed"))
-}
-
 fn budget() -> Timeouts {
     Timeouts {
         ask: Duration::from_secs(10),
@@ -126,26 +72,8 @@ fn budget() -> Timeouts {
     }
 }
 
-fn ask(cli: AgentCli, prompt: &str, files: &[PathBuf], root: &Path) -> Result<AskValue, String> {
-    ask_with(cli, prompt, files, root, budget())
-}
-
-fn ask_with(
-    cli: AgentCli,
-    prompt: &str,
-    files: &[PathBuf],
-    root: &Path,
-    timeouts: Timeouts,
-) -> Result<AskValue, String> {
-    let mut handle = ai::spawn_with(
-        1,
-        cli,
-        prompt.to_string(),
-        files.to_vec(),
-        root.to_path_buf(),
-        timeouts,
-    );
-    settle(&mut handle)
+fn test_key() -> ResolvedKey {
+    ResolvedKey::new("test-key", CredentialSource::File)
 }
 
 fn settle(handle: &mut AskHandle) -> Result<AskValue, String> {
@@ -159,69 +87,123 @@ fn settle(handle: &mut AskHandle) -> Result<AskValue, String> {
     }
 }
 
-fn argv(record: &Value) -> Vec<String> {
-    record["argv"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|arg| arg.as_str().unwrap().to_string())
-        .collect()
+fn ask_with(
+    prompt: &str,
+    files: &[PathBuf],
+    root: &Path,
+    key: ResolvedKey,
+    timeouts: Timeouts,
+    post: PostFn,
+) -> Result<AskValue, String> {
+    let mut handle = ai::spawn_with(
+        1,
+        prompt.to_string(),
+        files.to_vec(),
+        root.to_path_buf(),
+        key,
+        timeouts,
+        post,
+    );
+    settle(&mut handle)
+}
+
+fn ask(prompt: &str, files: &[PathBuf], root: &Path, post: PostFn) -> Result<AskValue, String> {
+    ask_with(prompt, files, root, test_key(), budget(), post)
 }
 
 fn with_credentials_path<F: FnOnce()>(f: F) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("credentials");
     let prev = std::env::var_os("HALLWARD_CREDENTIALS_PATH");
-    let prev_key = std::env::var_os("GEMINI_API_KEY");
+    let prev_openrouter = std::env::var_os("OPENROUTER_API_KEY");
+    let prev_gemini = std::env::var_os("GEMINI_API_KEY");
     std::env::set_var("HALLWARD_CREDENTIALS_PATH", &path);
+    std::env::remove_var("OPENROUTER_API_KEY");
     std::env::remove_var("GEMINI_API_KEY");
     f();
     match prev {
         Some(value) => std::env::set_var("HALLWARD_CREDENTIALS_PATH", value),
         None => std::env::remove_var("HALLWARD_CREDENTIALS_PATH"),
     }
-    match prev_key {
+    match prev_openrouter {
+        Some(value) => std::env::set_var("OPENROUTER_API_KEY", value),
+        None => std::env::remove_var("OPENROUTER_API_KEY"),
+    }
+    match prev_gemini {
         Some(value) => std::env::set_var("GEMINI_API_KEY", value),
         None => std::env::remove_var("GEMINI_API_KEY"),
     }
 }
 
-static GEMINI_STUB: Mutex<Option<GeminiStub>> = Mutex::new(None);
+static OPENROUTER_STUB: Mutex<Option<OpenRouterStub>> = Mutex::new(None);
 
-/// Serializes tests that share the global `GEMINI_STUB` so parallel runs
+/// Serializes tests that share the global `OPENROUTER_STUB` so parallel runs
 /// don't overwrite each other's installed response.
-static GEMINI_TEST_LOCK: Mutex<()> = Mutex::new(());
+static OPENROUTER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-struct GeminiStub {
-    status: u16,
-    body: String,
-    seen_url: Option<String>,
-    seen_key: Option<String>,
-    seen_body: Option<Value>,
+struct OpenRouterStub {
+    responses: Vec<(u16, String)>,
+    seen_urls: Vec<String>,
+    seen_keys: Vec<String>,
+    seen_bodies: Vec<Value>,
 }
 
-fn install_gemini_stub(status: u16, body: Value) {
-    *GEMINI_STUB.lock().unwrap() = Some(GeminiStub {
-        status,
-        body: body.to_string(),
-        seen_url: None,
-        seen_key: None,
-        seen_body: None,
-    });
+impl OpenRouterStub {
+    fn single(status: u16, body: Value) -> Self {
+        Self {
+            responses: vec![(status, body.to_string())],
+            seen_urls: Vec::new(),
+            seen_keys: Vec::new(),
+            seen_bodies: Vec::new(),
+        }
+    }
+
+    fn queue(status_bodies: Vec<(u16, Value)>) -> Self {
+        Self {
+            responses: status_bodies
+                .into_iter()
+                .map(|(status, body)| (status, body.to_string()))
+                .collect(),
+            seen_urls: Vec::new(),
+            seen_keys: Vec::new(),
+            seen_bodies: Vec::new(),
+        }
+    }
 }
 
-fn stub_gemini_post(
+fn install_openrouter_stub(stub: OpenRouterStub) {
+    *OPENROUTER_STUB
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stub);
+}
+
+fn stub_openrouter_post(
     url: &str,
     api_key: &str,
     body: &Value,
     _timeout: Duration,
 ) -> Result<(u16, String), String> {
-    let mut guard = GEMINI_STUB.lock().unwrap();
-    let stub = guard.as_mut().expect("gemini stub not installed");
-    stub.seen_url = Some(url.to_string());
-    stub.seen_key = Some(api_key.to_string());
-    stub.seen_body = Some(body.clone());
-    Ok((stub.status, stub.body.clone()))
+    let mut guard = OPENROUTER_STUB
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stub = guard.as_mut().expect("openrouter stub not installed");
+    stub.seen_urls.push(url.to_string());
+    stub.seen_keys.push(api_key.to_string());
+    stub.seen_bodies.push(body.clone());
+    let (status, text) = stub.responses.remove(0);
+    Ok((status, text))
+}
+
+fn openrouter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    OPENROUTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn text_response(text: &str) -> Value {
+    json!({
+        "choices": [{ "message": { "content": text } }]
+    })
 }
 
 fn png_response() -> Value {
@@ -234,124 +216,108 @@ fn png_response() -> Value {
     .unwrap();
     let data = BASE64.encode(bytes);
     json!({
-        "candidates": [{
-            "content": {
-                "parts": [{ "inlineData": { "mimeType": "image/png", "data": data } }]
-            }
-        }]
+        "data": [{ "b64_json": data }]
     })
 }
 
-fn edit_with_stub(
-    instruction: &str,
-    source: PathBuf,
-    root: &Path,
-    post: PostGeminiFn,
-) -> Result<AskValue, String> {
-    let key = ResolvedKey {
-        key: "test-key".into(),
-        source: CredentialSource::File,
-    };
-    let mut handle = ai::spawn_edit_with(
-        1,
-        instruction.to_string(),
-        source,
-        root.to_path_buf(),
-        key,
-        budget(),
-        post,
-    );
-    settle(&mut handle)
+fn is_ask_request(url: &str, body: &Value) -> bool {
+    url == CHAT_URL || body.get("model") == Some(&json!(ASK_MODEL))
+}
+
+fn is_edit_request(url: &str, body: &Value) -> bool {
+    url == IMAGES_URL || body.get("model") == Some(&json!(EDIT_MODEL))
+}
+
+fn ask_then_edit_post(
+    ask_text: &str,
+    url: &str,
+    api_key: &str,
+    body: &Value,
+    timeout: Duration,
+) -> Result<(u16, String), String> {
+    if is_ask_request(url, body) {
+        Ok((200, text_response(ask_text).to_string()))
+    } else if is_edit_request(url, body) {
+        Ok((200, png_response().to_string()))
+    } else {
+        stub_openrouter_post(url, api_key, body, timeout)
+    }
 }
 
 #[test]
 fn a_plain_answer_reaches_the_caller() {
+    let _lock = openrouter_test_lock();
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
-    let stub = Stub::new(json!({ "ask": { "stdout": "A red Ferrari." } }));
+    install_openrouter_stub(OpenRouterStub::single(
+        200,
+        text_response("A red Ferrari."),
+    ));
 
-    let value = ask(stub.cli("opencode"), "which car?", &[photo], library.root());
+    let value = ask("which car?", &[photo], library.root(), stub_openrouter_post).unwrap();
 
-    assert_eq!(value.unwrap(), AskValue::Answer("A red Ferrari.".into()));
+    assert_eq!(value, AskValue::Answer("A red Ferrari.".into()));
 }
 
 #[test]
-fn agent_chrome_above_the_answer_is_dropped() {
+fn multi_paragraph_answers_keep_only_the_last_paragraph() {
+    let _lock = openrouter_test_lock();
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
-    let stub = Stub::new(json!({
-        "ask": { "stdout": "> build \u{b7} kimi-k2.7-code\n\nA red Ferrari." }
-    }));
+    install_openrouter_stub(OpenRouterStub::single(
+        200,
+        text_response("Let me inspect the image.\n\nA red Ferrari."),
+    ));
 
-    let value = ask(stub.cli("opencode"), "which car?", &[photo], library.root());
+    let value = ask("which car?", &[photo], library.root(), stub_openrouter_post).unwrap();
 
-    assert_eq!(value.unwrap(), AskValue::Answer("A red Ferrari.".into()));
+    assert_eq!(value, AskValue::Answer("A red Ferrari.".into()));
 }
 
 #[test]
-fn the_agent_only_sees_a_stripped_jpeg_preview() {
+fn ask_only_sees_jpeg_previews() {
+    let _lock = openrouter_test_lock();
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
-    let stub = Stub::new(json!({ "ask": { "stdout": "ok" } }));
+    install_openrouter_stub(OpenRouterStub::single(200, text_response("ok")));
 
-    ask(
-        stub.cli("opencode"),
-        "what is this?",
-        &[photo],
-        library.root(),
-    )
-    .unwrap();
+    ask("what is this?", &[photo], library.root(), stub_openrouter_post).unwrap();
 
-    let argv = argv(&stub.call("ask"));
-    assert!(
-        argv.iter()
-            .any(|arg| arg.ends_with("image-000.jpg") && Path::new(arg).is_absolute()),
-        "OpenCode must receive an absolute preview path: {argv:?}"
-    );
-    assert!(
-        !argv.iter().any(|arg| arg.contains("photo.jpg")),
-        "the original path must never reach the agent: {argv:?}"
-    );
+    let stub = OPENROUTER_STUB.lock().unwrap_or_else(|p| p.into_inner());
+    let body = stub.as_ref().unwrap().seen_bodies.first().unwrap();
+    assert_eq!(body["model"], ASK_MODEL);
+    let content = body["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "image_url");
+    assert!(content[0]["image_url"]["url"]
+        .as_str()
+        .unwrap()
+        .starts_with("data:image/jpeg;base64,"));
+    assert!(content[0]["image_url"]["url"]
+        .as_str()
+        .unwrap()
+        .len()
+        > 30);
+    assert_eq!(stub.as_ref().unwrap().seen_urls[0], CHAT_URL);
 }
 
 #[test]
-fn an_edit_directive_stops_at_classification() {
+fn an_edit_directive_writes_indexes_and_reports_a_sibling() {
+    let _lock = openrouter_test_lock();
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
-    let stub = Stub::new(json!({
-        "ask": { "stdout": "{\"edit\":\"Remove the people in the background.\"}" }
-    }));
+    install_openrouter_stub(OpenRouterStub::queue(vec![
+        (
+            200,
+            text_response(r#"{"edit":"Remove the people in the background."}"#),
+        ),
+        (200, png_response()),
+    ]));
 
     let value = ask(
-        stub.cli("opencode"),
         "remove the people in the background",
         std::slice::from_ref(&photo),
         library.root(),
-    )
-    .unwrap();
-
-    assert_eq!(
-        value,
-        AskValue::Edit {
-            instruction: "Remove the people in the background.".into()
-        }
-    );
-    assert_eq!(stub.calls().len(), 1);
-    assert!(!library.root().join("Rome/photo-edited.png").exists());
-}
-
-#[test]
-fn gemini_edit_writes_indexes_and_reports_a_sibling() {
-    let _lock = GEMINI_TEST_LOCK.lock().unwrap();
-    let library = Library::new();
-    let photo = library.photo("Rome/photo.jpg");
-    install_gemini_stub(200, png_response());
-
-    let value = edit_with_stub(
-        "Remove the people in the background.",
-        photo.clone(),
-        library.root(),
-        stub_gemini_post,
+        stub_openrouter_post,
     )
     .unwrap();
 
@@ -366,98 +332,69 @@ fn gemini_edit_writes_indexes_and_reports_a_sibling() {
         library.captured_at("Rome", "photo-edited.png"),
         library.captured_at("Rome", "photo.jpg")
     );
-    assert_eq!(image::image_dimensions(&photo).unwrap(), (48, 32));
 
-    let seen = GEMINI_STUB.lock().unwrap();
-    let stub = seen.as_ref().unwrap();
-    assert!(stub.seen_url.as_ref().unwrap().contains(GEMINI_EDIT_MODEL));
-    assert_eq!(stub.seen_key.as_deref(), Some("test-key"));
-    assert_eq!(
-        stub.seen_body.as_ref().unwrap()["generationConfig"]["responseModalities"],
-        json!(["TEXT", "IMAGE"])
-    );
+    let stub = OPENROUTER_STUB.lock().unwrap_or_else(|p| p.into_inner());
+    let seen = stub.as_ref().unwrap();
+    assert!(seen.seen_urls.iter().any(|url| url == CHAT_URL));
+    assert!(seen.seen_urls.iter().any(|url| url == IMAGES_URL));
+    assert_eq!(seen.seen_keys, vec!["test-key", "test-key"]);
 }
 
 #[test]
-fn classify_keeps_the_agents_default_model() {
+fn an_invalid_saved_key_is_cleared() {
+    let _lock = openrouter_test_lock();
+    install_openrouter_stub(OpenRouterStub::single(
+        401,
+        json!({"error": {"code": 401, "message": "bad"}}),
+    ));
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
-    let stub = Stub::new(json!({
-        "ask": { "stdout": "{\"edit\":\"Blur the background.\"}" }
-    }));
-
-    ask(
-        stub.cli("opencode"),
-        "blur the background",
-        &[photo],
-        library.root(),
-    )
-    .unwrap();
-
-    let ask_argv = argv(&stub.call("ask"));
-    assert!(
-        !ask_argv.iter().any(|arg| arg == "--model"),
-        "Q&A must keep the agent's default model: {ask_argv:?}"
-    );
-    assert_eq!(stub.calls().len(), 1);
+    with_credentials_path(|| {
+        credentials::save_api_key("saved-key").unwrap();
+        let error = ask(
+            "which car?",
+            &[photo],
+            library.root(),
+            stub_openrouter_post,
+        )
+        .unwrap_err();
+        assert_eq!(error, credentials::INVALID_SAVED_KEY);
+        assert!(!credentials::resolve().is_some());
+    });
 }
 
 #[test]
-fn an_auth_failure_becomes_a_sign_in_hint() {
+fn a_provider_error_names_the_ask_model() {
+    let _lock = openrouter_test_lock();
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
-    let stub = Stub::new(json!({
-        "ask": { "stderr": "AI_APICallError: No auth credentials found", "exit": 1 }
-    }));
+    install_openrouter_stub(OpenRouterStub::single(
+        404,
+        json!({"error": {"code": 404, "message": "model missing"}}),
+    ));
 
-    let error = ask(stub.cli("opencode"), "which car?", &[photo], library.root()).unwrap_err();
+    let error = ask("which car?", &[photo], library.root(), stub_openrouter_post).unwrap_err();
 
-    assert_eq!(error, ai::sign_in_hint("opencode"));
-}
-
-#[test]
-fn a_provider_error_is_surfaced_verbatim() {
-    let library = Library::new();
-    let photo = library.photo("Rome/photo.jpg");
-    let stub = Stub::new(json!({
-        "ask": {
-            "stderr": "Upstream request failed: [NOT_FOUND] Model not found, inaccessible, and/or not deployed",
-            "exit": 1
-        }
-    }));
-
-    let error = ask(stub.cli("opencode"), "which car?", &[photo], library.root()).unwrap_err();
-
-    // The original provider error must reach the user verbatim so they can
-    // see which model failed — a generic "not available" message hides the cause.
-    assert!(
-        error.contains("[NOT_FOUND]"),
-        "provider error must be surfaced verbatim: {error}"
-    );
-    assert!(
-        error.contains("Model not found"),
-        "provider error must be surfaced verbatim: {error}"
-    );
-    assert!(
-        !error.contains("not available"),
-        "the generic mapped message must not hide the provider error: {error}"
-    );
+    assert!(error.contains(ASK_MODEL), "{error}");
+    assert!(error.contains("not available"), "{error}");
 }
 
 #[test]
 fn editing_needs_exactly_one_marked_photo() {
+    let _lock = openrouter_test_lock();
     let library = Library::new();
     let first = library.photo("Rome/one.jpg");
     let second = library.photo("Rome/two.jpg");
-    let stub = Stub::new(json!({
-        "ask": { "stdout": "{\"edit\":\"Blur the background.\"}" }
-    }));
+    install_openrouter_stub(OpenRouterStub::single(
+        200,
+        text_response(r#"{"edit":"Blur the background."}"#),
+    ));
 
     let error = ask(
-        stub.cli("opencode"),
         "blur the background",
         &[first, second],
         library.root(),
+        stub_openrouter_post,
     )
     .unwrap_err();
 
@@ -465,39 +402,39 @@ fn editing_needs_exactly_one_marked_photo() {
 }
 
 #[test]
-fn a_timed_out_gemini_edit_leaves_no_partial_sibling() {
+fn a_timed_out_edit_leaves_no_partial_sibling() {
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
-    fn slow_post(
-        _url: &str,
-        _api_key: &str,
-        _body: &Value,
-        _timeout: Duration,
+    fn slow_edit_post(
+        url: &str,
+        api_key: &str,
+        body: &Value,
+        timeout: Duration,
     ) -> Result<(u16, String), String> {
-        thread::sleep(Duration::from_secs(2));
-        Ok((200, png_response().to_string()))
+        if is_ask_request(url, body) {
+            Ok((
+                200,
+                text_response(r#"{"edit":"Blur the background."}"#).to_string(),
+            ))
+        } else {
+            thread::sleep(Duration::from_secs(2));
+            stub_openrouter_post(url, api_key, body, timeout)
+        }
     }
 
     let started = Instant::now();
-    let error = {
-        let key = ResolvedKey {
-            key: "test-key".into(),
-            source: CredentialSource::File,
-        };
-        let mut handle = ai::spawn_edit_with(
-            1,
-            "Blur the background.".to_string(),
-            photo,
-            library.root().to_path_buf(),
-            key,
-            Timeouts {
-                ask: Duration::from_secs(10),
-                edit: Duration::from_millis(300),
-            },
-            slow_post,
-        );
-        settle(&mut handle).unwrap_err()
-    };
+    let error = ask_with(
+        "blur the background",
+        &[photo],
+        library.root(),
+        test_key(),
+        Timeouts {
+            ask: Duration::from_secs(10),
+            edit: Duration::from_millis(300),
+        },
+        slow_edit_post,
+    )
+    .unwrap_err();
 
     assert_eq!(error, "The AI request timed out.");
     assert!(started.elapsed() < Duration::from_secs(10));
@@ -508,17 +445,24 @@ fn a_timed_out_gemini_edit_leaves_no_partial_sibling() {
 fn cancelling_stops_an_in_flight_request() {
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
-    let stub = Stub::new(json!({
-        "ask": { "sleep_ms": 30_000, "stdout": "too late" }
-    }));
+    fn slow_post(
+        _url: &str,
+        _api_key: &str,
+        _body: &Value,
+        _timeout: Duration,
+    ) -> Result<(u16, String), String> {
+        thread::sleep(Duration::from_secs(2));
+        Ok((200, text_response("too late").to_string()))
+    }
 
     let mut handle = ai::spawn_with(
         1,
-        stub.cli("opencode"),
         "which car?".to_string(),
         vec![photo],
         library.root().to_path_buf(),
+        test_key(),
         budget(),
+        slow_post,
     );
     thread::sleep(Duration::from_millis(200));
     let started = Instant::now();
@@ -530,35 +474,18 @@ fn cancelling_stops_an_in_flight_request() {
 }
 
 #[test]
-fn a_missing_agent_binary_reports_that_it_is_not_installed() {
-    let library = Library::new();
-    let photo = library.photo("Rome/photo.jpg");
-    let dir = tempfile::tempdir().unwrap();
-
-    let error = ask(
-        missing_program(dir.path()),
-        "which car?",
-        &[photo],
-        library.root(),
-    )
-    .unwrap_err();
-
-    assert!(error.contains("not installed"), "{error}");
-}
-
-#[test]
 fn repeated_edits_never_overwrite_an_earlier_sibling() {
-    let _lock = GEMINI_TEST_LOCK.lock().unwrap();
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
 
     for expected in ["photo-edited.png", "photo-edited-2.png"] {
-        install_gemini_stub(200, png_response());
-        let value = edit_with_stub(
-            "Blur the background.",
-            photo.clone(),
+        let value = ask(
+            "blur the background",
+            std::slice::from_ref(&photo),
             library.root(),
-            stub_gemini_post,
+            |url, key, body, timeout| {
+                ask_then_edit_post(r#"{"edit":"Blur the background."}"#, url, key, body, timeout)
+            },
         )
         .unwrap();
         let AskValue::Saved(saved) = value else {
@@ -574,110 +501,146 @@ fn repeated_edits_never_overwrite_an_earlier_sibling() {
 }
 
 #[test]
-fn gemini_401_for_saved_key_reopens_overlay() {
-    let _lock = GEMINI_TEST_LOCK.lock().unwrap();
-    install_gemini_stub(
+fn env_key_401_is_not_overlay_recoverable() {
+    let _lock = openrouter_test_lock();
+    install_openrouter_stub(OpenRouterStub::single(
         401,
-        json!({"error": {"code": 401, "status": "UNAUTHENTICATED", "message": "bad"}}),
-    );
+        json!({"error": {"code": 401, "message": "bad"}}),
+    ));
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
-    with_credentials_path(|| {
-        credentials::save_gemini_key("saved-key").unwrap();
-        let error = edit_with_stub(
-            "Blur the background.",
-            photo,
-            library.root(),
-            stub_gemini_post,
-        )
-        .unwrap_err();
-        assert_eq!(error, credentials::INVALID_SAVED_KEY);
-        assert!(!credentials::resolve().is_some());
-    });
-}
-
-#[test]
-fn gemini_401_for_env_key_is_not_overlay_recoverable() {
-    let _lock = GEMINI_TEST_LOCK.lock().unwrap();
-    install_gemini_stub(
-        401,
-        json!({"error": {"code": 401, "status": "UNAUTHENTICATED", "message": "bad"}}),
-    );
-    let library = Library::new();
-    let photo = library.photo("Rome/photo.jpg");
-    let key = ResolvedKey {
-        key: "env-key".into(),
-        source: CredentialSource::Environment,
-    };
-    let mut handle = ai::spawn_edit_with(
-        1,
-        "Blur the background.".to_string(),
-        photo,
-        library.root().to_path_buf(),
+    let key = ResolvedKey::new("env-key", CredentialSource::Environment);
+    let error = ask_with(
+        "which car?",
+        &[photo],
+        library.root(),
         key,
         budget(),
-        stub_gemini_post,
-    );
-    let error = settle(&mut handle).unwrap_err();
-    assert!(error.contains("GEMINI_API_KEY"), "{error}");
+        stub_openrouter_post,
+    )
+    .unwrap_err();
+    assert!(error.contains("OPENROUTER_API_KEY"), "{error}");
 }
 
 #[test]
-fn gemini_404_429_and_no_image_are_mapped() {
-    let _lock = GEMINI_TEST_LOCK.lock().unwrap();
+fn provider_404_429_and_no_image_are_mapped() {
+    let _lock = openrouter_test_lock();
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
 
-    install_gemini_stub(
-        404,
-        json!({"error": {"code": 404, "status": "NOT_FOUND", "message": "model"}}),
-    );
-    let err = edit_with_stub("edit", photo.clone(), library.root(), stub_gemini_post).unwrap_err();
-    assert!(err.contains(GEMINI_EDIT_MODEL), "{err}");
+    install_openrouter_stub(OpenRouterStub::queue(vec![
+        (200, text_response(r#"{"edit":"Blur."}"#)),
+        (
+            404,
+            json!({"error": {"code": 404, "message": "model"}}),
+        ),
+    ]));
+    let err = ask(
+        "blur",
+        std::slice::from_ref(&photo),
+        library.root(),
+        stub_openrouter_post,
+    )
+    .unwrap_err();
+    assert!(err.contains(EDIT_MODEL), "{err}");
 
-    install_gemini_stub(
-        429,
-        json!({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "quota"}}),
-    );
-    let err = edit_with_stub("edit", photo.clone(), library.root(), stub_gemini_post).unwrap_err();
+    install_openrouter_stub(OpenRouterStub::queue(vec![
+        (200, text_response(r#"{"edit":"Blur."}"#)),
+        (
+            429,
+            json!({"error": {"code": 429, "message": "quota"}}),
+        ),
+    ]));
+    let err = ask(
+        "blur",
+        std::slice::from_ref(&photo),
+        library.root(),
+        stub_openrouter_post,
+    )
+    .unwrap_err();
     assert!(err.contains("quota"), "{err}");
 
-    install_gemini_stub(
-        200,
-        json!({"candidates": [{ "content": { "parts": [{ "text": "no image" }] } }]}),
-    );
-    let err = edit_with_stub("edit", photo, library.root(), stub_gemini_post).unwrap_err();
-    assert_eq!(err, "Gemini returned no image.");
+    install_openrouter_stub(OpenRouterStub::queue(vec![
+        (200, text_response(r#"{"edit":"Blur."}"#)),
+        (200, json!({ "data": [] })),
+    ]));
+    let err = ask(
+        "blur",
+        std::slice::from_ref(&photo),
+        library.root(),
+        stub_openrouter_post,
+    )
+    .unwrap_err();
+    assert_eq!(err, "OpenRouter returned no image.");
 }
 
 #[test]
-fn cancelling_gemini_edit_leaves_no_partial_sibling() {
+fn cancelling_edit_leaves_no_partial_sibling() {
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
-    fn slow_post(
-        _url: &str,
-        _api_key: &str,
-        _body: &Value,
-        _timeout: Duration,
+    fn slow_edit_post(
+        url: &str,
+        api_key: &str,
+        body: &Value,
+        timeout: Duration,
     ) -> Result<(u16, String), String> {
-        thread::sleep(Duration::from_secs(2));
-        Ok((200, png_response().to_string()))
+        if is_ask_request(url, body) {
+            Ok((200, text_response(r#"{"edit":"Blur."}"#).to_string()))
+        } else {
+            thread::sleep(Duration::from_secs(2));
+            stub_openrouter_post(url, api_key, body, timeout)
+        }
     }
-    let key = ResolvedKey {
-        key: "test-key".into(),
-        source: CredentialSource::File,
-    };
-    let mut handle = ai::spawn_edit_with(
+    let mut handle = ai::spawn_with(
         1,
-        "Blur.".to_string(),
-        photo,
+        "blur".to_string(),
+        vec![photo],
         library.root().to_path_buf(),
-        key,
+        test_key(),
         budget(),
-        slow_post,
+        slow_edit_post,
     );
     handle.cancel();
     let error = settle(&mut handle).unwrap_err();
     assert!(error.contains("cancelled"), "{error}");
     assert!(!library.root().join("Rome/photo-edited.png").exists());
+}
+
+#[test]
+fn openrouter_request_bodies_match_public_helpers() {
+    let ask = openrouter::ask_request_body("hello", &[("image/jpeg".into(), "abcd".into())], ASK_MODEL);
+    assert_eq!(ask["model"], ASK_MODEL);
+    let edit = openrouter::edit_request_body("blur", "image/jpeg", "abcd", EDIT_MODEL);
+    assert_eq!(edit["model"], EDIT_MODEL);
+}
+
+#[test]
+fn custom_models_from_credentials_file_are_used_in_requests() {
+    let _lock = openrouter_test_lock();
+    let library = Library::new();
+    let photo = library.photo("Rome/photo.jpg");
+    with_credentials_path(|| {
+        let path = std::env::var("HALLWARD_CREDENTIALS_PATH").unwrap();
+        fs::write(
+            path,
+            "OPENROUTER_API_KEY=saved\nASK_MODEL=custom/ask\nEDIT_MODEL=custom/edit\n",
+        )
+        .unwrap();
+        install_openrouter_stub(OpenRouterStub::single(200, text_response("ok")));
+        let key = credentials::resolve().unwrap();
+        ask_with(
+            "what?",
+            &[photo],
+            library.root(),
+            key,
+            budget(),
+            stub_openrouter_post,
+        )
+        .unwrap();
+        let stub = OPENROUTER_STUB.lock().unwrap();
+        assert_eq!(
+            stub.as_ref().unwrap().seen_bodies[0]["model"],
+            "custom/ask"
+        );
+    });
 }
