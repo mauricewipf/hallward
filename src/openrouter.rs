@@ -235,7 +235,10 @@ fn parse_image_bytes(value: &Value) -> Result<Vec<u8>, String> {
             }
         }
     }
-    if let Some(images) = value.pointer("/choices/0/message/images").and_then(Value::as_array) {
+    if let Some(images) = value
+        .pointer("/choices/0/message/images")
+        .and_then(Value::as_array)
+    {
         for image in images {
             if let Some(url) = image
                 .get("image_url")
@@ -360,7 +363,11 @@ mod tests {
 
     #[test]
     fn ask_request_uses_chat_completions_shape() {
-        let body = ask_request_body("what car?", &[("image/jpeg".into(), "abcd".into())], ASK_MODEL);
+        let body = ask_request_body(
+            "what car?",
+            &[("image/jpeg".into(), "abcd".into())],
+            ASK_MODEL,
+        );
         assert_eq!(body["model"], ASK_MODEL);
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "image_url");
@@ -408,11 +415,14 @@ mod tests {
     #[test]
     fn interpret_auth_quota_and_model_errors() {
         let auth = json!({"error": {"code": 401, "message": "bad key"}});
-        assert!(
-            interpret_chat_text(401, &auth.to_string(), CredentialSource::Environment, ASK_MODEL)
-                .unwrap_err()
-                .contains("OPENROUTER_API_KEY")
-        );
+        assert!(interpret_chat_text(
+            401,
+            &auth.to_string(),
+            CredentialSource::Environment,
+            ASK_MODEL
+        )
+        .unwrap_err()
+        .contains("OPENROUTER_API_KEY"));
         let saved = interpret_chat_text(401, &auth.to_string(), CredentialSource::File, ASK_MODEL)
             .unwrap_err();
         assert_eq!(saved, credentials::INVALID_SAVED_KEY);
@@ -423,10 +433,13 @@ mod tests {
                 .contains("quota")
         );
         let missing = json!({"error": {"code": 404, "message": "model"}});
-        assert!(
-            interpret_image_bytes(404, &missing.to_string(), CredentialSource::File, EDIT_MODEL)
-                .unwrap_err()
-                .contains(EDIT_MODEL)
-        );
+        assert!(interpret_image_bytes(
+            404,
+            &missing.to_string(),
+            CredentialSource::File,
+            EDIT_MODEL
+        )
+        .unwrap_err()
+        .contains(EDIT_MODEL));
     }
 }

@@ -249,10 +249,7 @@ fn a_plain_answer_reaches_the_caller() {
     let _lock = openrouter_test_lock();
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
-    install_openrouter_stub(OpenRouterStub::single(
-        200,
-        text_response("A red Ferrari."),
-    ));
+    install_openrouter_stub(OpenRouterStub::single(200, text_response("A red Ferrari.")));
 
     let value = ask("which car?", &[photo], library.root(), stub_openrouter_post).unwrap();
 
@@ -281,7 +278,13 @@ fn ask_only_sees_jpeg_previews() {
     let photo = library.photo("Rome/photo.jpg");
     install_openrouter_stub(OpenRouterStub::single(200, text_response("ok")));
 
-    ask("what is this?", &[photo], library.root(), stub_openrouter_post).unwrap();
+    ask(
+        "what is this?",
+        &[photo],
+        library.root(),
+        stub_openrouter_post,
+    )
+    .unwrap();
 
     let stub = OPENROUTER_STUB.lock().unwrap_or_else(|p| p.into_inner());
     let body = stub.as_ref().unwrap().seen_bodies.first().unwrap();
@@ -292,11 +295,7 @@ fn ask_only_sees_jpeg_previews() {
         .as_str()
         .unwrap()
         .starts_with("data:image/jpeg;base64,"));
-    assert!(content[0]["image_url"]["url"]
-        .as_str()
-        .unwrap()
-        .len()
-        > 30);
+    assert!(content[0]["image_url"]["url"].as_str().unwrap().len() > 30);
     assert_eq!(stub.as_ref().unwrap().seen_urls[0], CHAT_URL);
 }
 
@@ -351,13 +350,7 @@ fn an_invalid_saved_key_is_cleared() {
     let photo = library.photo("Rome/photo.jpg");
     with_credentials_path(|| {
         credentials::save_api_key("saved-key").unwrap();
-        let error = ask(
-            "which car?",
-            &[photo],
-            library.root(),
-            stub_openrouter_post,
-        )
-        .unwrap_err();
+        let error = ask("which car?", &[photo], library.root(), stub_openrouter_post).unwrap_err();
         assert_eq!(error, credentials::INVALID_SAVED_KEY);
         assert!(!credentials::resolve().is_some());
     });
@@ -484,7 +477,13 @@ fn repeated_edits_never_overwrite_an_earlier_sibling() {
             std::slice::from_ref(&photo),
             library.root(),
             |url, key, body, timeout| {
-                ask_then_edit_post(r#"{"edit":"Blur the background."}"#, url, key, body, timeout)
+                ask_then_edit_post(
+                    r#"{"edit":"Blur the background."}"#,
+                    url,
+                    key,
+                    body,
+                    timeout,
+                )
             },
         )
         .unwrap();
@@ -530,10 +529,7 @@ fn provider_404_429_and_no_image_are_mapped() {
 
     install_openrouter_stub(OpenRouterStub::queue(vec![
         (200, text_response(r#"{"edit":"Blur."}"#)),
-        (
-            404,
-            json!({"error": {"code": 404, "message": "model"}}),
-        ),
+        (404, json!({"error": {"code": 404, "message": "model"}})),
     ]));
     let err = ask(
         "blur",
@@ -546,10 +542,7 @@ fn provider_404_429_and_no_image_are_mapped() {
 
     install_openrouter_stub(OpenRouterStub::queue(vec![
         (200, text_response(r#"{"edit":"Blur."}"#)),
-        (
-            429,
-            json!({"error": {"code": 429, "message": "quota"}}),
-        ),
+        (429, json!({"error": {"code": 429, "message": "quota"}})),
     ]));
     let err = ask(
         "blur",
@@ -608,7 +601,8 @@ fn cancelling_edit_leaves_no_partial_sibling() {
 
 #[test]
 fn openrouter_request_bodies_match_public_helpers() {
-    let ask = openrouter::ask_request_body("hello", &[("image/jpeg".into(), "abcd".into())], ASK_MODEL);
+    let ask =
+        openrouter::ask_request_body("hello", &[("image/jpeg".into(), "abcd".into())], ASK_MODEL);
     assert_eq!(ask["model"], ASK_MODEL);
     let edit = openrouter::edit_request_body("blur", "image/jpeg", "abcd", EDIT_MODEL);
     assert_eq!(edit["model"], EDIT_MODEL);
@@ -638,9 +632,6 @@ fn custom_models_from_credentials_file_are_used_in_requests() {
         )
         .unwrap();
         let stub = OPENROUTER_STUB.lock().unwrap();
-        assert_eq!(
-            stub.as_ref().unwrap().seen_bodies[0]["model"],
-            "custom/ask"
-        );
+        assert_eq!(stub.as_ref().unwrap().seen_bodies[0]["model"], "custom/ask");
     });
 }

@@ -84,9 +84,9 @@ pub fn resolve() -> Option<ResolvedKey> {
         return Some(ResolvedKey {
             key,
             source: CredentialSource::Environment,
-            ask_model: models.map(ParsedCredentials::ask_model).unwrap_or_else(|| {
-                DEFAULT_ASK_MODEL.to_string()
-            }),
+            ask_model: models
+                .map(ParsedCredentials::ask_model)
+                .unwrap_or_else(|| DEFAULT_ASK_MODEL.to_string()),
             edit_model: models
                 .map(ParsedCredentials::edit_model)
                 .unwrap_or_else(|| DEFAULT_EDIT_MODEL.to_string()),

@@ -15,7 +15,7 @@ use crate::meta;
 use crate::openrouter;
 use crate::thumbs;
 
-pub use crate::openrouter::{post_openrouter, ASK_MODEL, EDIT_MODEL, PostFn};
+pub use crate::openrouter::{post_openrouter, PostFn, ASK_MODEL, EDIT_MODEL};
 
 pub const EDIT_TIMEOUT: Duration = Duration::from_secs(180);
 
