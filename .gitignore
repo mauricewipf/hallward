@@ -1,6 +1,11 @@
 # Test/library media — never commit photo or video bytes
 medialibrary/*
 !medialibrary/.gitkeep
+!medialibrary/Instructions/
+!medialibrary/Instructions/Getting Started/
+!medialibrary/Instructions/Getting Started/hallward-install-macos-infographic.png
+!medialibrary/Instructions/Getting Started/hallward-install-omarchy-infographic.png
+!medialibrary/Instructions/Getting Started/hallward-keybindings-infographic-pil.png
 
 # Generated catalog and thumbs (inside the library root)
 .album/
