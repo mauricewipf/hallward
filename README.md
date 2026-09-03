@@ -9,6 +9,7 @@ Terminal photo library: miller-style folders, a thumbnail grid for albums, an **
 - Browse photos and videos from the Terminal
 - Point Hallward on a remote or mounted file system and it works as well
 - **Ask AI** questions about photos: "Which car is this?"
+- **Edit** a marked photo with a prompt: "Remove the persons in the background."
 - View photos and videos in external viewer
 - First-class [Omarchy](https://omarchy.org/) support
 - More is coming. Stay tuned!
@@ -19,7 +20,7 @@ Terminal photo library: miller-style folders, a thumbnail grid for albums, an **
 - `libheif` / `heif-convert` for HEIC thumbnails (Arch: `pacman -S libheif`)
 - **ffmpeg** (ships `ffprobe`) for video **thumbnails** and Live Photo detection — not a player
 - A video player: **mpv**
-- (Optional) For AI use, install an agent CLI (OpenCode, Claude Code, or Codex).
+- (Optional) For AI use, install an agent CLI (OpenCode, Claude Code, or Codex). Image editing uses that same CLI.
 
 **macOS:** still images open in built-in **Preview** (no extra install). Quit Preview (Cmd-Q) to return to Hallward, same as mpv. Video playback requires **mpv** (`brew install mpv`). FFmpeg’s `ffplay` is a terminal player: it tears down the TUI, dumps decoder logs to the shell, and is not an acceptable viewer. If the status pane says `video: ffplay` or `video: no player`, install mpv and restart Hallward until it shows `video: mpv`.
 
@@ -75,6 +76,10 @@ hallward --root PATH   # library is PATH instead of cwd
 ### Ask AI
 
 Mark with `Space` key one or more **images** and the search bar becomes **Ask AI**. On Omarchy set a default agent. On Mac install any of these agent CLIs: opencode, pi, omp, hermes, codex, claude.
+
+Type a question and press Enter: "Which car is this?" The agent answers in the pane.
+
+If the prompt is an edit instruction such as "Remove the persons in the background.", Hallward classifies the request and then runs the same agent CLI a second time to perform the edit. Both runs use the model you configured for your agent — Hallward never overrides it, so editing only works when that model can generate images. The edited photo is saved as a new sibling file (`photo-edited.png`, then `photo-edited-2.png`, …). The original is never overwritten. Editing needs **exactly one** marked still. Esc cancels an in-flight request.
 
 ![Ask AI](assets/2026-09-02_ai-chat.png)
 

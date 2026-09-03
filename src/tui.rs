@@ -25,6 +25,7 @@ use rusqlite::Connection;
 
 use crate::ai::{self, AskHandle};
 use crate::catalog::{self, Photo};
+use crate::image_edit;
 use crate::index;
 use crate::library::{self, Folder, Kind};
 use crate::media::{is_image, is_video};
@@ -97,7 +98,12 @@ impl AskAi {
 
     fn second_paragraph(&self, now: Instant) -> Option<String> {
         if let Some(started) = self.waiting_from {
-            return Some(ai::waiting_text(started, now));
+            let phase = self
+                .job
+                .as_ref()
+                .map(|job| job.progress())
+                .unwrap_or(ai::AskProgress::Analyzing);
+            return Some(ai::waiting_text(phase, started, now));
         }
         match &self.reply {
             Some(AskReply::Text(t) | AskReply::Error(t)) => Some(t.clone()),
@@ -245,10 +251,20 @@ impl App {
             return;
         }
         self.ask.waiting_from = None;
-        self.ask.reply = Some(match outcome.result {
-            Ok(text) => AskReply::Text(text),
-            Err(err) => AskReply::Error(err),
-        });
+        match outcome.result {
+            Ok(ai::AskValue::Answer(text)) => {
+                self.ask.reply = Some(AskReply::Text(text));
+            }
+            Ok(ai::AskValue::Saved(saved)) => {
+                self.focus_saved_edit(&saved.relpath);
+                let message = image_edit::saved_message(&saved.filename);
+                self.status = message.clone();
+                self.ask.reply = Some(AskReply::Text(message));
+            }
+            Err(err) => {
+                self.ask.reply = Some(AskReply::Error(err));
+            }
+        }
     }
 
     fn send_ask(&mut self) {
@@ -275,7 +291,18 @@ impl App {
         self.ask.reply = None;
         self.ask.waiting_from = Some(Instant::now());
         self.ask.scroll = 0;
-        self.ask.job = Some(ai::spawn(self.ask.generation, agent, prompt, files));
+        self.ask.job = Some(ai::spawn(
+            self.ask.generation,
+            agent,
+            prompt,
+            files,
+            self.root.clone(),
+        ));
+    }
+
+    fn focus_saved_edit(&mut self, relpath: &str) {
+        self.protocols.remove(relpath);
+        self.reload_photos_focusing(Some(relpath));
     }
 
     fn shutdown_ask(&mut self) {
@@ -330,18 +357,20 @@ impl App {
     }
 
     fn reload_photos(&mut self) {
+        self.reload_photos_focusing(None);
+    }
+
+    fn reload_photos_focusing(&mut self, focus_rel: Option<&str>) {
         self.photos = if let Some(album) = self.current_album() {
             let key = Self::album_key(album);
             catalog::photos_in_album(&self.conn, &key).unwrap_or_default()
         } else {
             Vec::new()
         };
-        if self.photos.is_empty() {
-            self.grid_idx = 0;
-        } else if self.grid_idx >= self.photos.len() {
-            self.grid_idx = self.photos.len() - 1;
+        self.grid_idx = focused_photo_index(&self.photos, self.grid_idx, focus_rel);
+        if focus_rel.is_none() {
+            self.grid_scroll = 0;
         }
-        self.grid_scroll = 0;
         self.marked.clear();
         self.sync_ask_selection();
     }
@@ -589,6 +618,21 @@ fn apply_ask_scroll(scroll: u16, key: AskFieldKey, page: u16, max: u16) -> u16 {
 
 fn ask_outcome_is_stale(generation: u64, outcome_id: u64) -> bool {
     generation != outcome_id
+}
+
+fn focused_photo_index(photos: &[Photo], current: usize, focus_rel: Option<&str>) -> usize {
+    if let Some(rel) = focus_rel {
+        if let Some(index) = photos.iter().position(|photo| photo.relpath == rel) {
+            return index;
+        }
+    }
+    if photos.is_empty() {
+        0
+    } else if current >= photos.len() {
+        photos.len() - 1
+    } else {
+        current
+    }
 }
 
 fn is_shift_tab(key: &KeyEvent) -> bool {
@@ -1048,12 +1092,7 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect, ask_ai: bool, second: O
         Style::default()
     };
     let text = if ask_ai {
-        ask_ai_lines(
-            &app.ask.prompt,
-            second,
-            app.ask.second_is_error(),
-            focused,
-        )
+        ask_ai_lines(&app.ask.prompt, second, app.ask.second_is_error(), focused)
     } else {
         vec![Line::from(app.query.clone())]
     };
@@ -1678,11 +1717,11 @@ mod tests {
 
     #[test]
     fn ask_ai_lines_are_two_paragraphs() {
-        let lines = ask_ai_lines("describe this", Some("Waiting..."), false, false);
+        let lines = ask_ai_lines("describe this", Some("Analyzing prompt..."), false, false);
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].spans[0].content, "describe this");
         assert_eq!(lines[1].spans.len(), 0);
-        assert_eq!(lines[2].spans[0].content, "Waiting...");
+        assert_eq!(lines[2].spans[0].content, "Analyzing prompt...");
     }
 
     #[test]
@@ -1760,6 +1799,22 @@ mod tests {
     fn changed_selection_invalidates_stale_ask_output() {
         assert!(ask_outcome_is_stale(2, 1));
         assert!(!ask_outcome_is_stale(2, 2));
+    }
+
+    #[test]
+    fn saved_edit_focuses_the_new_sibling() {
+        let photos = vec![
+            photo("album/a.jpg"),
+            photo("album/a-edited.png"),
+            photo("album/b.jpg"),
+        ];
+        assert_eq!(
+            focused_photo_index(&photos, 0, Some("album/a-edited.png")),
+            1
+        );
+        assert_eq!(focused_photo_index(&photos, 2, None), 2);
+        assert_eq!(focused_photo_index(&[], 3, None), 0);
+        assert_eq!(focused_photo_index(&photos, 9, None), 2);
     }
 
     #[test]

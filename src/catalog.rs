@@ -79,6 +79,17 @@ pub fn get_mtime_size(conn: &Connection, relpath: &str) -> Result<Option<(i64, i
     Ok(row)
 }
 
+pub fn captured_at(conn: &Connection, relpath: &str) -> Result<Option<String>> {
+    let row = conn
+        .query_row(
+            "SELECT captured_at FROM photos WHERE relpath = ?1",
+            [relpath],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(row.flatten())
+}
+
 /// Atomically apply all catalog mutations after thumbnail generation.
 pub fn apply_index_changes(
     conn: &mut Connection,
@@ -127,6 +138,34 @@ pub fn apply_index_changes(
     }
     tx.commit()?;
     Ok(removed)
+}
+
+pub fn upsert_photo(conn: &Connection, photo: &Photo) -> Result<()> {
+    conn.execute(
+        "INSERT INTO photos (relpath, album, filename, mtime, size, captured_at, camera, width, height)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(relpath) DO UPDATE SET
+            album=excluded.album,
+            filename=excluded.filename,
+            mtime=excluded.mtime,
+            size=excluded.size,
+            captured_at=excluded.captured_at,
+            camera=excluded.camera,
+            width=excluded.width,
+            height=excluded.height",
+        params![
+            photo.relpath,
+            photo.album,
+            photo.filename,
+            photo.mtime,
+            photo.size,
+            photo.captured_at,
+            photo.camera,
+            photo.width,
+            photo.height,
+        ],
+    )?;
+    Ok(())
 }
 
 pub fn photos_in_album(conn: &Connection, album: &str) -> Result<Vec<Photo>> {

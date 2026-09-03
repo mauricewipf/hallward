@@ -1,13 +1,14 @@
-mod ai;
-mod catalog;
-mod index;
-mod library;
-mod media;
-mod meta;
-mod search;
-mod thumbs;
-mod tui;
-mod viewer;
+pub mod ai;
+pub mod catalog;
+pub mod image_edit;
+pub mod index;
+pub mod library;
+pub mod media;
+pub mod meta;
+pub mod search;
+pub mod thumbs;
+pub mod tui;
+pub mod viewer;
 
 use std::io::{self, Write};
 use std::path::PathBuf;

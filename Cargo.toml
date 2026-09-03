@@ -2,6 +2,7 @@
 name = "hallward"
 version = "0.1.4"
 edition = "2021"
+default-run = "hallward"
 description = "Terminal photo library: miller collections, thumbnail albums, external viewer"
 license = "MIT"
 repository = "https://github.com/mauricewipf/hallward"

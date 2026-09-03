@@ -241,6 +241,46 @@ fn index_library_inner(root: &Path, progress: Option<&CliProgress>) -> Result<In
     Ok(stats)
 }
 
+/// Index a single new still without pruning the rest of the catalog.
+pub fn index_new_file(
+    root: &Path,
+    abs: &Path,
+    captured_at_fallback: Option<&str>,
+) -> Result<Photo> {
+    let rel = abs
+        .strip_prefix(root)
+        .map_err(|_| anyhow::anyhow!("{} is outside the library", abs.display()))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let meta_fs = fs::metadata(abs)?;
+    let mtime = mtime_epoch(&meta_fs)?;
+    let size = meta_fs.len() as i64;
+    let filename = abs
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let album = catalog::album_relpath(&rel);
+    let mut photo_meta = if is_video(abs) {
+        meta::video_meta_from_mtime(mtime)
+    } else {
+        meta::read_meta(abs)
+    };
+    if photo_meta.captured_at.is_none() {
+        photo_meta.captured_at = captured_at_fallback.map(str::to_string);
+    }
+    if photo_meta.width.is_none() || photo_meta.height.is_none() {
+        if let Ok((width, height)) = image::image_dimensions(abs) {
+            photo_meta.width = photo_meta.width.or(Some(width));
+            photo_meta.height = photo_meta.height.or(Some(height));
+        }
+    }
+    thumbs::generate_thumb(root, abs, &rel)?;
+    let photo = catalog::photo_from_file(rel, filename, album, mtime, size, photo_meta);
+    let conn = catalog::open(root, true)?;
+    catalog::upsert_photo(&conn, &photo)?;
+    Ok(photo)
+}
+
 fn mtime_epoch(meta: &fs::Metadata) -> Result<i64> {
     let d = meta
         .modified()

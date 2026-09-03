@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::catalog::Photo;
+use crate::image_edit::{self, SavedEdit};
 use crate::media::{bin_on_path, is_image};
 use crate::thumbs;
 
@@ -26,11 +27,71 @@ const DOT_STEP: Duration = Duration::from_millis(400);
 const SUPPORTED: &[&str] = &["opencode", "pi", "omp", "hermes", "codex", "claude"];
 const STUB_MAX_BYTES: usize = 16 * 1024;
 
+/// Progress shown while a headless Ask AI / edit job is running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AskProgress {
+    Analyzing,
+    Editing,
+    Indexing,
+}
+
+/// Successful Ask AI outcome: a text answer, or a newly saved edited still.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AskValue {
+    Answer(String),
+    Saved(SavedEdit),
+}
+
 /// Result of one headless Ask AI run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AskOutcome {
     pub id: u64,
-    pub result: Result<String, String>,
+    pub result: Result<AskValue, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AskDecision {
+    Answer(String),
+    Edit(String),
+}
+
+/// An agent name paired with the executable that implements it. Tests point
+/// `program` at a stub binary so a whole Ask AI run needs no live agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentCli {
+    pub agent: String,
+    pub program: PathBuf,
+}
+
+impl AgentCli {
+    /// Run the agent by name, resolved on PATH, the way the TUI does.
+    pub fn on_path(agent: &str) -> Self {
+        Self::with_program(agent, agent)
+    }
+
+    /// Build the agent's argv but run it through `program`.
+    pub fn with_program(agent: &str, program: impl Into<PathBuf>) -> Self {
+        Self {
+            agent: agent.to_string(),
+            program: program.into(),
+        }
+    }
+}
+
+/// Wall-clock budgets for the two agent calls one Ask AI request can make.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timeouts {
+    pub ask: Duration,
+    pub edit: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            ask: ASK_TIMEOUT,
+            edit: image_edit::EDIT_TIMEOUT,
+        }
+    }
 }
 
 /// Handle for an in-flight Ask AI child process.
@@ -39,6 +100,7 @@ pub struct AskHandle {
     rx: Receiver<AskOutcome>,
     cancel: Arc<AtomicBool>,
     child_slot: Arc<Mutex<Option<Child>>>,
+    progress: Arc<Mutex<AskProgress>>,
 }
 
 impl AskHandle {
@@ -56,6 +118,13 @@ impl AskHandle {
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
         kill_slot(&self.child_slot);
+    }
+
+    pub fn progress(&self) -> AskProgress {
+        *self
+            .progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -277,17 +346,22 @@ pub fn ask_ai_active(agent: Option<&str>, stills: &[String]) -> bool {
     agent.is_some() && !stills.is_empty()
 }
 
-pub fn waiting_text(started: Instant, now: Instant) -> String {
+pub fn waiting_text(phase: AskProgress, started: Instant, now: Instant) -> String {
+    let base = match phase {
+        AskProgress::Analyzing => "Analyzing prompt",
+        AskProgress::Editing => "Editing image",
+        AskProgress::Indexing => "Indexing result",
+    };
     let step = now
         .checked_duration_since(started)
         .unwrap_or(Duration::ZERO)
         .as_millis()
         / DOT_STEP.as_millis();
     match step % 4 {
-        0 => "Waiting".into(),
-        1 => "Waiting.".into(),
-        2 => "Waiting..".into(),
-        _ => "Waiting...".into(),
+        0 => base.into(),
+        1 => format!("{base}."),
+        2 => format!("{base}.."),
+        _ => format!("{base}..."),
     }
 }
 
@@ -358,19 +432,95 @@ pub fn no_images_message() -> String {
     "Videos can't be sent to the AI. Mark a photo and try again.".into()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolPolicy {
+    DenyAll,
+    AllowWrite,
+}
+
 fn photo_qa_prompt(user_prompt: &str) -> String {
     format!(
-        "You are a photo Q&A assistant. Analyze only the attached images themselves. \
+        "You are a photo assistant. Analyze only the attached images themselves. \
 Do not inspect files, databases, metadata, paths, or the working directory. \
-Do not use or mention tools. Do not reveal reasoning or narrate your process. \
-Return only the direct final answer to the user's question.\n\nUser question:\n{user_prompt}"
+Do not use or mention tools. Do not reveal reasoning or narrate your process.\n\n\
+If the user wants the photograph itself changed (remove, add, retouch, restyle, \
+replace, or otherwise alter pixels), reply with exactly one JSON object and nothing else:\n\
+{{\"edit\":\"<imperative instruction for the image editor>\"}}\n\
+The edit value must be a complete instruction that can be applied to the attached image, \
+preserving everything the user did not mention.\n\n\
+Otherwise return only the direct final answer to the user's question.\n\n\
+User request:\n{user_prompt}"
     )
+}
+
+pub fn parse_ask_decision(text: &str) -> AskDecision {
+    if let Some(instruction) = parse_edit_directive(text) {
+        AskDecision::Edit(instruction)
+    } else {
+        AskDecision::Answer(text.trim().to_string())
+    }
+}
+
+fn parse_edit_directive(text: &str) -> Option<String> {
+    let candidate = strip_markdown_fence(text.trim());
+    let value: Value = serde_json::from_str(candidate).ok()?;
+    let object = value.as_object()?;
+    let instruction = object.get("edit")?.as_str()?.trim();
+    if instruction.is_empty() {
+        return None;
+    }
+    Some(instruction.to_string())
+}
+
+fn strip_markdown_fence(text: &str) -> &str {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let rest = rest
+        .strip_prefix("json")
+        .or_else(|| rest.strip_prefix("JSON"))
+        .unwrap_or(rest);
+    let rest = rest
+        .strip_prefix("\r\n")
+        .or_else(|| rest.strip_prefix('\n'))
+        .or_else(|| rest.strip_prefix('\r'))
+        .unwrap_or(rest);
+    match rest.strip_suffix("```") {
+        Some(inner) => inner.trim(),
+        None => trimmed,
+    }
 }
 
 fn attachment_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// OpenCode binds the default model to `--dir` (the project). Pointing that at
+/// a throwaway preview folder makes it fall back to an undeployed Console
+/// model, so `--dir` stays the process cwd and `-f` uses absolute paths.
+fn opencode_dir_and_files<P: AsRef<Path>>(files: &[P]) -> Vec<String> {
+    let mut argv = Vec::new();
+    if let Ok(dir) = env::current_dir() {
+        argv.push("--dir".into());
+        argv.push(dir.to_string_lossy().into_owned());
+    }
+    for file in files {
+        argv.push("-f".into());
+        argv.push(absolute_attach(file.as_ref()));
+    }
+    argv
+}
+
+fn absolute_attach(path: &Path) -> String {
+    if path.is_absolute() {
+        return path.to_string_lossy().into_owned();
+    }
+    env::current_dir()
+        .map(|cwd| cwd.join(path).to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
 }
 
 /// Headless argv for a verified image-capable Omarchy agent.
@@ -383,17 +533,8 @@ pub fn build_argv(agent: &str, prompt: &str, files: &[PathBuf]) -> Result<Vec<St
     }
     Ok(match agent {
         "opencode" => {
-            let mut argv = vec![
-                "opencode".into(),
-                "run".into(),
-                photo_qa_prompt(prompt),
-                "--format".into(),
-                "json".into(),
-            ];
-            for f in files {
-                argv.push("-f".into());
-                argv.push(attachment_name(f));
-            }
+            let mut argv = vec!["opencode".into(), "run".into(), photo_qa_prompt(prompt)];
+            argv.extend(opencode_dir_and_files(files));
             argv
         }
         "pi" => {
@@ -475,6 +616,87 @@ pub fn build_argv(agent: &str, prompt: &str, files: &[PathBuf]) -> Result<Vec<St
                 body,
             ]
         }
+        other => return Err(unsupported_message(other)),
+    })
+}
+
+fn photo_edit_prompt(instruction: &str, source_name: &str, dest_name: &str) -> String {
+    format!(
+        "You are a photo editor. Edit only the attached photograph according to the instruction. \
+Save the edited image as a new file named exactly {dest_name} in the current directory. \
+Do not overwrite {source_name} or any other file. \
+Do not add text, watermarks, or captions. \
+When finished, reply with only the saved filename.\n\n\
+Instruction:\n{instruction}"
+    )
+}
+
+/// Headless argv that asks the agent to write an edited sibling image.
+pub fn build_edit_argv(
+    agent: &str,
+    instruction: &str,
+    source: &Path,
+    dest: &Path,
+) -> Result<Vec<String>, String> {
+    if !is_supported_agent(agent) {
+        return Err(unsupported_message(agent));
+    }
+    let source_name = attachment_name(source);
+    let dest_name = attachment_name(dest);
+    let prompt = photo_edit_prompt(instruction, &source_name, &dest_name);
+    Ok(match agent {
+        "opencode" => {
+            let mut argv = vec!["opencode".into(), "run".into(), prompt];
+            argv.extend(opencode_dir_and_files(&[source]));
+            argv
+        }
+        "pi" => vec![
+            "pi".into(),
+            "-p".into(),
+            "--no-context-files".into(),
+            "--no-session".into(),
+            format!("@{source_name}"),
+            "--".into(),
+            prompt,
+        ],
+        "omp" => vec![
+            "omp".into(),
+            "-p".into(),
+            "--no-session".into(),
+            format!("@{source_name}"),
+            "--".into(),
+            prompt,
+        ],
+        "hermes" => vec![
+            "hermes".into(),
+            "chat".into(),
+            "--oneshot".into(),
+            "-Q".into(),
+            "--image".into(),
+            source_name,
+            "-q".into(),
+            prompt,
+        ],
+        "codex" => vec![
+            "codex".into(),
+            "exec".into(),
+            "--ephemeral".into(),
+            "--sandbox".into(),
+            "workspace-write".into(),
+            prompt,
+            "-i".into(),
+            source_name,
+        ],
+        "claude" => vec![
+            "claude".into(),
+            "-p".into(),
+            "--tools".into(),
+            "Read,Write".into(),
+            "--permission-mode".into(),
+            "dontAsk".into(),
+            "--".into(),
+            format!("Look at this image:\n{source_name}\n\n{prompt}"),
+        ],
         other => return Err(unsupported_message(other)),
     })
 }
@@ -645,24 +867,51 @@ fn kill_process_group(pid: u32) {
 fn kill_process_group(_pid: u32) {}
 
 /// Spawn a headless Ask AI request on a background thread.
-pub fn spawn(id: u64, agent: String, prompt: String, files: Vec<PathBuf>) -> AskHandle {
-    spawn_with_timeout(id, agent, prompt, files, ASK_TIMEOUT)
-}
-
-fn spawn_with_timeout(
+pub fn spawn(
     id: u64,
     agent: String,
     prompt: String,
     files: Vec<PathBuf>,
-    timeout: Duration,
+    library_root: PathBuf,
+) -> AskHandle {
+    spawn_with(
+        id,
+        AgentCli::on_path(&agent),
+        prompt,
+        files,
+        library_root,
+        Timeouts::default(),
+    )
+}
+
+/// [`spawn`] with an explicit executable and timeouts, so tests can drive a
+/// full request against a stub agent in milliseconds.
+pub fn spawn_with(
+    id: u64,
+    cli: AgentCli,
+    prompt: String,
+    files: Vec<PathBuf>,
+    library_root: PathBuf,
+    timeouts: Timeouts,
 ) -> AskHandle {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let child_slot = Arc::new(Mutex::new(None));
+    let progress = Arc::new(Mutex::new(AskProgress::Analyzing));
     let cancel_t = cancel.clone();
     let slot_t = child_slot.clone();
+    let progress_t = progress.clone();
     thread::spawn(move || {
-        let result = run_ask(&agent, &prompt, &files, &cancel_t, &slot_t, timeout);
+        let result = run_ask(
+            &cli,
+            &prompt,
+            &files,
+            &library_root,
+            &cancel_t,
+            &slot_t,
+            &progress_t,
+            timeouts,
+        );
         let _ = tx.send(AskOutcome { id, result });
     });
     AskHandle {
@@ -670,35 +919,117 @@ fn spawn_with_timeout(
         rx,
         cancel,
         child_slot,
+        progress,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_ask(
-    agent: &str,
+    cli: &AgentCli,
     prompt: &str,
     files: &[PathBuf],
+    library_root: &Path,
     cancel: &AtomicBool,
     child_slot: &Mutex<Option<Child>>,
-    timeout: Duration,
-) -> Result<String, String> {
+    progress: &Mutex<AskProgress>,
+    timeouts: Timeouts,
+) -> Result<AskValue, String> {
     if cancel.load(Ordering::SeqCst) {
         return Err("Ask AI cancelled.".into());
     }
+    set_progress(progress, AskProgress::Analyzing);
     let (preview_dir, prepared_files) = prepare_agent_files(files)?;
-    let argv = build_argv(agent, prompt, &prepared_files)?;
-    execute_argv(
-        agent,
+    let argv = build_argv(&cli.agent, prompt, &prepared_files)?;
+    let answer = execute_argv(
+        cli,
         &argv,
         preview_dir.path(),
         cancel,
         child_slot,
-        timeout,
-    )
+        timeouts.ask,
+        ToolPolicy::DenyAll,
+    )?;
+    match parse_ask_decision(&answer) {
+        AskDecision::Answer(text) => {
+            if text.is_empty() {
+                Err(format!("{} returned no answer.", display_name(&cli.agent)))
+            } else {
+                Ok(AskValue::Answer(text))
+            }
+        }
+        AskDecision::Edit(instruction) => {
+            edit_source_count_ok(files.len())?;
+            set_progress(progress, AskProgress::Editing);
+            let saved = run_agent_edit(
+                cli,
+                &files[0],
+                library_root,
+                &instruction,
+                cancel,
+                child_slot,
+                progress,
+                timeouts.edit,
+            )?;
+            Ok(AskValue::Saved(saved))
+        }
+    }
 }
 
-fn prepare_agent_files(
-    files: &[PathBuf],
-) -> Result<(tempfile::TempDir, Vec<PathBuf>), String> {
+fn set_progress(progress: &Mutex<AskProgress>, value: AskProgress) {
+    if let Ok(mut guard) = progress.lock() {
+        *guard = value;
+    }
+}
+
+pub fn edit_source_count_ok(count: usize) -> Result<(), String> {
+    if count == 1 {
+        Ok(())
+    } else {
+        Err(image_edit::edit_needs_one_photo_message())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_agent_edit(
+    cli: &AgentCli,
+    source: &Path,
+    library_root: &Path,
+    instruction: &str,
+    cancel: &AtomicBool,
+    child_slot: &Mutex<Option<Child>>,
+    progress: &Mutex<AskProgress>,
+    timeout: Duration,
+) -> Result<SavedEdit, String> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err("Ask AI cancelled.".into());
+    }
+    let dest = image_edit::unique_sibling_path(source, "png")?;
+    let work_dir = source.parent().unwrap_or_else(|| Path::new("."));
+    let argv = build_edit_argv(&cli.agent, instruction, source, &dest)?;
+    let result = execute_argv(
+        cli,
+        &argv,
+        work_dir,
+        cancel,
+        child_slot,
+        timeout,
+        ToolPolicy::AllowWrite,
+    );
+    if matches!(&result, Err(error) if error.contains("cancelled") || error.contains("timed out")) {
+        let _ = fs::remove_file(&dest);
+        return Err(result.unwrap_err());
+    }
+    if dest.is_file() {
+        set_progress(progress, AskProgress::Indexing);
+        return image_edit::index_saved_edit(source, &dest, library_root);
+    }
+    match result {
+        Ok(_) => Err(image_edit::no_saved_image_message(display_name(&cli.agent))),
+        Err(error) => Err(error),
+    }
+}
+
+fn prepare_agent_files(files: &[PathBuf]) -> Result<(tempfile::TempDir, Vec<PathBuf>), String> {
     let dir = tempfile::tempdir()
         .map_err(|error| format!("Could not create Ask AI image previews: {error}"))?;
     let mut previews = Vec::with_capacity(files.len());
@@ -713,21 +1044,27 @@ fn prepare_agent_files(
 }
 
 fn execute_argv(
-    agent: &str,
+    cli: &AgentCli,
     argv: &[String],
     work_dir: &Path,
     cancel: &AtomicBool,
     child_slot: &Mutex<Option<Child>>,
     timeout: Duration,
+    tools: ToolPolicy,
 ) -> Result<String, String> {
-    let mut cmd = Command::new(&argv[0]);
+    let agent = cli.agent.as_str();
+    let mut cmd = Command::new(&cli.program);
     cmd.args(&argv[1..])
         .current_dir(work_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if agent == "opencode" {
-        cmd.env("OPENCODE_PERMISSION", r#"{"*":"deny"}"#);
+        let permission = match tools {
+            ToolPolicy::DenyAll => r#"{"*":"deny"}"#,
+            ToolPolicy::AllowWrite => r#"{"*":"allow"}"#,
+        };
+        cmd.env("OPENCODE_PERMISSION", permission);
     }
     #[cfg(unix)]
     {
@@ -816,10 +1153,7 @@ fn finalize_answer(agent: &str, stdout: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err(format!("{} returned no answer.", display_name(agent)));
     }
-    match agent {
-        "opencode" => parse_opencode_events(trimmed).or_else(|_| Ok(finalize_plain_answer(trimmed))),
-        _ => Ok(finalize_plain_answer(trimmed)),
-    }
+    Ok(finalize_plain_answer(trimmed))
 }
 
 fn finalize_plain_answer(stdout: &str) -> String {
@@ -833,54 +1167,6 @@ fn finalize_plain_answer(stdout: &str) -> String {
         [only] => (*only).to_string(),
         _ => paragraphs.last().copied().unwrap_or("").to_string(),
     }
-}
-
-fn parse_opencode_events(stream: &str) -> Result<String, String> {
-    let mut step_text = Vec::new();
-    let mut final_answer = None;
-    let mut error = None;
-
-    for line in stream.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(event) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        match event.get("type").and_then(Value::as_str) {
-            Some("step_start") => step_text.clear(),
-            Some("text") => {
-                if let Some(text) = event
-                    .get("part")
-                    .and_then(|part| part.get("text"))
-                    .and_then(Value::as_str)
-                {
-                    step_text.push(text.to_string());
-                }
-            }
-            Some("step_finish") => {
-                let stopped = event
-                    .get("part")
-                    .and_then(|part| part.get("reason"))
-                    .and_then(Value::as_str)
-                    == Some("stop");
-                if stopped && !step_text.is_empty() {
-                    final_answer = Some(step_text.concat());
-                }
-            }
-            Some("error") => {
-                error = event
-                    .get("error")
-                    .and_then(|value| value.get("data"))
-                    .and_then(|value| value.get("message"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-            }
-            _ => {}
-        }
-    }
-
-    final_answer
-        .map(|answer| answer.trim().to_string())
-        .filter(|answer| !answer.is_empty())
-        .ok_or_else(|| error.unwrap_or_else(|| "OpenCode returned no final answer.".into()))
 }
 
 fn combine_output(primary: &str, secondary: &str) -> String {
@@ -1072,46 +1358,23 @@ mod tests {
     fn opencode_argv_matches_requested_shape() {
         let files = [PathBuf::from("/lib/a.png"), PathBuf::from("/lib/b.jpg")];
         let argv = build_argv("opencode", "what is this?", &files).unwrap();
-        assert!(argv[2].contains("Return only the direct final answer"));
-        assert!(argv[2].ends_with("User question:\nwhat is this?"));
+        assert!(argv[2].contains("direct final answer"));
+        assert!(argv[2].contains("{\"edit\":\""));
+        assert!(argv[2].ends_with("User request:\nwhat is this?"));
         assert_eq!(&argv[..2], ["opencode", "run"]);
+        let cwd = env::current_dir().unwrap();
         assert_eq!(
             &argv[3..],
             [
-                "--format",
-                "json",
+                "--dir",
+                cwd.to_str().unwrap(),
                 "-f",
-                "a.png",
+                "/lib/a.png",
                 "-f",
-                "b.jpg",
+                "/lib/b.jpg"
             ]
         );
-    }
-
-    #[test]
-    fn opencode_json_keeps_only_the_final_step_text() {
-        let events = concat!(
-            r#"{"type":"step_start","part":{"type":"step-start"}}"#,
-            "\n",
-            r#"{"type":"text","part":{"type":"text","text":"I'll inspect the files."}}"#,
-            "\n",
-            r#"{"type":"step_finish","part":{"reason":"tool-calls"}}"#,
-            "\n",
-            r#"{"type":"step_start","part":{"type":"step-start"}}"#,
-            "\n",
-            r#"{"type":"text","part":{"type":"text","text":"Salta, "}}"#,
-            "\n",
-            r#"{"type":"text","part":{"type":"text","text":"Argentina"}}"#,
-            "\n",
-            r#"{"type":"step_finish","part":{"reason":"stop"}}"#,
-        );
-        assert_eq!(parse_opencode_events(events).unwrap(), "Salta, Argentina");
-    }
-
-    #[test]
-    fn opencode_json_returns_clean_error_message() {
-        let event = r#"{"type":"error","error":{"name":"UnknownError","data":{"message":"Model not found"}}}"#;
-        assert_eq!(parse_opencode_events(event).unwrap_err(), "Model not found");
+        assert_ne!(argv[4], "/lib", "preview/album dirs must not become --dir");
     }
 
     #[test]
@@ -1129,22 +1392,15 @@ mod tests {
     }
 
     #[test]
-    fn finalize_answer_uses_opencode_json_steps() {
-        let events = concat!(
-            r#"{"type":"text","part":{"type":"text","text":"thinking"}}"#,
-            "\n",
-            r#"{"type":"step_finish","part":{"reason":"stop"}}"#,
-        );
-        assert_eq!(
-            finalize_answer("opencode", events).unwrap(),
-            "thinking"
-        );
-    }
-
-    #[test]
     fn finalize_answer_plain_agents_drop_leading_reasoning() {
         let text = "I'll look at the photo.\n\nA red car.";
-        assert_eq!(finalize_answer("pi", text).unwrap(), "A red car.");
+        for agent in ["pi", "omp", "hermes", "codex", "claude", "opencode"] {
+            assert_eq!(
+                finalize_answer(agent, text).unwrap(),
+                "A red car.",
+                "{agent}"
+            );
+        }
     }
 
     #[test]
@@ -1159,8 +1415,9 @@ mod tests {
                 "hermes" => argv.last().unwrap(),
                 _ => argv.last().unwrap(),
             };
-            assert!(prompt.contains("Return only the direct final answer"), "{agent}");
-            assert!(prompt.ends_with("User question:\nwhat car?"), "{agent}");
+            assert!(prompt.contains("direct final answer"), "{agent}");
+            assert!(prompt.contains("{\"edit\":\""), "{agent}");
+            assert!(prompt.ends_with("User request:\nwhat car?"), "{agent}");
         }
     }
 
@@ -1277,7 +1534,10 @@ mod tests {
                 "a.png",
             ]
         );
-        let prompt_at = argv.iter().position(|a| a.contains("User question:\nlook")).unwrap();
+        let prompt_at = argv
+            .iter()
+            .position(|a| a.contains("User request:\nlook"))
+            .unwrap();
         let image_at = argv.iter().position(|a| a == "-i").unwrap();
         assert!(prompt_at < image_at);
     }
@@ -1341,22 +1601,25 @@ mod tests {
     #[test]
     fn waiting_dots_cycle_through_three_then_none() {
         let t0 = Instant::now();
-        assert_eq!(waiting_text(t0, t0), "Waiting");
         assert_eq!(
-            waiting_text(t0, t0 + Duration::from_millis(400)),
-            "Waiting."
+            waiting_text(AskProgress::Analyzing, t0, t0),
+            "Analyzing prompt"
         );
         assert_eq!(
-            waiting_text(t0, t0 + Duration::from_millis(800)),
-            "Waiting.."
+            waiting_text(AskProgress::Analyzing, t0, t0 + Duration::from_millis(400)),
+            "Analyzing prompt."
         );
         assert_eq!(
-            waiting_text(t0, t0 + Duration::from_millis(1200)),
-            "Waiting..."
+            waiting_text(AskProgress::Editing, t0, t0 + Duration::from_millis(800)),
+            "Editing image.."
         );
         assert_eq!(
-            waiting_text(t0, t0 + Duration::from_millis(1600)),
-            "Waiting"
+            waiting_text(AskProgress::Indexing, t0, t0 + Duration::from_millis(1200)),
+            "Indexing result..."
+        );
+        assert_eq!(
+            waiting_text(AskProgress::Analyzing, t0, t0 + Duration::from_millis(1600)),
+            "Analyzing prompt"
         );
     }
 
@@ -1374,14 +1637,15 @@ mod tests {
     fn execute_echo_returns_stdout() {
         let cancel = AtomicBool::new(false);
         let slot = Mutex::new(None);
-        let argv = vec!["echo".into(), "hello-ask".into()];
+        let argv = vec!["pi".into(), "hello-ask".into()];
         let out = execute_argv(
-            "pi",
+            &AgentCli::with_program("pi", "echo"),
             &argv,
             Path::new("."),
             &cancel,
             &slot,
             Duration::from_secs(5),
+            ToolPolicy::DenyAll,
         )
         .unwrap();
         assert_eq!(out.trim(), "hello-ask");
@@ -1392,17 +1656,18 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let slot = Mutex::new(None);
         let argv = vec![
-            "sh".into(),
+            "opencode".into(),
             "-c".into(),
             "echo 'No auth credentials found' >&2; exit 1".into(),
         ];
         let err = execute_argv(
-            "opencode",
+            &AgentCli::with_program("opencode", "sh"),
             &argv,
             Path::new("."),
             &cancel,
             &slot,
             Duration::from_secs(5),
+            ToolPolicy::DenyAll,
         )
         .unwrap_err();
         assert!(err.contains("opencode auth login"), "{err}");
@@ -1418,13 +1683,15 @@ mod tests {
             let slot_t = child_slot.clone();
             thread::spawn(move || {
                 let result = execute_argv(
-                    "pi",
-                    &["sleep".into(), "30".into()],
+                    &AgentCli::with_program("pi", "sleep"),
+                    &["pi".into(), "30".into()],
                     Path::new("."),
                     &cancel_t,
                     &slot_t,
                     Duration::from_secs(30),
-                );
+                    ToolPolicy::DenyAll,
+                )
+                .map(AskValue::Answer);
                 let _ = tx.send(AskOutcome { id: 1, result });
             });
             AskHandle {
@@ -1432,6 +1699,7 @@ mod tests {
                 rx,
                 cancel,
                 child_slot,
+                progress: Arc::new(Mutex::new(AskProgress::Analyzing)),
             }
         };
         thread::sleep(Duration::from_millis(80));
@@ -1457,15 +1725,146 @@ mod tests {
         let slot = Mutex::new(None);
         let started = Instant::now();
         let err = execute_argv(
-            "pi",
-            &["sleep".into(), "30".into()],
+            &AgentCli::with_program("pi", "sleep"),
+            &["pi".into(), "30".into()],
             Path::new("."),
             &cancel,
             &slot,
             Duration::from_millis(200),
+            ToolPolicy::DenyAll,
         )
         .unwrap_err();
         assert_eq!(err, "The AI request timed out.");
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_missing_program_is_reported_as_not_installed() {
+        let cancel = AtomicBool::new(false);
+        let slot = Mutex::new(None);
+        let dir = tempfile::tempdir().unwrap();
+        let err = execute_argv(
+            &AgentCli::with_program("opencode", dir.path().join("absent")),
+            &["opencode".into()],
+            dir.path(),
+            &cancel,
+            &slot,
+            Duration::from_secs(5),
+            ToolPolicy::DenyAll,
+        )
+        .unwrap_err();
+        assert!(err.contains("not installed"), "{err}");
+    }
+
+    #[test]
+    fn parse_ask_decision_accepts_bare_edit_json() {
+        assert_eq!(
+            parse_ask_decision(r#"{"edit":"Remove persons in the background."}"#),
+            AskDecision::Edit("Remove persons in the background.".into())
+        );
+    }
+
+    #[test]
+    fn parse_ask_decision_accepts_fenced_edit_json() {
+        let text = "```json\n{\"edit\":\"Blur the background\"}\n```";
+        assert_eq!(
+            parse_ask_decision(text),
+            AskDecision::Edit("Blur the background".into())
+        );
+    }
+
+    #[test]
+    fn parse_ask_decision_treats_malformed_or_prose_as_answer() {
+        assert_eq!(
+            parse_ask_decision("A red car."),
+            AskDecision::Answer("A red car.".into())
+        );
+        assert_eq!(
+            parse_ask_decision(r#"Sure. {"edit":"remove them"}"#),
+            AskDecision::Answer(r#"Sure. {"edit":"remove them"}"#.into())
+        );
+        assert_eq!(
+            parse_ask_decision(r#"{"edit":""}"#),
+            AskDecision::Answer(r#"{"edit":""}"#.into())
+        );
+        assert_eq!(
+            parse_ask_decision(r#"{"action":"edit","instruction":"remove them"}"#),
+            AskDecision::Answer(r#"{"action":"edit","instruction":"remove them"}"#.into())
+        );
+    }
+
+    #[test]
+    fn edit_json_from_agent_with_multiple_files_is_rejected() {
+        assert!(edit_source_count_ok(1).is_ok());
+        assert_eq!(
+            edit_source_count_ok(2).unwrap_err(),
+            image_edit::edit_needs_one_photo_message()
+        );
+        assert_eq!(
+            edit_source_count_ok(0).unwrap_err(),
+            "Image editing needs exactly one marked photo."
+        );
+    }
+
+    #[test]
+    fn edit_argv_asks_the_agent_to_write_a_sibling() {
+        let source = PathBuf::from("/lib/Rome/photo.jpg");
+        let dest = PathBuf::from("/lib/Rome/photo-edited.png");
+        for agent in SUPPORTED {
+            let argv = build_edit_argv(agent, "Remove the people", &source, &dest).unwrap();
+            assert!(
+                !argv.iter().any(|arg| arg == "--model"),
+                "{agent} must keep the user's configured model"
+            );
+            assert!(
+                argv.iter().any(|arg| arg.contains("photo-edited.png")),
+                "{agent}"
+            );
+        }
+
+        let argv = build_edit_argv("opencode", "Remove the people", &source, &dest).unwrap();
+        assert_eq!(&argv[..2], ["opencode", "run"]);
+        let cwd = env::current_dir().unwrap();
+        assert_eq!(
+            &argv[3..],
+            ["--dir", cwd.to_str().unwrap(), "-f", "/lib/Rome/photo.jpg"]
+        );
+
+        let pi = build_edit_argv("pi", "blur", &source, &dest).unwrap();
+        assert!(!pi.iter().any(|arg| arg == "--no-tools"));
+        assert!(pi.iter().any(|arg| arg == "@photo.jpg"));
+
+        let hermes = build_edit_argv("hermes", "blur", &source, &dest).unwrap();
+        assert!(!hermes.iter().any(|arg| arg == "--safe-mode"));
+
+        let codex = build_edit_argv("codex", "blur", &source, &dest).unwrap();
+        assert!(codex.iter().any(|arg| arg == "workspace-write"));
+        assert!(!codex.iter().any(|arg| arg == "read-only"));
+
+        let claude = build_edit_argv("claude", "blur", &source, &dest).unwrap();
+        assert_eq!(claude[3], "Read,Write");
+    }
+
+    #[test]
+    fn cancel_before_edit_does_not_write() {
+        let cancel = AtomicBool::new(true);
+        let slot = Mutex::new(None);
+        let progress = Mutex::new(AskProgress::Editing);
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("photo.jpg");
+        fs::write(&source, b"orig").unwrap();
+        let err = run_agent_edit(
+            &AgentCli::on_path("opencode"),
+            &source,
+            dir.path(),
+            "remove people",
+            &cancel,
+            &slot,
+            &progress,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
+        assert!(!dir.path().join("photo-edited.png").exists());
     }
 }
