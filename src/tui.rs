@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -8,6 +9,7 @@ use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use crossterm::cursor::MoveTo;
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -219,6 +221,7 @@ struct App {
     clipboard: Option<clipboard::Clipboard>,
     pending_gemini_edit: Option<PendingGeminiEdit>,
     gemini_key_overlay: Option<GeminiKeyOverlay>,
+    gemini_url_rect: Option<Rect>,
     ask: AskAi,
 }
 
@@ -251,6 +254,7 @@ impl App {
             clipboard: None,
             pending_gemini_edit: None,
             gemini_key_overlay: None,
+            gemini_url_rect: None,
             ask: AskAi::new(),
         };
         app.reload_photos();
@@ -503,6 +507,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         app.sync_ask_selection();
         app.poll_ask();
         terminal.draw(|f| draw(f, app))?;
+        write_gemini_url_hyperlink(app);
         if !event::poll(Duration::from_millis(200))? {
             continue;
         }
@@ -1740,13 +1745,16 @@ fn draw_delete_confirm(frame: &mut Frame, rels: &[String]) {
     );
 }
 
+const GEMINI_KEY_URL: &str = "https://aistudio.google.com/apikey";
+
 const GEMINI_KEY_HINT: &str =
     "The marked photo will be sent to Google Gemini for editing and may use paid quota.\n\
 Paste a key from https://aistudio.google.com/apikey\n\
-Enter save · Esc cancel";
+o open URL · Enter save · Esc cancel";
 
-fn draw_gemini_key_overlay(frame: &mut Frame, app: &App) {
+fn draw_gemini_key_overlay(frame: &mut Frame, app: &mut App) {
     let Some(overlay) = app.gemini_key_overlay.as_ref() else {
+        app.gemini_url_rect = None;
         return;
     };
     let area = frame.area();
@@ -1770,6 +1778,25 @@ fn draw_gemini_key_overlay(frame: &mut Frame, app: &App) {
             ),
         popup,
     );
+    app.gemini_url_rect = gemini_url_screen_rect(popup);
+}
+
+/// Screen position of the URL in the overlay hint, so the event loop can
+/// emit an OSC 8 hyperlink there after the frame is drawn.
+fn gemini_url_screen_rect(popup: Rect) -> Option<Rect> {
+    let prefix = "Paste a key from ";
+    let url_len = GEMINI_KEY_URL.len() as u16;
+    let prefix_len = prefix.len() as u16;
+    let line = "Paste a key from https://aistudio.google.com/apikey";
+    let line_len = line.len() as u16;
+    let content_width = popup.width.saturating_sub(2);
+    let pad = content_width.saturating_sub(line_len) / 2;
+    let x = popup.x + 1 + pad + prefix_len;
+    let y = popup.y + 3;
+    if x + url_len > popup.x + popup.width {
+        return None;
+    }
+    Some(Rect::new(x, y, url_len, 1))
 }
 
 fn handle_gemini_key_overlay_key(app: &mut App, code: KeyCode) {
@@ -1778,6 +1805,7 @@ fn handle_gemini_key_overlay_key(app: &mut App, code: KeyCode) {
     };
     match classify_gemini_key_key(code) {
         GeminiKeyKey::Cancel => app.cancel_gemini_edit(),
+        GeminiKeyKey::Open => open_gemini_key_url(),
         GeminiKeyKey::Save => match credentials::save_gemini_key(&overlay.input) {
             Ok(()) => {
                 app.gemini_key_overlay = None;
@@ -1813,6 +1841,7 @@ fn append_gemini_key_input(app: &mut App, text: &str) {
 enum GeminiKeyKey {
     Save,
     Cancel,
+    Open,
     Backspace,
     Char(char),
     Ignore,
@@ -1822,10 +1851,45 @@ fn classify_gemini_key_key(code: KeyCode) -> GeminiKeyKey {
     match code {
         KeyCode::Esc => GeminiKeyKey::Cancel,
         KeyCode::Enter => GeminiKeyKey::Save,
+        KeyCode::Char('o') => GeminiKeyKey::Open,
         KeyCode::Backspace => GeminiKeyKey::Backspace,
         KeyCode::Char(c) => GeminiKeyKey::Char(c),
         _ => GeminiKeyKey::Ignore,
     }
+}
+
+fn open_gemini_key_url() {
+    let _ = std::process::Command::new(open_command())
+        .arg(GEMINI_KEY_URL)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+fn open_command() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    }
+}
+
+/// Emit an OSC 8 hyperlink over the URL text so modern terminals (iTerm2,
+/// Kitty, WezTerm, GNOME Terminal, …) render it as a Cmd/Ctrl+clickable
+/// link. Written after the frame draw so ratatui's buffer doesn't strip it.
+fn write_gemini_url_hyperlink(app: &App) {
+    let Some(rect) = app.gemini_url_rect else {
+        return;
+    };
+    let mut out = std::io::stdout();
+    let open = format!("\x1b]8;;{GEMINI_KEY_URL}\x1b\\");
+    let close = "\x1b]8;;\x1b\\";
+    let _ = execute!(
+        out,
+        MoveTo(rect.x, rect.y),
+        crossterm::style::Print(format!("{open}{GEMINI_KEY_URL}{close}")),
+    );
 }
 
 pub fn mask_gemini_key_input(input: &str) -> String {
@@ -2149,11 +2213,28 @@ mod tests {
     fn gemini_key_overlay_keys_save_cancel_and_mask() {
         assert_eq!(classify_gemini_key_key(KeyCode::Enter), GeminiKeyKey::Save);
         assert_eq!(classify_gemini_key_key(KeyCode::Esc), GeminiKeyKey::Cancel);
+        assert_eq!(classify_gemini_key_key(KeyCode::Char('o')), GeminiKeyKey::Open);
         assert_eq!(
             classify_gemini_key_key(KeyCode::Char('a')),
             GeminiKeyKey::Char('a')
         );
         assert_eq!(mask_gemini_key_input("secret"), "••••••");
+    }
+
+    #[test]
+    fn gemini_url_rect_fits_inside_popup() {
+        let popup = Rect::new(10, 5, 62, 8);
+        let rect = gemini_url_screen_rect(popup).unwrap();
+        assert_eq!(rect.y, popup.y + 3);
+        assert_eq!(rect.width, GEMINI_KEY_URL.len() as u16);
+        assert!(rect.x >= popup.x + 1);
+        assert!(rect.x + rect.width <= popup.x + popup.width - 1);
+    }
+
+    #[test]
+    fn gemini_url_rect_is_none_when_popup_too_narrow() {
+        let popup = Rect::new(0, 0, 20, 8);
+        assert!(gemini_url_screen_rect(popup).is_none());
     }
 
     #[test]
