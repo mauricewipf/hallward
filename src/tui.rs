@@ -1748,9 +1748,11 @@ fn draw_delete_confirm(frame: &mut Frame, rels: &[String]) {
 const GEMINI_KEY_URL: &str = "https://aistudio.google.com/apikey";
 
 const GEMINI_KEY_HINT: &str =
-    "The marked photo will be sent to Google Gemini for editing and may use paid quota.\n\
-Paste a key from https://aistudio.google.com/apikey\n\
-o open URL · Enter save · Esc cancel";
+    "The marked photo will be sent to Google Gemini for editing\n\
+and may use paid quota.\n\
+Paste a key from https://aistudio.google.com/apikey";
+
+const GEMINI_KEY_BIND: &str = "o open URL · Enter save · Esc cancel";
 
 fn draw_gemini_key_overlay(frame: &mut Frame, app: &mut App) {
     let Some(overlay) = app.gemini_key_overlay.as_ref() else {
@@ -1758,41 +1760,79 @@ fn draw_gemini_key_overlay(frame: &mut Frame, app: &mut App) {
         return;
     };
     let area = frame.area();
-    let width = area.width.min(62).max(34.min(area.width));
-    let height = 8.min(area.height);
+    let width = area.width.min(64).max(36.min(area.width));
+    let height = if overlay.error.is_some() { 11 } else { 10 };
+    let height = height.min(area.height);
     let popup = centered_rect(width, height, area);
     frame.render_widget(Clear, popup);
-    let masked = "•".repeat(overlay.input.chars().count());
-    let mut lines = vec![GEMINI_KEY_HINT.to_string(), String::new(), masked];
-    if let Some(error) = &overlay.error {
-        lines.push(error.clone());
-    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Image editing")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // hint
+            Constraint::Length(1), // gap
+            Constraint::Length(3), // input field
+            Constraint::Length(1), // keybindings
+            Constraint::Min(0),   // error
+        ])
+        .split(inner);
+
     frame.render_widget(
-        Paragraph::new(lines.join("\n"))
+        Paragraph::new(GEMINI_KEY_HINT)
             .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Image editing")
-                    .border_style(Style::default().fg(Color::Cyan)),
-            ),
-        popup,
+            .wrap(Wrap { trim: true }),
+        chunks[0],
     );
-    app.gemini_url_rect = gemini_url_screen_rect(popup);
+
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .title("API key")
+        .border_style(Style::default().fg(Color::Yellow));
+    let input_inner = input_block.inner(chunks[2]);
+    frame.render_widget(input_block, chunks[2]);
+    let masked = "•".repeat(overlay.input.chars().count());
+    frame.render_widget(
+        Paragraph::new(masked).alignment(Alignment::Center),
+        input_inner,
+    );
+
+    frame.render_widget(
+        Paragraph::new(GEMINI_KEY_BIND).alignment(Alignment::Center),
+        chunks[3],
+    );
+
+    if let Some(error) = &overlay.error {
+        frame.render_widget(
+            Paragraph::new(error.as_str())
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::LightRed)),
+            chunks[4],
+        );
+    }
+
+    app.gemini_url_rect = gemini_url_screen_rect(popup, inner);
 }
 
 /// Screen position of the URL in the overlay hint, so the event loop can
-/// emit an OSC 8 hyperlink there after the frame is drawn.
-fn gemini_url_screen_rect(popup: Rect) -> Option<Rect> {
+/// emit an OSC 8 hyperlink there after the frame is drawn. The URL is on
+/// the third line (index 2) of the hint, which starts at `inner.y`.
+fn gemini_url_screen_rect(popup: Rect, inner: Rect) -> Option<Rect> {
     let prefix = "Paste a key from ";
     let url_len = GEMINI_KEY_URL.len() as u16;
     let prefix_len = prefix.len() as u16;
     let line = "Paste a key from https://aistudio.google.com/apikey";
     let line_len = line.len() as u16;
-    let content_width = popup.width.saturating_sub(2);
-    let pad = content_width.saturating_sub(line_len) / 2;
-    let x = popup.x + 1 + pad + prefix_len;
-    let y = popup.y + 3;
+    let inner_width = inner.width;
+    let pad = inner_width.saturating_sub(line_len) / 2;
+    let x = inner.x + pad + prefix_len;
+    let y = inner.y + 2;
     if x + url_len > popup.x + popup.width {
         return None;
     }
@@ -2223,18 +2263,20 @@ mod tests {
 
     #[test]
     fn gemini_url_rect_fits_inside_popup() {
-        let popup = Rect::new(10, 5, 62, 8);
-        let rect = gemini_url_screen_rect(popup).unwrap();
-        assert_eq!(rect.y, popup.y + 3);
+        let popup = Rect::new(10, 5, 64, 10);
+        let inner = Rect::new(11, 6, 62, 8);
+        let rect = gemini_url_screen_rect(popup, inner).unwrap();
+        assert_eq!(rect.y, inner.y + 2);
         assert_eq!(rect.width, GEMINI_KEY_URL.len() as u16);
-        assert!(rect.x >= popup.x + 1);
+        assert!(rect.x >= inner.x);
         assert!(rect.x + rect.width <= popup.x + popup.width - 1);
     }
 
     #[test]
     fn gemini_url_rect_is_none_when_popup_too_narrow() {
-        let popup = Rect::new(0, 0, 20, 8);
-        assert!(gemini_url_screen_rect(popup).is_none());
+        let popup = Rect::new(0, 0, 20, 10);
+        let inner = Rect::new(1, 1, 18, 8);
+        assert!(gemini_url_screen_rect(popup, inner).is_none());
     }
 
     #[test]
