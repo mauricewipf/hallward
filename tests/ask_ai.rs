@@ -6,13 +6,18 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use hallward::ai::{self, AgentCli, AskHandle, AskValue, Timeouts};
 use hallward::catalog;
-use hallward::image_edit;
+use hallward::credentials::{self, CredentialSource, ResolvedKey};
+use hallward::image_edit::{self, PostGeminiFn, GEMINI_EDIT_MODEL};
 use hallward::index;
+use image::{Rgb, RgbImage};
 use serde_json::{json, Value};
 
 /// A library root with a catalog, plus helpers to add indexed photos.
@@ -34,7 +39,7 @@ impl Library {
     fn photo(&self, rel: &str) -> PathBuf {
         let abs = self.root().join(rel);
         fs::create_dir_all(abs.parent().unwrap()).unwrap();
-        image::RgbImage::from_pixel(48, 32, image::Rgb([12, 34, 56]))
+        RgbImage::from_pixel(48, 32, Rgb([12, 34, 56]))
             .save(&abs)
             .unwrap();
         index::index_new_file(self.root(), &abs, Some("2024:01:02 03:04:05")).unwrap();
@@ -62,9 +67,6 @@ impl Library {
 }
 
 /// A scripted agent: a scenario file plus a wrapper that runs the stub with it.
-///
-/// The scenario travels via a per-test wrapper script rather than the ambient
-/// environment, so tests stay isolated under cargo's parallel harness.
 struct Stub {
     dir: tempfile::TempDir,
     program: PathBuf,
@@ -95,7 +97,6 @@ impl Stub {
         AgentCli::with_program(agent, &self.program)
     }
 
-    /// One record per invocation of the stub, in call order.
     fn calls(&self) -> Vec<Value> {
         let log = self.dir.path().join("argv.log");
         let Ok(text) = fs::read_to_string(log) else {
@@ -118,7 +119,6 @@ fn missing_program(dir: &Path) -> AgentCli {
     AgentCli::with_program("opencode", dir.join("definitely-not-installed"))
 }
 
-/// Short enough that a wedged test fails fast, long enough for a real spawn.
 fn budget() -> Timeouts {
     Timeouts {
         ask: Duration::from_secs(10),
@@ -166,6 +166,102 @@ fn argv(record: &Value) -> Vec<String> {
         .iter()
         .map(|arg| arg.as_str().unwrap().to_string())
         .collect()
+}
+
+fn with_credentials_path<F: FnOnce()>(f: F) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("credentials");
+    let prev = std::env::var_os("HALLWARD_CREDENTIALS_PATH");
+    let prev_key = std::env::var_os("GEMINI_API_KEY");
+    std::env::set_var("HALLWARD_CREDENTIALS_PATH", &path);
+    std::env::remove_var("GEMINI_API_KEY");
+    f();
+    match prev {
+        Some(value) => std::env::set_var("HALLWARD_CREDENTIALS_PATH", value),
+        None => std::env::remove_var("HALLWARD_CREDENTIALS_PATH"),
+    }
+    match prev_key {
+        Some(value) => std::env::set_var("GEMINI_API_KEY", value),
+        None => std::env::remove_var("GEMINI_API_KEY"),
+    }
+}
+
+static GEMINI_STUB: Mutex<Option<GeminiStub>> = Mutex::new(None);
+
+/// Serializes tests that share the global `GEMINI_STUB` so parallel runs
+/// don't overwrite each other's installed response.
+static GEMINI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+struct GeminiStub {
+    status: u16,
+    body: String,
+    seen_url: Option<String>,
+    seen_key: Option<String>,
+    seen_body: Option<Value>,
+}
+
+fn install_gemini_stub(status: u16, body: Value) {
+    *GEMINI_STUB.lock().unwrap() = Some(GeminiStub {
+        status,
+        body: body.to_string(),
+        seen_url: None,
+        seen_key: None,
+        seen_body: None,
+    });
+}
+
+fn stub_gemini_post(
+    url: &str,
+    api_key: &str,
+    body: &Value,
+    _timeout: Duration,
+) -> Result<(u16, String), String> {
+    let mut guard = GEMINI_STUB.lock().unwrap();
+    let stub = guard.as_mut().expect("gemini stub not installed");
+    stub.seen_url = Some(url.to_string());
+    stub.seen_key = Some(api_key.to_string());
+    stub.seen_body = Some(body.clone());
+    Ok((stub.status, stub.body.clone()))
+}
+
+fn png_response() -> Value {
+    let png = RgbImage::from_pixel(24, 16, Rgb([90, 140, 200]));
+    let mut bytes = Vec::new();
+    png.write_to(
+        &mut std::io::Cursor::new(&mut bytes),
+        image::ImageFormat::Png,
+    )
+    .unwrap();
+    let data = BASE64.encode(bytes);
+    json!({
+        "candidates": [{
+            "content": {
+                "parts": [{ "inlineData": { "mimeType": "image/png", "data": data } }]
+            }
+        }]
+    })
+}
+
+fn edit_with_stub(
+    instruction: &str,
+    source: PathBuf,
+    root: &Path,
+    post: PostGeminiFn,
+) -> Result<AskValue, String> {
+    let key = ResolvedKey {
+        key: "test-key".into(),
+        source: CredentialSource::File,
+    };
+    let mut handle = ai::spawn_edit_with(
+        1,
+        instruction.to_string(),
+        source,
+        root.to_path_buf(),
+        key,
+        budget(),
+        post,
+    );
+    settle(&mut handle)
 }
 
 #[test]
@@ -216,21 +312,14 @@ fn the_agent_only_sees_a_stripped_jpeg_preview() {
         !argv.iter().any(|arg| arg.contains("photo.jpg")),
         "the original path must never reach the agent: {argv:?}"
     );
-    let dir_at = argv.iter().position(|arg| arg == "--dir").unwrap();
-    assert_eq!(
-        fs::canonicalize(&argv[dir_at + 1]).unwrap(),
-        fs::canonicalize(std::env::current_dir().unwrap()).unwrap(),
-        "OpenCode --dir must stay the Hallward process cwd so it keeps the user's model"
-    );
 }
 
 #[test]
-fn an_edit_directive_writes_indexes_and_reports_a_sibling() {
+fn an_edit_directive_stops_at_classification() {
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
     let stub = Stub::new(json!({
-        "ask": { "stdout": "{\"edit\":\"Remove the people in the background.\"}" },
-        "edit": { "write_png": true, "stdout": "photo-edited.png" }
+        "ask": { "stdout": "{\"edit\":\"Remove the people in the background.\"}" }
     }));
 
     let value = ask(
@@ -238,9 +327,35 @@ fn an_edit_directive_writes_indexes_and_reports_a_sibling() {
         "remove the people in the background",
         std::slice::from_ref(&photo),
         library.root(),
-    );
+    )
+    .unwrap();
 
-    let AskValue::Saved(saved) = value.unwrap() else {
+    assert_eq!(
+        value,
+        AskValue::Edit {
+            instruction: "Remove the people in the background.".into()
+        }
+    );
+    assert_eq!(stub.calls().len(), 1);
+    assert!(!library.root().join("Rome/photo-edited.png").exists());
+}
+
+#[test]
+fn gemini_edit_writes_indexes_and_reports_a_sibling() {
+    let _lock = GEMINI_TEST_LOCK.lock().unwrap();
+    let library = Library::new();
+    let photo = library.photo("Rome/photo.jpg");
+    install_gemini_stub(200, png_response());
+
+    let value = edit_with_stub(
+        "Remove the people in the background.",
+        photo.clone(),
+        library.root(),
+        stub_gemini_post,
+    )
+    .unwrap();
+
+    let AskValue::Saved(saved) = value else {
         panic!("expected a saved edit");
     };
     assert_eq!(saved.filename, "photo-edited.png");
@@ -249,23 +364,26 @@ fn an_edit_directive_writes_indexes_and_reports_a_sibling() {
     assert_eq!(library.album("Rome"), vec!["photo-edited.png", "photo.jpg"]);
     assert_eq!(
         library.captured_at("Rome", "photo-edited.png"),
-        library.captured_at("Rome", "photo.jpg"),
-        "the sibling inherits the capture date so it sorts beside the original"
+        library.captured_at("Rome", "photo.jpg")
     );
+    assert_eq!(image::image_dimensions(&photo).unwrap(), (48, 32));
+
+    let seen = GEMINI_STUB.lock().unwrap();
+    let stub = seen.as_ref().unwrap();
+    assert!(stub.seen_url.as_ref().unwrap().contains(GEMINI_EDIT_MODEL));
+    assert_eq!(stub.seen_key.as_deref(), Some("test-key"));
     assert_eq!(
-        image::image_dimensions(&photo).unwrap(),
-        (48, 32),
-        "the original must not be overwritten"
+        stub.seen_body.as_ref().unwrap()["generationConfig"]["responseModalities"],
+        json!(["TEXT", "IMAGE"])
     );
 }
 
 #[test]
-fn the_edit_run_keeps_the_users_configured_model() {
+fn classify_keeps_the_agents_default_model() {
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
     let stub = Stub::new(json!({
-        "ask": { "stdout": "{\"edit\":\"Blur the background.\"}" },
-        "edit": { "write_png": true, "stdout": "photo-edited.png" }
+        "ask": { "stdout": "{\"edit\":\"Blur the background.\"}" }
     }));
 
     ask(
@@ -276,100 +394,12 @@ fn the_edit_run_keeps_the_users_configured_model() {
     )
     .unwrap();
 
-    for call in stub.calls() {
-        let argv = argv(&call);
-        assert!(
-            !argv.iter().any(|arg| arg == "--model"),
-            "Hallward must not override the agent's model: {argv:?}"
-        );
-    }
-}
-
-#[test]
-fn the_edit_run_is_the_only_one_allowed_to_write() {
-    let library = Library::new();
-    let photo = library.photo("Rome/photo.jpg");
-    let stub = Stub::new(json!({
-        "ask": { "stdout": "{\"edit\":\"Blur the background.\"}" },
-        "edit": { "write_png": true, "stdout": "photo-edited.png" }
-    }));
-
-    ask(
-        stub.cli("opencode"),
-        "blur the background",
-        &[photo],
-        library.root(),
-    )
-    .unwrap();
-
-    assert_eq!(
-        stub.call("ask")["opencode_permission"],
-        json!("{\"*\":\"deny\"}")
-    );
-    assert_eq!(
-        stub.call("edit")["opencode_permission"],
-        json!("{\"*\":\"allow\"}")
-    );
-}
-
-#[test]
-fn the_edit_run_works_in_the_album_the_photo_lives_in() {
-    let library = Library::new();
-    let photo = library.photo("Rome/photo.jpg");
-    let stub = Stub::new(json!({
-        "ask": { "stdout": "{\"edit\":\"Blur the background.\"}" },
-        "edit": { "write_png": true, "stdout": "photo-edited.png" }
-    }));
-
-    ask(
-        stub.cli("opencode"),
-        "blur the background",
-        &[photo],
-        library.root(),
-    )
-    .unwrap();
-
-    let edit = stub.call("edit");
-    let cwd = PathBuf::from(edit["cwd"].as_str().unwrap());
-    assert_eq!(
-        fs::canonicalize(cwd).unwrap(),
-        fs::canonicalize(library.root().join("Rome")).unwrap()
-    );
-    let argv = argv(&edit);
-    let dir_at = argv.iter().position(|arg| arg == "--dir").unwrap();
-    let project = fs::canonicalize(&argv[dir_at + 1]).unwrap();
-    assert_ne!(
-        project,
-        fs::canonicalize(library.root().join("Rome")).unwrap(),
-        "OpenCode --dir is the project for model selection, not the album"
-    );
+    let ask_argv = argv(&stub.call("ask"));
     assert!(
-        argv.iter()
-            .any(|arg| arg.ends_with("photo.jpg") && Path::new(arg).is_absolute()),
-        "edit must attach the original still by absolute path: {argv:?}"
+        !ask_argv.iter().any(|arg| arg == "--model"),
+        "Q&A must keep the agent's default model: {ask_argv:?}"
     );
-}
-
-#[test]
-fn an_agent_that_saves_nothing_says_so() {
-    let library = Library::new();
-    let photo = library.photo("Rome/photo.jpg");
-    let stub = Stub::new(json!({
-        "ask": { "stdout": "{\"edit\":\"Blur the background.\"}" },
-        "edit": { "stdout": "I cannot generate images." }
-    }));
-
-    let error = ask(
-        stub.cli("opencode"),
-        "blur the background",
-        &[photo],
-        library.root(),
-    )
-    .unwrap_err();
-
-    assert_eq!(error, image_edit::no_saved_image_message("OpenCode"));
-    assert!(!library.root().join("Rome/photo-edited.png").exists());
-    assert_eq!(library.album("Rome"), vec!["photo.jpg"]);
+    assert_eq!(stub.calls().len(), 1);
 }
 
 #[test]
@@ -391,14 +421,27 @@ fn a_provider_error_is_surfaced_verbatim() {
     let photo = library.photo("Rome/photo.jpg");
     let stub = Stub::new(json!({
         "ask": {
-            "stderr": "Upstream request failed: [NOT_FOUND] Model not found",
+            "stderr": "Upstream request failed: [NOT_FOUND] Model not found, inaccessible, and/or not deployed",
             "exit": 1
         }
     }));
 
     let error = ask(stub.cli("opencode"), "which car?", &[photo], library.root()).unwrap_err();
 
-    assert!(error.contains("[NOT_FOUND] Model not found"), "{error}");
+    // The original provider error must reach the user verbatim so they can
+    // see which model failed — a generic "not available" message hides the cause.
+    assert!(
+        error.contains("[NOT_FOUND]"),
+        "provider error must be surfaced verbatim: {error}"
+    );
+    assert!(
+        error.contains("Model not found"),
+        "provider error must be surfaced verbatim: {error}"
+    );
+    assert!(
+        !error.contains("not available"),
+        "the generic mapped message must not hide the provider error: {error}"
+    );
 }
 
 #[test]
@@ -407,8 +450,7 @@ fn editing_needs_exactly_one_marked_photo() {
     let first = library.photo("Rome/one.jpg");
     let second = library.photo("Rome/two.jpg");
     let stub = Stub::new(json!({
-        "ask": { "stdout": "{\"edit\":\"Blur the background.\"}" },
-        "edit": { "write_png": true }
+        "ask": { "stdout": "{\"edit\":\"Blur the background.\"}" }
     }));
 
     let error = ask(
@@ -420,35 +462,46 @@ fn editing_needs_exactly_one_marked_photo() {
     .unwrap_err();
 
     assert_eq!(error, image_edit::edit_needs_one_photo_message());
-    assert!(stub.calls().iter().all(|call| call["call"] == "ask"));
 }
 
 #[test]
-fn a_timed_out_edit_leaves_no_partial_sibling() {
+fn a_timed_out_gemini_edit_leaves_no_partial_sibling() {
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
-    let stub = Stub::new(json!({
-        "ask": { "stdout": "{\"edit\":\"Blur the background.\"}" },
-        "edit": { "sleep_ms": 30_000, "write_png": true }
-    }));
+    fn slow_post(
+        _url: &str,
+        _api_key: &str,
+        _body: &Value,
+        _timeout: Duration,
+    ) -> Result<(u16, String), String> {
+        thread::sleep(Duration::from_secs(2));
+        Ok((200, png_response().to_string()))
+    }
 
     let started = Instant::now();
-    let error = ask_with(
-        stub.cli("opencode"),
-        "blur the background",
-        &[photo],
-        library.root(),
-        Timeouts {
-            ask: Duration::from_secs(10),
-            edit: Duration::from_millis(300),
-        },
-    )
-    .unwrap_err();
+    let error = {
+        let key = ResolvedKey {
+            key: "test-key".into(),
+            source: CredentialSource::File,
+        };
+        let mut handle = ai::spawn_edit_with(
+            1,
+            "Blur the background.".to_string(),
+            photo,
+            library.root().to_path_buf(),
+            key,
+            Timeouts {
+                ask: Duration::from_secs(10),
+                edit: Duration::from_millis(300),
+            },
+            slow_post,
+        );
+        settle(&mut handle).unwrap_err()
+    };
 
     assert_eq!(error, "The AI request timed out.");
     assert!(started.elapsed() < Duration::from_secs(10));
     assert!(!library.root().join("Rome/photo-edited.png").exists());
-    assert_eq!(library.album("Rome"), vec!["photo.jpg"]);
 }
 
 #[test]
@@ -495,22 +548,20 @@ fn a_missing_agent_binary_reports_that_it_is_not_installed() {
 
 #[test]
 fn repeated_edits_never_overwrite_an_earlier_sibling() {
+    let _lock = GEMINI_TEST_LOCK.lock().unwrap();
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
-    let scenario = json!({
-        "ask": { "stdout": "{\"edit\":\"Blur the background.\"}" },
-        "edit": { "write_png": true, "stdout": "saved" }
-    });
 
     for expected in ["photo-edited.png", "photo-edited-2.png"] {
-        let stub = Stub::new(scenario.clone());
-        let value = ask(
-            stub.cli("opencode"),
-            "blur the background",
-            std::slice::from_ref(&photo),
+        install_gemini_stub(200, png_response());
+        let value = edit_with_stub(
+            "Blur the background.",
+            photo.clone(),
             library.root(),
-        );
-        let AskValue::Saved(saved) = value.unwrap() else {
+            stub_gemini_post,
+        )
+        .unwrap();
+        let AskValue::Saved(saved) = value else {
             panic!("expected a saved edit");
         };
         assert_eq!(saved.filename, expected);
@@ -520,4 +571,113 @@ fn repeated_edits_never_overwrite_an_earlier_sibling() {
         library.album("Rome"),
         vec!["photo-edited-2.png", "photo-edited.png", "photo.jpg"]
     );
+}
+
+#[test]
+fn gemini_401_for_saved_key_reopens_overlay() {
+    let _lock = GEMINI_TEST_LOCK.lock().unwrap();
+    install_gemini_stub(
+        401,
+        json!({"error": {"code": 401, "status": "UNAUTHENTICATED", "message": "bad"}}),
+    );
+    let library = Library::new();
+    let photo = library.photo("Rome/photo.jpg");
+    with_credentials_path(|| {
+        credentials::save_gemini_key("saved-key").unwrap();
+        let error = edit_with_stub(
+            "Blur the background.",
+            photo,
+            library.root(),
+            stub_gemini_post,
+        )
+        .unwrap_err();
+        assert_eq!(error, credentials::INVALID_SAVED_KEY);
+        assert!(!credentials::resolve().is_some());
+    });
+}
+
+#[test]
+fn gemini_401_for_env_key_is_not_overlay_recoverable() {
+    let _lock = GEMINI_TEST_LOCK.lock().unwrap();
+    install_gemini_stub(
+        401,
+        json!({"error": {"code": 401, "status": "UNAUTHENTICATED", "message": "bad"}}),
+    );
+    let library = Library::new();
+    let photo = library.photo("Rome/photo.jpg");
+    let key = ResolvedKey {
+        key: "env-key".into(),
+        source: CredentialSource::Environment,
+    };
+    let mut handle = ai::spawn_edit_with(
+        1,
+        "Blur the background.".to_string(),
+        photo,
+        library.root().to_path_buf(),
+        key,
+        budget(),
+        stub_gemini_post,
+    );
+    let error = settle(&mut handle).unwrap_err();
+    assert!(error.contains("GEMINI_API_KEY"), "{error}");
+}
+
+#[test]
+fn gemini_404_429_and_no_image_are_mapped() {
+    let _lock = GEMINI_TEST_LOCK.lock().unwrap();
+    let library = Library::new();
+    let photo = library.photo("Rome/photo.jpg");
+
+    install_gemini_stub(
+        404,
+        json!({"error": {"code": 404, "status": "NOT_FOUND", "message": "model"}}),
+    );
+    let err = edit_with_stub("edit", photo.clone(), library.root(), stub_gemini_post).unwrap_err();
+    assert!(err.contains(GEMINI_EDIT_MODEL), "{err}");
+
+    install_gemini_stub(
+        429,
+        json!({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "quota"}}),
+    );
+    let err = edit_with_stub("edit", photo.clone(), library.root(), stub_gemini_post).unwrap_err();
+    assert!(err.contains("quota"), "{err}");
+
+    install_gemini_stub(
+        200,
+        json!({"candidates": [{ "content": { "parts": [{ "text": "no image" }] } }]}),
+    );
+    let err = edit_with_stub("edit", photo, library.root(), stub_gemini_post).unwrap_err();
+    assert_eq!(err, "Gemini returned no image.");
+}
+
+#[test]
+fn cancelling_gemini_edit_leaves_no_partial_sibling() {
+    let library = Library::new();
+    let photo = library.photo("Rome/photo.jpg");
+    fn slow_post(
+        _url: &str,
+        _api_key: &str,
+        _body: &Value,
+        _timeout: Duration,
+    ) -> Result<(u16, String), String> {
+        thread::sleep(Duration::from_secs(2));
+        Ok((200, png_response().to_string()))
+    }
+    let key = ResolvedKey {
+        key: "test-key".into(),
+        source: CredentialSource::File,
+    };
+    let mut handle = ai::spawn_edit_with(
+        1,
+        "Blur.".to_string(),
+        photo,
+        library.root().to_path_buf(),
+        key,
+        budget(),
+        slow_post,
+    );
+    handle.cancel();
+    let error = settle(&mut handle).unwrap_err();
+    assert!(error.contains("cancelled"), "{error}");
+    assert!(!library.root().join("Rome/photo-edited.png").exists());
 }

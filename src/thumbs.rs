@@ -13,6 +13,15 @@ use crate::meta;
 
 pub const THUMB_SIZE: u32 = 256;
 pub const AI_PREVIEW_MAX_SIZE: u32 = 1600;
+const EDIT_INPUT_MAX_SIZE: u32 = 2048;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditInput {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
 
 pub fn thumbs_dir(root: &Path) -> PathBuf {
     root.join(ALBUM_DIR).join("thumbs")
@@ -56,6 +65,28 @@ pub fn generate_thumb(root: &Path, abs: &Path, relpath: &str) -> Result<PathBuf>
         .save_with_format(&out, ImageFormat::Jpeg)
         .with_context(|| format!("write {}", out.display()))?;
     Ok(out)
+}
+
+pub fn prepare_edit_input(source: &Path) -> Result<EditInput> {
+    let image =
+        load_image(source).with_context(|| format!("decode edit input {}", source.display()))?;
+    let (width, height) = (image.width(), image.height());
+    let image = if width > EDIT_INPUT_MAX_SIZE || height > EDIT_INPUT_MAX_SIZE {
+        image.thumbnail(EDIT_INPUT_MAX_SIZE, EDIT_INPUT_MAX_SIZE)
+    } else {
+        image
+    };
+    let mut bytes = Vec::new();
+    image
+        .to_rgb8()
+        .write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Jpeg)
+        .with_context(|| format!("encode edit input {}", source.display()))?;
+    Ok(EditInput {
+        bytes,
+        mime: "image/jpeg".into(),
+        width: Some(width),
+        height: Some(height),
+    })
 }
 
 pub fn write_ai_preview(source: &Path, destination: &Path) -> Result<()> {

@@ -29,6 +29,7 @@ use rusqlite::Connection;
 use crate::ai::{self, AskHandle};
 use crate::catalog::{self, Photo};
 use crate::clipboard::{self, ClipboardOp};
+use crate::credentials::{self, ResolvedKey};
 use crate::delete;
 use crate::image_edit;
 use crate::index;
@@ -76,6 +77,18 @@ struct AskAi {
     generation: u64,
     selection: Vec<String>,
     scroll: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingGeminiEdit {
+    instruction: String,
+    source: PathBuf,
+    generation: u64,
+}
+
+struct GeminiKeyOverlay {
+    input: String,
+    error: Option<String>,
 }
 
 impl AskAi {
@@ -204,6 +217,8 @@ struct App {
     marked: HashSet<String>,
     pending_delete: Option<Vec<String>>,
     clipboard: Option<clipboard::Clipboard>,
+    pending_gemini_edit: Option<PendingGeminiEdit>,
+    gemini_key_overlay: Option<GeminiKeyOverlay>,
     ask: AskAi,
 }
 
@@ -234,6 +249,8 @@ impl App {
             marked: HashSet::new(),
             pending_delete: None,
             clipboard: None,
+            pending_gemini_edit: None,
+            gemini_key_overlay: None,
             ask: AskAi::new(),
         };
         app.reload_photos();
@@ -274,16 +291,75 @@ impl App {
             Ok(ai::AskValue::Answer(text)) => {
                 self.ask.reply = Some(AskReply::Text(text));
             }
+            Ok(ai::AskValue::Edit { instruction }) => {
+                self.begin_gemini_edit(instruction);
+            }
             Ok(ai::AskValue::Saved(saved)) => {
+                self.pending_gemini_edit = None;
+                self.gemini_key_overlay = None;
                 self.focus_saved_edit(&saved.relpath);
                 let message = image_edit::saved_message(&saved.filename);
                 self.status = message.clone();
                 self.ask.reply = Some(AskReply::Text(message));
             }
             Err(err) => {
+                if credentials::is_invalid_saved_key_error(&err) {
+                    self.gemini_key_overlay = Some(GeminiKeyOverlay {
+                        input: String::new(),
+                        error: Some("Gemini rejected that key. Paste a new one.".into()),
+                    });
+                    return;
+                }
+                self.pending_gemini_edit = None;
+                self.gemini_key_overlay = None;
                 self.ask.reply = Some(AskReply::Error(err));
             }
         }
+    }
+
+    fn begin_gemini_edit(&mut self, instruction: String) {
+        let stills = ai::marked_still_rels(&self.photos, &self.marked);
+        if stills.len() != 1 {
+            self.ask.reply = Some(AskReply::Error(image_edit::edit_needs_one_photo_message()));
+            return;
+        }
+        let source = self.root.join(&stills[0]);
+        self.pending_gemini_edit = Some(PendingGeminiEdit {
+            instruction,
+            source,
+            generation: self.ask.generation,
+        });
+        if let Some(key) = credentials::resolve() {
+            self.start_gemini_job(key);
+        } else {
+            self.gemini_key_overlay = Some(GeminiKeyOverlay {
+                input: String::new(),
+                error: None,
+            });
+        }
+    }
+
+    fn start_gemini_job(&mut self, key: ResolvedKey) {
+        let Some(pending) = self.pending_gemini_edit.clone() else {
+            return;
+        };
+        if ask_outcome_is_stale(self.ask.generation, pending.generation) {
+            return;
+        }
+        self.ask.waiting_from = Some(Instant::now());
+        self.ask.job = Some(ai::spawn_edit(
+            pending.generation,
+            pending.instruction,
+            pending.source,
+            self.root.clone(),
+            key,
+            ai::Timeouts::default(),
+        ));
+    }
+
+    fn cancel_gemini_edit(&mut self) {
+        self.pending_gemini_edit = None;
+        self.gemini_key_overlay = None;
     }
 
     fn send_ask(&mut self) {
@@ -436,6 +512,9 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
                     break;
                 }
             }
+            Event::Paste(text) if app.gemini_key_overlay.is_some() => {
+                append_gemini_key_input(app, &text);
+            }
             Event::Mouse(mouse) => {
                 handle_mouse(app, mouse, terminal)?;
             }
@@ -453,6 +532,11 @@ fn handle_key(
 ) -> Result<bool> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
+    }
+
+    if app.gemini_key_overlay.is_some() {
+        handle_gemini_key_overlay_key(app, key.code);
+        return Ok(false);
     }
 
     if app.pending_delete.is_some() {
@@ -803,7 +887,7 @@ fn handle_mouse(
     mouse: MouseEvent,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<()> {
-    if app.pending_delete.is_some() {
+    if app.pending_delete.is_some() || app.gemini_key_overlay.is_some() {
         return Ok(());
     }
     if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
@@ -1321,6 +1405,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(rels) = app.pending_delete.as_deref() {
         draw_delete_confirm(frame, rels);
     }
+    if app.gemini_key_overlay.is_some() {
+        draw_gemini_key_overlay(frame, app);
+    }
 }
 
 fn draw_search(frame: &mut Frame, app: &App, area: Rect, ask_ai: bool, second: Option<&str>) {
@@ -1468,9 +1555,9 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
     let clip_label = clipboard_footer_label(&app.photos, app.clipboard.as_ref());
     let block =
         match album_grid_footer(pos, app.photos.len(), app.marked.len(), clip_label, focused) {
-        Some(footer) => block.title_bottom(footer),
-        None => block,
-    };
+            Some(footer) => block.title_bottom(footer),
+            None => block,
+        };
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1651,6 +1738,98 @@ fn draw_delete_confirm(frame: &mut Frame, rels: &[String]) {
         ),
         popup,
     );
+}
+
+const GEMINI_KEY_HINT: &str =
+    "The marked photo will be sent to Google Gemini for editing and may use paid quota.\n\
+Paste a key from https://aistudio.google.com/apikey\n\
+Enter save · Esc cancel";
+
+fn draw_gemini_key_overlay(frame: &mut Frame, app: &App) {
+    let Some(overlay) = app.gemini_key_overlay.as_ref() else {
+        return;
+    };
+    let area = frame.area();
+    let width = area.width.min(62).max(34.min(area.width));
+    let height = 8.min(area.height);
+    let popup = centered_rect(width, height, area);
+    frame.render_widget(Clear, popup);
+    let masked = "•".repeat(overlay.input.chars().count());
+    let mut lines = vec![GEMINI_KEY_HINT.to_string(), String::new(), masked];
+    if let Some(error) = &overlay.error {
+        lines.push(error.clone());
+    }
+    frame.render_widget(
+        Paragraph::new(lines.join("\n"))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Image editing")
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
+        popup,
+    );
+}
+
+fn handle_gemini_key_overlay_key(app: &mut App, code: KeyCode) {
+    let Some(overlay) = app.gemini_key_overlay.as_mut() else {
+        return;
+    };
+    match classify_gemini_key_key(code) {
+        GeminiKeyKey::Cancel => app.cancel_gemini_edit(),
+        GeminiKeyKey::Save => match credentials::save_gemini_key(&overlay.input) {
+            Ok(()) => {
+                app.gemini_key_overlay = None;
+                if let Some(key) = credentials::resolve() {
+                    app.start_gemini_job(key);
+                }
+            }
+            Err(error) => overlay.error = Some(error),
+        },
+        GeminiKeyKey::Backspace => {
+            overlay.input.pop();
+            overlay.error = None;
+        }
+        GeminiKeyKey::Char(c) => {
+            overlay.input.push(c);
+            overlay.error = None;
+        }
+        GeminiKeyKey::Ignore => {}
+    }
+}
+
+fn append_gemini_key_input(app: &mut App, text: &str) {
+    let Some(overlay) = app.gemini_key_overlay.as_mut() else {
+        return;
+    };
+    for ch in text.chars().filter(|c| !c.is_control()) {
+        overlay.input.push(ch);
+    }
+    overlay.error = None;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeminiKeyKey {
+    Save,
+    Cancel,
+    Backspace,
+    Char(char),
+    Ignore,
+}
+
+fn classify_gemini_key_key(code: KeyCode) -> GeminiKeyKey {
+    match code {
+        KeyCode::Esc => GeminiKeyKey::Cancel,
+        KeyCode::Enter => GeminiKeyKey::Save,
+        KeyCode::Backspace => GeminiKeyKey::Backspace,
+        KeyCode::Char(c) => GeminiKeyKey::Char(c),
+        _ => GeminiKeyKey::Ignore,
+    }
+}
+
+pub fn mask_gemini_key_input(input: &str) -> String {
+    "•".repeat(input.chars().count())
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -1964,6 +2143,17 @@ mod tests {
         assert!(STATUS_HINT.contains("c copy"));
         assert!(STATUS_HINT.contains("x cut"));
         assert!(STATUS_HINT.contains("p paste"));
+    }
+
+    #[test]
+    fn gemini_key_overlay_keys_save_cancel_and_mask() {
+        assert_eq!(classify_gemini_key_key(KeyCode::Enter), GeminiKeyKey::Save);
+        assert_eq!(classify_gemini_key_key(KeyCode::Esc), GeminiKeyKey::Cancel);
+        assert_eq!(
+            classify_gemini_key_key(KeyCode::Char('a')),
+            GeminiKeyKey::Char('a')
+        );
+        assert_eq!(mask_gemini_key_input("secret"), "••••••");
     }
 
     #[test]

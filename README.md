@@ -79,7 +79,7 @@ Mark with `Space` key one or more **images** and the search bar becomes **Ask AI
 
 Type a question and press Enter: "Which car is this?" The agent answers in the pane.
 
-If the prompt is an edit instruction such as "Remove the persons in the background.", Hallward classifies the request and then runs the same agent CLI a second time to perform the edit. Both runs use the model you configured for your agent — Hallward never overrides it, so editing only works when that model can generate images. The edited photo is saved as a new sibling file (`photo-edited.png`, then `photo-edited-2.png`, …). The original is never overwritten. Editing needs **exactly one** marked still. Esc cancels an in-flight request.
+If the prompt is an edit instruction such as "Remove the persons in the background.", Hallward first uses your configured agent to classify the request. The edit itself calls Google Gemini (`gemini-3.1-flash-image`) directly. The first edit may ask for a Gemini API key in a popup; you can also set `GEMINI_API_KEY`. The edited photo is saved as a new sibling file (`photo-edited.png`, then `photo-edited-2.png`, …). The original is never overwritten. Editing needs **exactly one** marked still. Esc cancels an in-flight request.
 
 ![Ask AI](assets/2026-09-02_ai-chat.png)
 

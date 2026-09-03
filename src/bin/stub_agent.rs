@@ -95,7 +95,10 @@ fn append_argv_log(scenario: &Value, call: &str, args: &[String]) {
 
 fn dest_name(args: &[String]) -> Option<String> {
     let tail = args.iter().find_map(|arg| arg.split_once(DEST_MARKER))?.1;
-    let name = tail.split_whitespace().next()?;
+    let name = tail
+        .split_whitespace()
+        .next()?
+        .trim_end_matches(['.', ',', ';']);
     Some(name.to_string())
 }
 

@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod catalog;
 pub mod clipboard;
+pub mod credentials;
 pub mod delete;
 pub mod image_edit;
 pub mod index;

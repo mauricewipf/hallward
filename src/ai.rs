@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::catalog::Photo;
-use crate::image_edit::{self, SavedEdit};
+use crate::credentials::{self, ResolvedKey};
+use crate::image_edit::{self, PostGeminiFn, SavedEdit};
 use crate::media::{bin_on_path, is_image};
 use crate::thumbs;
 
@@ -35,10 +36,11 @@ pub enum AskProgress {
     Indexing,
 }
 
-/// Successful Ask AI outcome: a text answer, or a newly saved edited still.
+/// Successful Ask AI outcome: a text answer, a pending edit directive, or a saved still.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AskValue {
     Answer(String),
+    Edit { instruction: String },
     Saved(SavedEdit),
 }
 
@@ -432,12 +434,6 @@ pub fn no_images_message() -> String {
     "Videos can't be sent to the AI. Mark a photo and try again.".into()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ToolPolicy {
-    DenyAll,
-    AllowWrite,
-}
-
 fn photo_qa_prompt(user_prompt: &str) -> String {
     format!(
         "You are a photo assistant. Analyze only the attached images themselves. \
@@ -616,87 +612,6 @@ pub fn build_argv(agent: &str, prompt: &str, files: &[PathBuf]) -> Result<Vec<St
                 body,
             ]
         }
-        other => return Err(unsupported_message(other)),
-    })
-}
-
-fn photo_edit_prompt(instruction: &str, source_name: &str, dest_name: &str) -> String {
-    format!(
-        "You are a photo editor. Edit only the attached photograph according to the instruction. \
-Save the edited image as a new file named exactly {dest_name} in the current directory. \
-Do not overwrite {source_name} or any other file. \
-Do not add text, watermarks, or captions. \
-When finished, reply with only the saved filename.\n\n\
-Instruction:\n{instruction}"
-    )
-}
-
-/// Headless argv that asks the agent to write an edited sibling image.
-pub fn build_edit_argv(
-    agent: &str,
-    instruction: &str,
-    source: &Path,
-    dest: &Path,
-) -> Result<Vec<String>, String> {
-    if !is_supported_agent(agent) {
-        return Err(unsupported_message(agent));
-    }
-    let source_name = attachment_name(source);
-    let dest_name = attachment_name(dest);
-    let prompt = photo_edit_prompt(instruction, &source_name, &dest_name);
-    Ok(match agent {
-        "opencode" => {
-            let mut argv = vec!["opencode".into(), "run".into(), prompt];
-            argv.extend(opencode_dir_and_files(&[source]));
-            argv
-        }
-        "pi" => vec![
-            "pi".into(),
-            "-p".into(),
-            "--no-context-files".into(),
-            "--no-session".into(),
-            format!("@{source_name}"),
-            "--".into(),
-            prompt,
-        ],
-        "omp" => vec![
-            "omp".into(),
-            "-p".into(),
-            "--no-session".into(),
-            format!("@{source_name}"),
-            "--".into(),
-            prompt,
-        ],
-        "hermes" => vec![
-            "hermes".into(),
-            "chat".into(),
-            "--oneshot".into(),
-            "-Q".into(),
-            "--image".into(),
-            source_name,
-            "-q".into(),
-            prompt,
-        ],
-        "codex" => vec![
-            "codex".into(),
-            "exec".into(),
-            "--ephemeral".into(),
-            "--sandbox".into(),
-            "workspace-write".into(),
-            prompt,
-            "-i".into(),
-            source_name,
-        ],
-        "claude" => vec![
-            "claude".into(),
-            "-p".into(),
-            "--tools".into(),
-            "Read,Write".into(),
-            "--permission-mode".into(),
-            "dontAsk".into(),
-            "--".into(),
-            format!("Look at this image:\n{source_name}\n\n{prompt}"),
-        ],
         other => return Err(unsupported_message(other)),
     })
 }
@@ -928,7 +843,7 @@ fn run_ask(
     cli: &AgentCli,
     prompt: &str,
     files: &[PathBuf],
-    library_root: &Path,
+    _library_root: &Path,
     cancel: &AtomicBool,
     child_slot: &Mutex<Option<Child>>,
     progress: &Mutex<AskProgress>,
@@ -947,7 +862,6 @@ fn run_ask(
         cancel,
         child_slot,
         timeouts.ask,
-        ToolPolicy::DenyAll,
     )?;
     match parse_ask_decision(&answer) {
         AskDecision::Answer(text) => {
@@ -959,18 +873,101 @@ fn run_ask(
         }
         AskDecision::Edit(instruction) => {
             edit_source_count_ok(files.len())?;
-            set_progress(progress, AskProgress::Editing);
-            let saved = run_agent_edit(
-                cli,
-                &files[0],
-                library_root,
-                &instruction,
-                cancel,
-                child_slot,
-                progress,
-                timeouts.edit,
-            )?;
+            Ok(AskValue::Edit { instruction })
+        }
+    }
+}
+
+/// Spawn a Gemini image edit on a background thread.
+pub fn spawn_edit(
+    id: u64,
+    instruction: String,
+    source: PathBuf,
+    library_root: PathBuf,
+    key: ResolvedKey,
+    timeouts: Timeouts,
+) -> AskHandle {
+    spawn_edit_with(
+        id,
+        instruction,
+        source,
+        library_root,
+        key,
+        timeouts,
+        image_edit::post_gemini,
+    )
+}
+
+/// [`spawn_edit`] with an injectable HTTP transport for tests.
+pub fn spawn_edit_with(
+    id: u64,
+    instruction: String,
+    source: PathBuf,
+    library_root: PathBuf,
+    key: ResolvedKey,
+    timeouts: Timeouts,
+    post: PostGeminiFn,
+) -> AskHandle {
+    let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let child_slot = Arc::new(Mutex::new(None));
+    let progress = Arc::new(Mutex::new(AskProgress::Editing));
+    let cancel_t = cancel.clone();
+    let progress_t = progress.clone();
+    thread::spawn(move || {
+        let result = run_gemini_edit(
+            &source,
+            &library_root,
+            &instruction,
+            &key,
+            &cancel_t,
+            &progress_t,
+            post,
+            timeouts.edit,
+        );
+        let _ = tx.send(AskOutcome { id, result });
+    });
+    AskHandle {
+        id,
+        rx,
+        cancel,
+        child_slot,
+        progress,
+    }
+}
+
+fn run_gemini_edit(
+    source: &Path,
+    library_root: &Path,
+    instruction: &str,
+    key: &ResolvedKey,
+    cancel: &AtomicBool,
+    progress: &Mutex<AskProgress>,
+    post: PostGeminiFn,
+    timeout: Duration,
+) -> Result<AskValue, String> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err("Ask AI cancelled.".into());
+    }
+    set_progress(progress, AskProgress::Editing);
+    match image_edit::run_gemini_edit(
+        source,
+        library_root,
+        instruction,
+        key,
+        cancel,
+        post,
+        timeout,
+    ) {
+        Ok(saved) => {
+            set_progress(progress, AskProgress::Indexing);
             Ok(AskValue::Saved(saved))
+        }
+        Err(err) => {
+            if credentials::is_invalid_saved_key_error(&err) {
+                let _ = credentials::clear_saved_key();
+            }
+            Err(err)
         }
     }
 }
@@ -986,46 +983,6 @@ pub fn edit_source_count_ok(count: usize) -> Result<(), String> {
         Ok(())
     } else {
         Err(image_edit::edit_needs_one_photo_message())
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_agent_edit(
-    cli: &AgentCli,
-    source: &Path,
-    library_root: &Path,
-    instruction: &str,
-    cancel: &AtomicBool,
-    child_slot: &Mutex<Option<Child>>,
-    progress: &Mutex<AskProgress>,
-    timeout: Duration,
-) -> Result<SavedEdit, String> {
-    if cancel.load(Ordering::SeqCst) {
-        return Err("Ask AI cancelled.".into());
-    }
-    let dest = image_edit::unique_sibling_path(source, "png")?;
-    let work_dir = source.parent().unwrap_or_else(|| Path::new("."));
-    let argv = build_edit_argv(&cli.agent, instruction, source, &dest)?;
-    let result = execute_argv(
-        cli,
-        &argv,
-        work_dir,
-        cancel,
-        child_slot,
-        timeout,
-        ToolPolicy::AllowWrite,
-    );
-    if matches!(&result, Err(error) if error.contains("cancelled") || error.contains("timed out")) {
-        let _ = fs::remove_file(&dest);
-        return Err(result.unwrap_err());
-    }
-    if dest.is_file() {
-        set_progress(progress, AskProgress::Indexing);
-        return image_edit::index_saved_edit(source, &dest, library_root);
-    }
-    match result {
-        Ok(_) => Err(image_edit::no_saved_image_message(display_name(&cli.agent))),
-        Err(error) => Err(error),
     }
 }
 
@@ -1050,7 +1007,6 @@ fn execute_argv(
     cancel: &AtomicBool,
     child_slot: &Mutex<Option<Child>>,
     timeout: Duration,
-    tools: ToolPolicy,
 ) -> Result<String, String> {
     let agent = cli.agent.as_str();
     let mut cmd = Command::new(&cli.program);
@@ -1060,11 +1016,7 @@ fn execute_argv(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if agent == "opencode" {
-        let permission = match tools {
-            ToolPolicy::DenyAll => r#"{"*":"deny"}"#,
-            ToolPolicy::AllowWrite => r#"{"*":"allow"}"#,
-        };
-        cmd.env("OPENCODE_PERMISSION", permission);
+        cmd.env("OPENCODE_PERMISSION", r#"{"*":"deny"}"#);
     }
     #[cfg(unix)]
     {
@@ -1590,6 +1542,21 @@ mod tests {
         assert!(vision.contains("cannot read images"), "{vision}");
         let other = map_error_text("codex", "rate limit exceeded");
         assert_eq!(other, "rate limit exceeded");
+        // Provider errors (model not found, NOT_FOUND, etc.) are surfaced
+        // verbatim so the user can see which model failed and debug their
+        // agent CLI config — a generic "not available" message hides the cause.
+        let missing = map_error_text(
+            "opencode",
+            "Error from provider (Console): Upstream request failed: [NOT_FOUND] Model not found, inaccessible, and/or not deployed",
+        );
+        assert!(
+            missing.contains("[NOT_FOUND]"),
+            "provider error must be surfaced verbatim: {missing}"
+        );
+        assert!(
+            missing.contains("Model not found"),
+            "provider error must be surfaced verbatim: {missing}"
+        );
     }
 
     #[test]
@@ -1642,7 +1609,6 @@ mod tests {
             &cancel,
             &slot,
             Duration::from_secs(5),
-            ToolPolicy::DenyAll,
         )
         .unwrap();
         assert_eq!(out.trim(), "hello-ask");
@@ -1664,7 +1630,6 @@ mod tests {
             &cancel,
             &slot,
             Duration::from_secs(5),
-            ToolPolicy::DenyAll,
         )
         .unwrap_err();
         assert!(err.contains("opencode auth login"), "{err}");
@@ -1686,7 +1651,6 @@ mod tests {
                     &cancel_t,
                     &slot_t,
                     Duration::from_secs(30),
-                    ToolPolicy::DenyAll,
                 )
                 .map(AskValue::Answer);
                 let _ = tx.send(AskOutcome { id: 1, result });
@@ -1728,7 +1692,6 @@ mod tests {
             &cancel,
             &slot,
             Duration::from_millis(200),
-            ToolPolicy::DenyAll,
         )
         .unwrap_err();
         assert_eq!(err, "The AI request timed out.");
@@ -1747,7 +1710,6 @@ mod tests {
             &cancel,
             &slot,
             Duration::from_secs(5),
-            ToolPolicy::DenyAll,
         )
         .unwrap_err();
         assert!(err.contains("not installed"), "{err}");
@@ -1804,64 +1766,44 @@ mod tests {
     }
 
     #[test]
-    fn edit_argv_asks_the_agent_to_write_a_sibling() {
-        let source = PathBuf::from("/lib/Rome/photo.jpg");
-        let dest = PathBuf::from("/lib/Rome/photo-edited.png");
-        for agent in SUPPORTED {
-            let argv = build_edit_argv(agent, "Remove the people", &source, &dest).unwrap();
-            assert!(
-                !argv.iter().any(|arg| arg == "--model"),
-                "{agent} must keep the user's configured model"
-            );
-            assert!(
-                argv.iter().any(|arg| arg.contains("photo-edited.png")),
-                "{agent}"
-            );
-        }
-
-        let argv = build_edit_argv("opencode", "Remove the people", &source, &dest).unwrap();
-        assert_eq!(&argv[..2], ["opencode", "run"]);
-        let cwd = env::current_dir().unwrap();
-        assert_eq!(
-            &argv[3..],
-            ["--dir", cwd.to_str().unwrap(), "-f", "/lib/Rome/photo.jpg"]
-        );
-
-        let pi = build_edit_argv("pi", "blur", &source, &dest).unwrap();
-        assert!(!pi.iter().any(|arg| arg == "--no-tools"));
-        assert!(pi.iter().any(|arg| arg == "@photo.jpg"));
-
-        let hermes = build_edit_argv("hermes", "blur", &source, &dest).unwrap();
-        assert!(!hermes.iter().any(|arg| arg == "--safe-mode"));
-
-        let codex = build_edit_argv("codex", "blur", &source, &dest).unwrap();
-        assert!(codex.iter().any(|arg| arg == "workspace-write"));
-        assert!(!codex.iter().any(|arg| arg == "read-only"));
-
-        let claude = build_edit_argv("claude", "blur", &source, &dest).unwrap();
-        assert_eq!(claude[3], "Read,Write");
-    }
-
-    #[test]
-    fn cancel_before_edit_does_not_write() {
-        let cancel = AtomicBool::new(true);
+    fn classify_job_stops_at_edit_directive() {
+        let cancel = AtomicBool::new(false);
         let slot = Mutex::new(None);
-        let progress = Mutex::new(AskProgress::Editing);
+        let progress = Mutex::new(AskProgress::Analyzing);
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("photo.jpg");
-        fs::write(&source, b"orig").unwrap();
-        let err = run_agent_edit(
-            &AgentCli::on_path("opencode"),
-            &source,
+        image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3]))
+            .save(&source)
+            .unwrap();
+        let stub = tempfile::tempdir().unwrap();
+        let program = stub.path().join("stub");
+        fs::write(
+            &program,
+            "#!/bin/sh\necho '{\"edit\":\"Blur the background.\"}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cli = AgentCli::with_program("opencode", &program);
+        let result = run_ask(
+            &cli,
+            "blur the background",
+            &[source],
             dir.path(),
-            "remove people",
             &cancel,
             &slot,
             &progress,
-            Duration::from_secs(5),
+            Timeouts::default(),
         )
-        .unwrap_err();
-        assert!(err.contains("cancelled"), "{err}");
-        assert!(!dir.path().join("photo-edited.png").exists());
+        .unwrap();
+        assert_eq!(
+            result,
+            AskValue::Edit {
+                instruction: "Blur the background.".into()
+            }
+        );
     }
 }
