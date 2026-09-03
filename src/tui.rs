@@ -93,6 +93,12 @@ struct GeminiKeyOverlay {
     error: Option<String>,
 }
 
+struct CreateFolderOverlay {
+    parent_relpath: PathBuf,
+    input: String,
+    error: Option<String>,
+}
+
 impl AskAi {
     fn new() -> Self {
         Self {
@@ -230,6 +236,7 @@ struct App {
     clipboard: Option<clipboard::Clipboard>,
     pending_ask: Option<PendingAsk>,
     gemini_key_overlay: Option<GeminiKeyOverlay>,
+    create_folder_overlay: Option<CreateFolderOverlay>,
     gemini_url_rect: Option<Rect>,
     /// Screen cells where an OSC 8 URL was painted outside ratatui's buffer.
     gemini_url_written: Option<Rect>,
@@ -265,6 +272,7 @@ impl App {
             clipboard: None,
             pending_ask: None,
             gemini_key_overlay: None,
+            create_folder_overlay: None,
             gemini_url_rect: None,
             gemini_url_written: None,
             ask: AskAi::new(),
@@ -441,6 +449,21 @@ impl App {
         None
     }
 
+    /// Folder shown in the gallery pane: an album, or a collection the user opened (empty or in grid).
+    fn gallery_folder(&self) -> Option<&Folder> {
+        if let Some(album) = self.current_album() {
+            return Some(album);
+        }
+        let folder = self.selected_folder()?;
+        if folder.kind == Kind::Collection
+            && (self.focus == Focus::Grid || folder.children.is_empty())
+        {
+            Some(folder)
+        } else {
+            None
+        }
+    }
+
     fn album_key(folder: &Folder) -> String {
         let s = folder.relpath.to_string_lossy().replace('\\', "/");
         if s.is_empty() {
@@ -525,6 +548,9 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
             Event::Paste(text) if app.gemini_key_overlay.is_some() => {
                 append_gemini_key_input(app, &text);
             }
+            Event::Paste(text) if app.create_folder_overlay.is_some() => {
+                append_create_folder_input(app, &text);
+            }
             Event::Mouse(mouse) => {
                 handle_mouse(app, mouse, terminal)?;
             }
@@ -546,6 +572,11 @@ fn handle_key(
 
     if app.gemini_key_overlay.is_some() {
         handle_gemini_key_overlay_key(app, key);
+        return Ok(false);
+    }
+
+    if app.create_folder_overlay.is_some() {
+        handle_create_folder_overlay_key(app, key);
         return Ok(false);
     }
 
@@ -613,6 +644,13 @@ fn handle_key(
             set_clipboard(app, ClipboardOp::Cut);
         }
         KeyCode::Char('p') if app.clipboard.is_some() => paste_clipboard(app, terminal)?,
+        KeyCode::Char('a') if !ask_ai && can_create_folder(app) => {
+            app.create_folder_overlay = Some(CreateFolderOverlay {
+                parent_relpath: create_folder_parent(app),
+                input: String::new(),
+                error: None,
+            });
+        }
         KeyCode::Esc => match classify_esc(
             !app.marked.is_empty(),
             app.clipboard.is_some(),
@@ -811,8 +849,8 @@ fn paste_clipboard(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdou
     let Some(clip) = app.clipboard.clone() else {
         return Ok(());
     };
-    let dest = match app.current_album() {
-        Some(album) => App::album_key(album),
+    let dest = match app.gallery_folder() {
+        Some(folder) => App::album_key(folder),
         None => {
             app.status = "select an album to paste".into();
             return Ok(());
@@ -897,7 +935,10 @@ fn handle_mouse(
     mouse: MouseEvent,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<()> {
-    if app.pending_delete.is_some() || app.gemini_key_overlay.is_some() {
+    if app.pending_delete.is_some()
+        || app.gemini_key_overlay.is_some()
+        || app.create_folder_overlay.is_some()
+    {
         return Ok(());
     }
     if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
@@ -1180,6 +1221,16 @@ fn column_len(app: &App, col: usize) -> usize {
     app.miller_columns().get(col).map(|c| c.len()).unwrap_or(0)
 }
 
+fn can_create_folder(app: &App) -> bool {
+    match app.focus {
+        Focus::Search => false,
+        Focus::Grid => app
+            .selected_folder()
+            .is_some_and(|f| f.kind == Kind::Collection),
+        Focus::Miller => true,
+    }
+}
+
 fn move_up(app: &mut App) {
     if app.focus == Focus::Grid {
         if app.grid_cols > 0 && app.grid_idx >= app.grid_cols {
@@ -1252,17 +1303,20 @@ fn move_right(app: &mut App) {
     let kind = app.selected_folder().map(|f| f.kind);
     match kind {
         Some(Kind::Album) => {
-            if !app.photos.is_empty() {
-                app.focus = Focus::Grid;
-            }
+            app.focus = Focus::Grid;
         }
         Some(Kind::Collection) => {
-            let next = app.miller_focus + 1;
-            let cols = app.miller_columns();
-            if next < cols.len() && !cols[next].is_empty() {
-                app.miller_focus = next;
-                if app.cursor.len() <= next {
-                    app.cursor.resize(next + 1, 0);
+            let folder = app.selected_folder().unwrap();
+            if folder.children.is_empty() {
+                app.focus = Focus::Grid;
+            } else {
+                let next = app.miller_focus + 1;
+                let cols = app.miller_columns();
+                if next < cols.len() && !cols[next].is_empty() {
+                    app.miller_focus = next;
+                    if app.cursor.len() <= next {
+                        app.cursor.resize(next + 1, 0);
+                    }
                 }
             }
         }
@@ -1420,6 +1474,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         app.gemini_url_rect = None;
     }
+    if app.create_folder_overlay.is_some() {
+        draw_create_folder_overlay(frame, app);
+    }
 }
 
 fn draw_search(frame: &mut Frame, app: &App, area: Rect, ask_ai: bool, second: Option<&str>) {
@@ -1551,7 +1608,7 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::default()
     };
     let album_name = app
-        .current_album()
+        .gallery_folder()
         .map(|a| a.display_name().to_string())
         .unwrap_or_else(|| "—".into());
     let heading = album_grid_heading(&album_name);
@@ -1573,7 +1630,7 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.current_album().is_none() {
+    if app.gallery_folder().is_none() {
         frame.render_widget(
             Paragraph::new("Select an album with the right arrow.")
                 .style(Style::default().fg(Color::DarkGray)),
@@ -1583,7 +1640,15 @@ fn draw_grid(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     if app.photos.is_empty() {
-        frame.render_widget(Paragraph::new("No still images in this album."), inner);
+        let hint = if app.focus == Focus::Grid {
+            "Empty · p paste · a new album"
+        } else {
+            "Press → to open"
+        };
+        frame.render_widget(
+            Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
         app.hit.grid = None;
         return;
     }
@@ -1701,8 +1766,10 @@ fn exif_lines(p: &Photo) -> Vec<Line<'static>> {
 }
 
 fn album_pane_lines(app: &App) -> Vec<Line<'static>> {
-    if app.current_album().is_none() {
+    if app.gallery_folder().is_none() {
         vec![Line::from("Select an album")]
+    } else if app.photos.is_empty() {
+        vec![Line::from("Empty")]
     } else {
         album_media_summary(&app.photos)
             .into_iter()
@@ -1879,6 +1946,222 @@ fn append_gemini_key_input(app: &mut App, text: &str) {
     overlay.error = None;
 }
 
+const CREATE_FOLDER_BIND: &str = "Enter save · Esc cancel";
+
+fn create_folder_parent(app: &App) -> PathBuf {
+    if let Some(folder) = app.selected_folder() {
+        if folder.kind == Kind::Collection
+            && (app.focus == Focus::Grid || folder.children.is_empty())
+        {
+            return folder.relpath.clone();
+        }
+    }
+    if app.miller_focus == 0 {
+        return PathBuf::new();
+    }
+    let cols = app.miller_columns();
+    let parent_col = app.miller_focus.saturating_sub(1);
+    let sel = app.cursor.get(parent_col).copied().unwrap_or(0);
+    cols.get(parent_col)
+        .and_then(|c| c.get(sel))
+        .map(|f| f.relpath.clone())
+        .unwrap_or_default()
+}
+
+fn rescan_tree_focusing(app: &mut App, focus_rel: Option<&str>) {
+    match library::scan_tree(&app.root) {
+        Ok(tree) => {
+            app.full_tree = tree;
+            app.view_tree = if app.query.is_empty() {
+                app.full_tree.clone()
+            } else {
+                search::filter_tree(&app.full_tree, &app.query)
+            };
+            if let Some(rel) = focus_rel {
+                focus_folder_path(app, Path::new(rel));
+            } else {
+                clamp_cursor(app);
+            }
+        }
+        Err(e) => app.status = format!("tree scan failed: {e:#}"),
+    }
+    app.reload_photos();
+}
+
+fn focus_folder_path(app: &mut App, relpath: &Path) {
+    use std::path::Component;
+    let components: Vec<String> = relpath
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if components.is_empty() {
+        return;
+    }
+
+    let mut cursor = vec![0usize];
+    let mut parent: &Folder = &app.view_tree;
+    let mut depth = 0usize;
+
+    for (i, comp) in components.iter().enumerate() {
+        let Some(idx) = parent.children.iter().position(|c| c.name == *comp) else {
+            break;
+        };
+        cursor.resize(depth + 1, 0);
+        cursor[depth] = idx;
+        if i == components.len() - 1 {
+            app.cursor = cursor;
+            app.miller_focus = depth;
+            app.focus = Focus::Miller;
+            clamp_cursor(app);
+            return;
+        }
+        let child = &parent.children[idx];
+        if child.kind != Kind::Collection {
+            break;
+        }
+        depth += 1;
+        parent = child;
+    }
+}
+
+fn draw_create_folder_overlay(frame: &mut Frame, app: &App) {
+    let Some(overlay) = app.create_folder_overlay.as_ref() else {
+        return;
+    };
+    let area = frame.area();
+    let width = area.width.min(48).max(28.min(area.width));
+    let height = if overlay.error.is_some() { 9 } else { 8 };
+    let height = height.min(area.height);
+    let popup = centered_rect(width, height, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("New folder")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new("Folder name").alignment(Alignment::Center),
+        chunks[0],
+    );
+
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let input_inner = input_block.inner(chunks[1]);
+    frame.render_widget(input_block, chunks[1]);
+    frame.render_widget(
+        Paragraph::new(overlay.input.as_str()).alignment(Alignment::Center),
+        input_inner,
+    );
+
+    frame.render_widget(
+        Paragraph::new(CREATE_FOLDER_BIND).alignment(Alignment::Center),
+        chunks[2],
+    );
+
+    if let Some(error) = &overlay.error {
+        frame.render_widget(
+            Paragraph::new(error.as_str())
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::LightRed)),
+            chunks[3],
+        );
+    }
+}
+
+fn handle_create_folder_overlay_key(app: &mut App, key: KeyEvent) {
+    match classify_create_folder_key(key) {
+        CreateFolderKey::Cancel => {
+            app.create_folder_overlay = None;
+        }
+        CreateFolderKey::Save => {
+            let Some(overlay) = app.create_folder_overlay.take() else {
+                return;
+            };
+            let name = overlay.input.trim().to_string();
+            match library::create_folder(&app.root, &overlay.parent_relpath, &name) {
+                Ok(relpath) => {
+                    let rel_str = relpath.to_string_lossy().replace('\\', "/");
+                    rescan_tree_focusing(app, Some(&rel_str));
+                    app.status = format!("created folder {name}");
+                    app.focus = Focus::Miller;
+                }
+                Err(e) => {
+                    app.create_folder_overlay = Some(CreateFolderOverlay {
+                        parent_relpath: overlay.parent_relpath,
+                        input: overlay.input,
+                        error: Some(format!("{e:#}")),
+                    });
+                }
+            }
+        }
+        CreateFolderKey::Backspace => {
+            let Some(overlay) = app.create_folder_overlay.as_mut() else {
+                return;
+            };
+            overlay.input.pop();
+            overlay.error = None;
+        }
+        CreateFolderKey::Char(c) => {
+            let Some(overlay) = app.create_folder_overlay.as_mut() else {
+                return;
+            };
+            overlay.input.push(c);
+            overlay.error = None;
+        }
+        CreateFolderKey::Ignore => {}
+    }
+}
+
+fn append_create_folder_input(app: &mut App, text: &str) {
+    let Some(overlay) = app.create_folder_overlay.as_mut() else {
+        return;
+    };
+    for ch in text.chars().filter(|c| !c.is_control()) {
+        overlay.input.push(ch);
+    }
+    overlay.error = None;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateFolderKey {
+    Save,
+    Cancel,
+    Backspace,
+    Char(char),
+    Ignore,
+}
+
+fn classify_create_folder_key(key: KeyEvent) -> CreateFolderKey {
+    match key.code {
+        KeyCode::Enter if key.modifiers.is_empty() => CreateFolderKey::Save,
+        KeyCode::Esc if key.modifiers.is_empty() => CreateFolderKey::Cancel,
+        KeyCode::Backspace if key.modifiers.is_empty() => CreateFolderKey::Backspace,
+        KeyCode::Char(c) if allows_text_char(key.modifiers) => CreateFolderKey::Char(c),
+        _ => CreateFolderKey::Ignore,
+    }
+}
+
+fn allows_text_char(modifiers: KeyModifiers) -> bool {
+    modifiers.is_empty() || modifiers == KeyModifiers::SHIFT
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GeminiKeyKey {
     Save,
@@ -1895,7 +2178,7 @@ fn classify_gemini_key_key(key: KeyEvent) -> GeminiKeyKey {
         KeyCode::Enter if key.modifiers.is_empty() => GeminiKeyKey::Save,
         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => GeminiKeyKey::Open,
         KeyCode::Backspace if key.modifiers.is_empty() => GeminiKeyKey::Backspace,
-        KeyCode::Char(c) if key.modifiers.is_empty() => GeminiKeyKey::Char(c),
+        KeyCode::Char(c) if allows_text_char(key.modifiers) => GeminiKeyKey::Char(c),
         _ => GeminiKeyKey::Ignore,
     }
 }
@@ -2259,6 +2542,36 @@ mod tests {
         assert!(STATUS_HINT.contains("c copy"));
         assert!(STATUS_HINT.contains("x cut"));
         assert!(STATUS_HINT.contains("p paste"));
+    }
+
+    #[test]
+    fn create_folder_overlay_keys_save_cancel_and_type() {
+        assert_eq!(
+            classify_create_folder_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            CreateFolderKey::Save
+        );
+        assert_eq!(
+            classify_create_folder_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            CreateFolderKey::Cancel
+        );
+        assert_eq!(
+            classify_create_folder_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            CreateFolderKey::Char('a')
+        );
+        assert_eq!(
+            classify_create_folder_key(KeyEvent::new(
+                KeyCode::Char('A'),
+                KeyModifiers::SHIFT
+            )),
+            CreateFolderKey::Char('A')
+        );
+        assert_eq!(
+            classify_create_folder_key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL
+            )),
+            CreateFolderKey::Ignore
+        );
     }
 
     #[test]

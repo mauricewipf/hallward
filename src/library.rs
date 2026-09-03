@@ -1,7 +1,7 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::media::{is_hidden, is_media_ext};
 
@@ -120,6 +120,50 @@ fn scan_dir(abs: &Path, relpath: PathBuf, name: String) -> Result<Folder> {
     })
 }
 
+pub fn validate_folder_name(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        bail!("folder name cannot be empty");
+    }
+    if trimmed == "." || trimmed == ".." {
+        bail!("invalid folder name");
+    }
+    if trimmed.starts_with('.') {
+        bail!("folder name cannot start with '.'");
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        bail!("folder name cannot contain '/'");
+    }
+    let path = Path::new(trimmed);
+    if path.components().count() != 1 {
+        bail!("folder name cannot contain '/'");
+    }
+    if !matches!(path.components().next(), Some(Component::Normal(_))) {
+        bail!("invalid folder name");
+    }
+    Ok(())
+}
+
+/// Create a folder under `parent_relpath` (empty = library root). Returns the new folder relpath.
+pub fn create_folder(root: &Path, parent_relpath: &Path, name: &str) -> Result<PathBuf> {
+    validate_folder_name(name)?;
+    let trimmed = name.trim();
+    let dest = if parent_relpath.as_os_str().is_empty() {
+        root.join(trimmed)
+    } else {
+        root.join(parent_relpath).join(trimmed)
+    };
+    if dest.exists() {
+        bail!("{trimmed} already exists");
+    }
+    fs::create_dir(&dest).with_context(|| format!("create folder {}", dest.display()))?;
+    Ok(if parent_relpath.as_os_str().is_empty() {
+        PathBuf::from(trimmed)
+    } else {
+        parent_relpath.join(trimmed)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +204,32 @@ mod tests {
         let clips = tree.children.iter().find(|c| c.name == "Clips").unwrap();
         assert_eq!(clips.kind, Kind::Album);
         assert!(clips.children.is_empty());
+    }
+
+    #[test]
+    fn create_folder_under_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("2025")).unwrap();
+
+        let rel = create_folder(root, Path::new("2025"), "Trip").unwrap();
+        assert_eq!(rel, PathBuf::from("2025/Trip"));
+        assert!(root.join("2025/Trip").is_dir());
+
+        let tree = scan_tree(root).unwrap();
+        let y2025 = tree.children.iter().find(|c| c.name == "2025").unwrap();
+        assert!(y2025.children.iter().any(|c| c.name == "Trip"));
+    }
+
+    #[test]
+    fn create_folder_rejects_invalid_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(validate_folder_name("").is_err());
+        assert!(validate_folder_name("a/b").is_err());
+        assert!(validate_folder_name(".hidden").is_err());
+        assert!(create_folder(root, Path::new(""), "Trip").is_ok());
+        assert!(create_folder(root, Path::new(""), "Trip").is_err());
     }
 
     #[test]
