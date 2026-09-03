@@ -13,10 +13,10 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
@@ -25,6 +25,7 @@ use rusqlite::Connection;
 
 use crate::ai::{self, AskHandle};
 use crate::catalog::{self, Photo};
+use crate::delete;
 use crate::image_edit;
 use crate::index;
 use crate::library::{self, Folder, Kind};
@@ -36,7 +37,7 @@ use crate::viewer;
 /// Inner image height in rows. Width is derived from the terminal font so the photo is square.
 const CELL_INNER_H: u16 = 6;
 const STATUS_HINT: &str =
-    "arrows move · Space mark · Esc unmark · Enter opens · click toggles mark · double-click opens · type to search · r reindex · q quit";
+    "arrows move · Space mark · Esc unmark · Enter opens · click toggles mark · double-click opens · type to search · d delete · r reindex · q quit";
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +188,7 @@ struct App {
     hit: HitRegions,
     last_grid_click: Option<(usize, Instant, bool)>,
     marked: HashSet<String>,
+    pending_delete: Option<Vec<String>>,
     ask: AskAi,
 }
 
@@ -215,6 +217,7 @@ impl App {
             hit: HitRegions::default(),
             last_grid_click: None,
             marked: HashSet::new(),
+            pending_delete: None,
             ask: AskAi::new(),
         };
         app.reload_photos();
@@ -436,6 +439,17 @@ fn handle_key(
         return Ok(true);
     }
 
+    if app.pending_delete.is_some() {
+        match classify_confirm_key(key.code) {
+            ConfirmKey::Yes => confirm_pending_delete(app, terminal)?,
+            ConfirmKey::No => {
+                app.pending_delete = None;
+            }
+            ConfirmKey::Ignore => {}
+        }
+        return Ok(false);
+    }
+
     if is_shift_tab(&key) {
         app.focus = shift_tab_focus(app.focus);
         return Ok(false);
@@ -479,6 +493,9 @@ fn handle_key(
     match key.code {
         KeyCode::Char('q') if !ask_ai => return Ok(true),
         KeyCode::Char('r') if !ask_ai => reindex(app, terminal)?,
+        KeyCode::Char('d') if !delete_targets(app).is_empty() => {
+            app.pending_delete = Some(delete_targets(app));
+        }
         KeyCode::Esc => {
             if !app.marked.is_empty() {
                 app.marked.clear();
@@ -591,6 +608,30 @@ fn classify_ask_field_key(code: KeyCode, waiting: bool) -> AskFieldKey {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmKey {
+    Yes,
+    No,
+    Ignore,
+}
+
+fn classify_confirm_key(code: KeyCode) -> ConfirmKey {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => ConfirmKey::Yes,
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => ConfirmKey::No,
+        _ => ConfirmKey::Ignore,
+    }
+}
+
+fn delete_targets(app: &App) -> Vec<String> {
+    delete::delete_rels(
+        &app.photos,
+        &app.marked,
+        app.focus == Focus::Grid,
+        app.grid_idx,
+    )
+}
+
 fn ask_scroll_page(pane_height: u16) -> u16 {
     pane_height.saturating_sub(3).max(1)
 }
@@ -651,6 +692,9 @@ fn handle_mouse(
     mouse: MouseEvent,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<()> {
+    if app.pending_delete.is_some() {
+        return Ok(());
+    }
     if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
         return Ok(());
     }
@@ -961,6 +1005,20 @@ fn move_right(app: &mut App) {
     }
 }
 
+fn confirm_pending_delete(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+) -> Result<()> {
+    let Some(rels) = app.pending_delete.take() else {
+        return Ok(());
+    };
+    match delete::unlink_media(&app.root, &rels) {
+        Ok(()) => reindex(app, terminal)?,
+        Err(e) => app.status = format!("delete failed: {e:#}"),
+    }
+    Ok(())
+}
+
 fn reindex(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     app.status = "indexing…".into();
     terminal.draw(|f| draw(f, app))?;
@@ -1081,6 +1139,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .split(chunks[2]);
     draw_exif(frame, app, bottom[0]);
     draw_status(frame, app, bottom[1]);
+    if let Some(rels) = app.pending_delete.as_deref() {
+        draw_delete_confirm(frame, rels);
+    }
 }
 
 fn draw_search(frame: &mut Frame, app: &App, area: Rect, ask_ai: bool, second: Option<&str>) {
@@ -1394,6 +1455,33 @@ fn status_tools_line(viewer: &str, video: &str, thumbs: &str, agent: Option<&str
     )
 }
 
+fn draw_delete_confirm(frame: &mut Frame, rels: &[String]) {
+    let area = frame.area();
+    let width = area.width.min(52).max(28.min(area.width));
+    let height = 5.min(area.height);
+    let popup = centered_rect(width, height, area);
+    frame.render_widget(Clear, popup);
+    let text = format!("{}\n{}", delete::confirm_prompt(rels), delete::CONFIRM_HINT);
+    frame.render_widget(
+        Paragraph::new(text).alignment(Alignment::Center).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Delete")
+                .border_style(Style::default().fg(Color::LightRed)),
+        ),
+        popup,
+    );
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let viewer_name = viewer::detect()
         .map(|v| v.bin().to_string())
@@ -1661,6 +1749,18 @@ mod tests {
         assert!(STATUS_HINT.contains("Space mark"));
         assert!(STATUS_HINT.contains("Esc unmark"));
         assert!(STATUS_HINT.contains("Enter opens"));
+        assert!(STATUS_HINT.contains("d delete"));
+    }
+
+    #[test]
+    fn confirm_overlay_keys_are_yes_no_or_ignored() {
+        assert_eq!(classify_confirm_key(KeyCode::Char('y')), ConfirmKey::Yes);
+        assert_eq!(classify_confirm_key(KeyCode::Char('Y')), ConfirmKey::Yes);
+        assert_eq!(classify_confirm_key(KeyCode::Char('n')), ConfirmKey::No);
+        assert_eq!(classify_confirm_key(KeyCode::Char('N')), ConfirmKey::No);
+        assert_eq!(classify_confirm_key(KeyCode::Esc), ConfirmKey::No);
+        assert_eq!(classify_confirm_key(KeyCode::Char('d')), ConfirmKey::Ignore);
+        assert_eq!(classify_confirm_key(KeyCode::Enter), ConfirmKey::Ignore);
     }
 
     #[test]
