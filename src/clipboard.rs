@@ -75,10 +75,24 @@ impl Clipboard {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PastedItem {
+    pub src: String,
+    pub dest: String,
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasteResult {
-    pub pasted: Vec<String>,
+    pub items: Vec<PastedItem>,
     pub skipped: usize,
     pub same_album_cut: bool,
+}
+
+impl PasteResult {
+    /// Destination relpaths in paste order (compat helper for focus/UI).
+    pub fn pasted(&self) -> Vec<String> {
+        self.items.iter().map(|item| item.dest.clone()).collect()
+    }
 }
 
 pub fn copied_message(n: usize) -> String {
@@ -124,7 +138,7 @@ pub fn paste_into(
         && same_location_cut(root, clipboard, dest_files, dest_folders)
     {
         return Ok(PasteResult {
-            pasted: Vec::new(),
+            items: Vec::new(),
             skipped: 0,
             same_album_cut: true,
         });
@@ -138,20 +152,29 @@ pub fn paste_into(
     fs::create_dir_all(dest_album_dir(&root, dest_folders))
         .with_context(|| format!("create folder {}", dest_folders))?;
 
-    let mut pasted = Vec::new();
+    let mut items = Vec::new();
     let mut skipped = 0;
     let cut = clipboard.op == ClipboardOp::Cut;
     for rel in &clipboard.rels {
         let src = root.join(rel);
         if src.is_dir() {
-            pasted.push(paste_folder(&root, rel, &src, dest_folders, cut)?);
+            let dest = paste_folder(&root, rel, &src, dest_folders, cut)?;
+            items.push(PastedItem {
+                src: rel.clone(),
+                dest,
+                is_dir: true,
+            });
         } else if src.is_file() {
             let Some(dest_album) = dest_files else {
                 skipped += 1;
                 continue;
             };
             match paste_file(&root, rel, &src, dest_album, cut)? {
-                Some(dest_rel) => pasted.push(dest_rel),
+                Some(dest_rel) => items.push(PastedItem {
+                    src: rel.clone(),
+                    dest: dest_rel,
+                    is_dir: false,
+                }),
                 None => skipped += 1,
             }
         } else {
@@ -159,7 +182,7 @@ pub fn paste_into(
         }
     }
     Ok(PasteResult {
-        pasted,
+        items,
         skipped,
         same_album_cut: false,
     })
@@ -618,7 +641,7 @@ mod tests {
         };
         let result = paste(&root, &clip, "Rome").unwrap();
         assert!(result.same_album_cut);
-        assert!(result.pasted.is_empty());
+        assert!(result.pasted().is_empty());
     }
 
     #[test]
@@ -632,7 +655,11 @@ mod tests {
             rels: vec!["Rome/photo.jpg".into()],
         };
         let result = paste(&root, &clip, "Paris").unwrap();
-        assert_eq!(result.pasted, vec!["Paris/photo-2.jpg"]);
+        assert_eq!(result.pasted(), vec!["Paris/photo-2.jpg"]);
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].src, "Rome/photo.jpg");
+        assert_eq!(result.items[0].dest, "Paris/photo-2.jpg");
+        assert!(!result.items[0].is_dir);
         assert!(root.join("Rome/photo.jpg").is_file());
         assert!(root.join("Paris/photo.jpg").is_file());
         assert!(root.join("Paris/photo-2.jpg").is_file());
@@ -649,7 +676,9 @@ mod tests {
             rels: vec!["Rome/IMG_1.jpg".into()],
         };
         let result = paste(&root, &clip, "Paris").unwrap();
-        assert_eq!(result.pasted, vec!["Paris/IMG_1.jpg"]);
+        assert_eq!(result.pasted(), vec!["Paris/IMG_1.jpg"]);
+        assert_eq!(result.items[0].src, "Rome/IMG_1.jpg");
+        assert!(!result.items[0].is_dir);
         assert!(root.join("Rome/IMG_1.jpg").is_file());
         assert!(root.join("Rome/IMG_1.MOV").is_file());
         assert!(root.join("Paris/IMG_1.jpg").is_file());
@@ -657,6 +686,32 @@ mod tests {
         index::index_library(&root).unwrap();
         let conn = catalog::open(&root, false).unwrap();
         assert_eq!(catalog::count(&conn).unwrap(), 2);
+    }
+
+    #[test]
+    fn paste_result_tracks_src_dest_mapping() {
+        let (_tmp, root) = mini_library();
+        write_still(&root.join("Rome/a.jpg"));
+        write_still(&root.join("Rome/b.jpg"));
+        let clip = Clipboard {
+            op: ClipboardOp::Copy,
+            rels: vec!["Rome/a.jpg".into(), "Rome".into(), "missing.jpg".into()],
+        };
+        let result = paste_into(&root, &clip, Some("Paris"), "Paris").unwrap();
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(
+            result.items[0],
+            PastedItem {
+                src: "Rome/a.jpg".into(),
+                dest: "Paris/a.jpg".into(),
+                is_dir: false,
+            }
+        );
+        assert_eq!(result.items[1].src, "Rome");
+        assert!(result.items[1].is_dir);
+        assert_eq!(result.items[1].dest, "Paris/Rome");
+        assert_eq!(result.skipped, 1);
+        assert_eq!(result.pasted(), vec!["Paris/a.jpg", "Paris/Rome"]);
     }
 
     #[test]
@@ -670,7 +725,8 @@ mod tests {
             rels: vec!["Rome/IMG_1.jpg".into()],
         };
         let result = paste(&root, &clip, "Paris").unwrap();
-        assert_eq!(result.pasted, vec!["Paris/IMG_1.jpg"]);
+        assert_eq!(result.pasted(), vec!["Paris/IMG_1.jpg"]);
+        assert_eq!(result.items[0].src, "Rome/IMG_1.jpg");
         assert!(!root.join("Rome/IMG_1.jpg").exists());
         assert!(!root.join("Rome/IMG_1.MOV").exists());
         assert!(root.join("Paris/IMG_1.jpg").is_file());
@@ -694,7 +750,7 @@ mod tests {
             rels: vec!["Rome".into()],
         };
         let result = paste_into(&root, &clip, None, "2024").unwrap();
-        assert_eq!(result.pasted, vec!["2024/Rome"]);
+        assert_eq!(result.pasted(), vec!["2024/Rome"]);
         assert!(root.join("Rome/photo.jpg").is_file());
         assert!(root.join("2024/Rome/photo.jpg").is_file());
         index::index_library(&root).unwrap();
@@ -712,7 +768,7 @@ mod tests {
             rels: vec!["Rome".into()],
         };
         let result = paste_into(&root, &clip, None, ".").unwrap();
-        assert_eq!(result.pasted, vec!["Rome-2"]);
+        assert_eq!(result.pasted(), vec!["Rome-2"]);
         assert!(root.join("Rome/a.jpg").is_file());
         assert!(root.join("Rome-2/a.jpg").is_file());
     }
@@ -729,7 +785,7 @@ mod tests {
             rels: vec!["Rome".into()],
         };
         let result = paste_into(&root, &clip, None, "2024").unwrap();
-        assert_eq!(result.pasted, vec!["2024/Rome"]);
+        assert_eq!(result.pasted(), vec!["2024/Rome"]);
         assert!(!root.join("Rome").exists());
         assert!(root.join("2024/Rome/IMG_1.jpg").is_file());
         assert!(root.join("2024/Rome/IMG_1.MOV").is_file());

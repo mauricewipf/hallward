@@ -168,6 +168,22 @@ pub fn upsert_photo(conn: &Connection, photo: &Photo) -> Result<()> {
     Ok(())
 }
 
+pub fn delete_photo(conn: &Connection, relpath: &str) -> Result<usize> {
+    Ok(conn.execute("DELETE FROM photos WHERE relpath = ?1", [relpath])?)
+}
+
+pub fn delete_under_prefix(conn: &Connection, dir_rel: &str) -> Result<usize> {
+    let escaped = dir_rel
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let like = format!("{escaped}/%");
+    Ok(conn.execute(
+        "DELETE FROM photos WHERE relpath = ?1 OR relpath LIKE ?2 ESCAPE '\\'",
+        rusqlite::params![dir_rel, like],
+    )?)
+}
+
 pub fn photos_in_album(conn: &Connection, album: &str) -> Result<Vec<Photo>> {
     let mut stmt = conn.prepare(
         "SELECT relpath, album, filename, mtime, size, captured_at, camera, width, height
@@ -253,5 +269,60 @@ mod tests {
 
         drop(open(dir.path(), true).unwrap());
         assert!(db.metadata().unwrap().len() > 0);
+    }
+
+    #[test]
+    fn delete_photo_and_prefix_do_not_overmatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(dir.path(), true).unwrap();
+        for rel in ["Rome/a.jpg", "Rome/sub/b.jpg", "Rome-2/a.jpg", "Paris/c.jpg"] {
+            upsert_photo(
+                &conn,
+                &Photo {
+                    relpath: rel.into(),
+                    album: album_relpath(rel),
+                    filename: "f".into(),
+                    mtime: 0,
+                    size: 0,
+                    captured_at: None,
+                    camera: None,
+                    width: None,
+                    height: None,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(delete_photo(&conn, "Paris/c.jpg").unwrap(), 1);
+        assert_eq!(count(&conn).unwrap(), 3);
+        assert_eq!(delete_under_prefix(&conn, "Rome").unwrap(), 2);
+        assert_eq!(count(&conn).unwrap(), 1);
+        // "Rome-2/a.jpg" must survive a "Rome" prefix delete.
+        let remaining = photos_in_album(&conn, "Rome-2").unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn delete_prefix_escapes_like_wildcards() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(dir.path(), true).unwrap();
+        for rel in ["a%b/c.jpg", "aXb/c.jpg"] {
+            upsert_photo(
+                &conn,
+                &Photo {
+                    relpath: rel.into(),
+                    album: album_relpath(rel),
+                    filename: "f".into(),
+                    mtime: 0,
+                    size: 0,
+                    captured_at: None,
+                    camera: None,
+                    width: None,
+                    height: None,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(delete_under_prefix(&conn, "a%b").unwrap(), 1);
+        assert_eq!(count(&conn).unwrap(), 1);
     }
 }

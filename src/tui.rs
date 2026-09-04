@@ -1103,17 +1103,28 @@ fn paste_clipboard(app: &mut App, terminal: &mut dyn TerminalDriver) -> Result<(
         Ok(result) if result.same_album_cut => {
             app.status = "already here".into();
         }
-        Ok(result) if result.pasted.is_empty() => {
+        Ok(result) if result.items.is_empty() => {
             app.status = "nothing to paste".into();
         }
         Ok(result) => {
             if clip.op == ClipboardOp::Cut {
                 app.clipboard = None;
             }
-            let focus = result.pasted.first().cloned();
-            reindex_focusing(app, terminal, focus.as_deref())?;
+            let focus = result.pasted().first().cloned();
+            refresh_after_paste(app, terminal, &result, &clip, focus.as_deref())?;
         }
-        Err(e) => app.status = format!("paste failed: {e:#}"),
+        Err(e) => {
+            // Partial copies may already be on disk without catalog rows.
+            // Fall back to a full scan so nothing stays invisible.
+            let msg = format!("paste failed: {e:#}");
+            match index::index_library(&app.root) {
+                Ok(stats) => app.status = format!("{msg} · {}", stats.summary()),
+                Err(ie) => app.status = format!("{msg} · index failed: {ie:#}"),
+            }
+            if let Err(e) = refresh_tree_only(app, None) {
+                app.status = format!("{} · tree scan failed: {e:#}", app.status);
+            }
+        }
     }
     Ok(())
 }
@@ -1591,6 +1602,51 @@ fn reindex_focusing(
         }
         Err(e) => app.status = format!("index failed: {e:#}"),
     }
+    match library::scan_tree(&app.root) {
+        Ok(tree) => {
+            app.full_tree = tree;
+            app.view_tree = if app.query.is_empty() {
+                app.full_tree.clone()
+            } else {
+                search::filter_tree(&app.full_tree, &app.query)
+            };
+            if let Some(rel) = focus_rel.filter(|rel| app.root.join(rel).is_dir()) {
+                focus_folder_path(app, Path::new(rel));
+            } else {
+                clamp_cursor(app);
+            }
+        }
+        Err(e) => app.status = format!("{} · tree scan failed: {e:#}", app.status),
+    }
+    app.protocols.clear();
+    if focus_rel.is_some_and(|rel| app.root.join(rel).is_dir()) {
+        app.reload_photos();
+    } else {
+        app.reload_photos_focusing(focus_rel);
+    }
+    Ok(())
+}
+
+fn refresh_after_paste(
+    app: &mut App,
+    terminal: &mut dyn TerminalDriver,
+    result: &clipboard::PasteResult,
+    clip: &clipboard::Clipboard,
+    focus_rel: Option<&str>,
+) -> Result<()> {
+    app.status = "indexing…".into();
+    terminal.redraw(app)?;
+    match index::index_pasted(&app.root, &result.items, &clip.rels, clip.op) {
+        Ok(stats) => {
+            app.status = stats.summary();
+        }
+        Err(e) => app.status = format!("index failed: {e:#}"),
+    }
+    refresh_tree_only(app, focus_rel)?;
+    Ok(())
+}
+
+fn refresh_tree_only(app: &mut App, focus_rel: Option<&str>) -> Result<()> {
     match library::scan_tree(&app.root) {
         Ok(tree) => {
             app.full_tree = tree;
