@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -14,7 +15,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
@@ -28,7 +29,7 @@ use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 use rusqlite::Connection;
 
-use crate::ai::{self, AskHandle};
+use crate::ai::{self, AskHandle, Timeouts};
 use crate::catalog::{self, Photo};
 use crate::clipboard::{self, ClipboardOp};
 use crate::credentials::{self, ResolvedKey};
@@ -37,6 +38,7 @@ use crate::image_edit;
 use crate::index;
 use crate::library::{self, Folder, Kind};
 use crate::media::{is_image, is_video};
+use crate::openrouter::PostFn;
 use crate::search;
 use crate::thumbs;
 use crate::viewer;
@@ -56,6 +58,213 @@ const DASHED_BORDER: border::Set = border::Set {
     horizontal_bottom: "╌",
 };
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
+
+/// Opens the external viewer. Production shells out to imv/Preview/mpv;
+/// tests record the playlist instead so `cargo test` never spawns a GUI.
+pub trait ViewerOpener: Send + Sync {
+    fn open(&self, files: &[PathBuf], start: usize) -> Result<()>;
+}
+
+/// Production opener: the real `viewer::open` (blocking `Command::status`).
+pub struct RealViewerOpener;
+
+impl ViewerOpener for RealViewerOpener {
+    fn open(&self, files: &[PathBuf], start: usize) -> Result<()> {
+        viewer::open(files, start)
+    }
+}
+
+/// Test opener: records `(files, start)` calls for assertions.
+pub struct FakeViewerOpener {
+    calls: Mutex<Vec<(Vec<PathBuf>, usize)>>,
+}
+
+impl FakeViewerOpener {
+    pub fn new() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn calls(&self) -> Vec<(Vec<PathBuf>, usize)> {
+        self.calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn last(&self) -> Option<(Vec<PathBuf>, usize)> {
+        self.calls().into_iter().last()
+    }
+
+    pub fn len(&self) -> usize {
+        self.calls().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for FakeViewerOpener {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ViewerOpener for FakeViewerOpener {
+    fn open(&self, files: &[PathBuf], start: usize) -> Result<()> {
+        self.calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((files.to_vec(), start));
+        Ok(())
+    }
+}
+
+/// Clock seam so double-click windows and Ask AI "Waiting..." text are
+/// deterministic in tests.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+/// Production clock: the real wall time.
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+/// Test clock: a fixed instant the test can advance manually.
+pub struct FixedClock {
+    now: Mutex<Instant>,
+}
+
+impl FixedClock {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            now: Mutex::new(now),
+        }
+    }
+
+    pub fn advance(&self, delta: Duration) {
+        let mut guard = self.now.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = *guard + delta;
+    }
+}
+
+impl Clock for FixedClock {
+    fn now(&self) -> Instant {
+        *self.now.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// Terminal abstraction so the same `App` drives a real Crossterm terminal
+/// in production and a `TestBackend` terminal in `cargo test`.
+pub trait TerminalDriver {
+    /// Render the current `App` state.
+    fn redraw(&mut self, app: &mut App) -> Result<()>;
+    /// Clear the screen (used after the external viewer returns).
+    fn clear_screen(&mut self) -> Result<()>;
+    /// Suspend the TUI, run the viewer opener, then restore the TUI.
+    /// The test driver just runs the closure without any terminal dance.
+    fn suspend_for_viewer(&mut self, run: &mut dyn FnMut() -> Result<()>) -> Result<()>;
+}
+
+/// Production driver over a live Crossterm terminal.
+pub struct CrosstermDriver<'a> {
+    terminal: &'a mut Terminal<CrosstermBackend<Stdout>>,
+}
+
+impl<'a> CrosstermDriver<'a> {
+    pub fn new(terminal: &'a mut Terminal<CrosstermBackend<Stdout>>) -> Self {
+        Self { terminal }
+    }
+}
+
+impl TerminalDriver for CrosstermDriver<'_> {
+    fn redraw(&mut self, app: &mut App) -> Result<()> {
+        self.terminal.draw(|f| draw(f, app))?;
+        Ok(())
+    }
+
+    fn clear_screen(&mut self) -> Result<()> {
+        self.terminal.clear()?;
+        Ok(())
+    }
+
+    fn suspend_for_viewer(&mut self, run: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        disable_raw_mode()?;
+        leave_tui(self.terminal.backend_mut())?;
+        self.terminal.show_cursor()?;
+        let result = run();
+        enable_raw_mode()?;
+        enter_tui(self.terminal.backend_mut())?;
+        self.terminal.clear()?;
+        result
+    }
+}
+
+/// Test driver over `ratatui::backend::TestBackend`.
+pub struct TestDriver {
+    terminal: Terminal<TestBackend>,
+}
+
+impl TestDriver {
+    pub fn new(width: u16, height: u16) -> Self {
+        let backend = TestBackend::new(width, height);
+        let terminal = Terminal::new(backend).expect("TestBackend terminal");
+        Self { terminal }
+    }
+
+    /// Full screen text, rows joined by `\n`.
+    pub fn screen_text(&self) -> String {
+        let buffer = self.terminal.backend().buffer();
+        let area = buffer.area;
+        let mut rows = Vec::new();
+        for y in area.y..area.y + area.height {
+            let mut row = String::new();
+            for x in area.x..area.x + area.width {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            rows.push(row);
+        }
+        rows.join("\n")
+    }
+
+    /// Text of a single buffer row (trailing spaces trimmed).
+    pub fn row_text(&self, y: u16) -> String {
+        let buffer = self.terminal.backend().buffer();
+        let area = buffer.area;
+        let mut row = String::new();
+        for x in area.x..area.x + area.width {
+            row.push_str(buffer[(x, y)].symbol());
+        }
+        row.trim_end().to_string()
+    }
+
+    pub fn size(&self) -> Rect {
+        self.terminal.backend().buffer().area
+    }
+}
+
+impl TerminalDriver for TestDriver {
+    fn redraw(&mut self, app: &mut App) -> Result<()> {
+        self.terminal.draw(|f| draw(f, app))?;
+        Ok(())
+    }
+
+    fn clear_screen(&mut self) -> Result<()> {
+        self.terminal.clear()?;
+        Ok(())
+    }
+
+    fn suspend_for_viewer(&mut self, run: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        run()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Focus {
@@ -212,7 +421,7 @@ fn leave_tui<W: std::io::Write>(out: &mut W) -> Result<()> {
     Ok(())
 }
 
-struct App {
+pub struct App {
     root: PathBuf,
     conn: Connection,
     full_tree: Folder,
@@ -241,10 +450,21 @@ struct App {
     /// Screen cells where an OSC 8 URL was painted outside ratatui's buffer.
     gemini_url_written: Option<Rect>,
     ask: AskAi,
+    viewer: Arc<dyn ViewerOpener>,
+    clock: Arc<dyn Clock>,
+    ask_post: PostFn,
 }
 
 impl App {
     fn new(root: PathBuf) -> Result<Self> {
+        Self::new_with(root, Arc::new(RealViewerOpener), Arc::new(SystemClock))
+    }
+
+    fn new_with(
+        root: PathBuf,
+        viewer: Arc<dyn ViewerOpener>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
         let conn = catalog::open(&root, false)?;
         let full_tree = library::scan_tree(&root)?;
         let view_tree = full_tree.clone();
@@ -276,6 +496,9 @@ impl App {
             gemini_url_rect: None,
             gemini_url_written: None,
             ask: AskAi::new(),
+            viewer,
+            clock,
+            ask_post: image_edit::post_openrouter,
         };
         app.reload_photos();
         Ok(app)
@@ -353,8 +576,16 @@ impl App {
         }
         self.pending_ask = None;
         self.gemini_key_overlay = None;
-        self.ask.waiting_from = Some(Instant::now());
-        self.ask.job = Some(ai::spawn(generation, prompt, files, self.root.clone(), key));
+        self.ask.waiting_from = Some(self.clock.now());
+        self.ask.job = Some(ai::spawn_with(
+            generation,
+            prompt,
+            files,
+            self.root.clone(),
+            key,
+            Timeouts::default(),
+            self.ask_post,
+        ));
     }
 
     fn dismiss_gemini_key_overlay(&mut self) {
@@ -515,6 +746,11 @@ impl App {
 }
 
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+    let mut driver = CrosstermDriver::new(terminal);
+    event_loop_with(&mut driver, app)
+}
+
+fn event_loop_with(driver: &mut dyn TerminalDriver, app: &mut App) -> Result<()> {
     loop {
         app.sync_ask_selection();
         app.poll_ask();
@@ -523,7 +759,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
                 erase_gemini_url_hyperlink(rect);
             }
         }
-        terminal.draw(|f| draw(f, app))?;
+        driver.redraw(app)?;
         if app.gemini_key_overlay.is_some() {
             if let Some(rect) = app.gemini_url_rect {
                 paint_gemini_url_hyperlink(rect);
@@ -535,7 +771,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         }
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if handle_key(app, key, terminal)? {
+                if handle_key(app, key, driver)? {
                     break;
                 }
             }
@@ -546,7 +782,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
                 append_create_folder_input(app, &text);
             }
             Event::Mouse(mouse) => {
-                handle_mouse(app, mouse, terminal)?;
+                handle_mouse(app, mouse, driver)?;
             }
             Event::Resize(_, _) => {}
             _ => {}
@@ -555,11 +791,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
     Ok(())
 }
 
-fn handle_key(
-    app: &mut App,
-    key: KeyEvent,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-) -> Result<bool> {
+fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut dyn TerminalDriver) -> Result<bool> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
     }
@@ -717,7 +949,7 @@ fn handle_ask_ai_key(app: &mut App, code: KeyCode) {
         | AskFieldKey::PageDown => {
             let max = ask_scroll_max(
                 &app.ask.prompt,
-                app.ask.second_paragraph(Instant::now()).as_deref(),
+                app.ask.second_paragraph(app.clock.now()).as_deref(),
                 app.hit.search,
             );
             let page = ask_scroll_page(app.hit.search.height);
@@ -854,7 +1086,7 @@ fn absorb_marks_into_clipboard(app: &mut App) {
     app.sync_ask_selection();
 }
 
-fn paste_clipboard(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+fn paste_clipboard(app: &mut App, terminal: &mut dyn TerminalDriver) -> Result<()> {
     absorb_marks_into_clipboard(app);
     let Some(clip) = app.clipboard.clone() else {
         return Ok(());
@@ -941,11 +1173,7 @@ fn shift_tab_focus(from: Focus) -> Focus {
     }
 }
 
-fn handle_mouse(
-    app: &mut App,
-    mouse: MouseEvent,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-) -> Result<()> {
+fn handle_mouse(app: &mut App, mouse: MouseEvent, terminal: &mut dyn TerminalDriver) -> Result<()> {
     if app.pending_delete.is_some()
         || app.gemini_key_overlay.is_some()
         || app.create_folder_overlay.is_some()
@@ -974,7 +1202,7 @@ fn handle_mouse(
 
     if let Some(hit) = app.hit.grid {
         if let Some(idx) = grid_index_at(hit, pos, app.photos.len()) {
-            let now = Instant::now();
+            let now = app.clock.now();
             let last = app.last_grid_click.map(|(i, t, _)| (i, t));
             if is_double_click(last, idx, now, DOUBLE_CLICK) {
                 let was_marked = app.last_grid_click.map(|(_, _, m)| m).unwrap_or(false);
@@ -1335,10 +1563,7 @@ fn move_right(app: &mut App) {
     }
 }
 
-fn confirm_pending_delete(
-    app: &mut App,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-) -> Result<()> {
+fn confirm_pending_delete(app: &mut App, terminal: &mut dyn TerminalDriver) -> Result<()> {
     let Some(rels) = app.pending_delete.take() else {
         return Ok(());
     };
@@ -1349,17 +1574,17 @@ fn confirm_pending_delete(
     Ok(())
 }
 
-fn reindex(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+fn reindex(app: &mut App, terminal: &mut dyn TerminalDriver) -> Result<()> {
     reindex_focusing(app, terminal, None)
 }
 
 fn reindex_focusing(
     app: &mut App,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut dyn TerminalDriver,
     focus_rel: Option<&str>,
 ) -> Result<()> {
     app.status = "indexing…".into();
-    terminal.draw(|f| draw(f, app))?;
+    terminal.redraw(app)?;
     match index::index_library(&app.root) {
         Ok(stats) => {
             app.status = stats.summary();
@@ -1410,7 +1635,7 @@ fn clamp_cursor(app: &mut App) {
     }
 }
 
-fn open_viewer(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+fn open_viewer(app: &mut App, terminal: &mut dyn TerminalDriver) -> Result<()> {
     if app.photos.is_empty() {
         app.status = "no photos in this album".into();
         return Ok(());
@@ -1421,14 +1646,12 @@ fn open_viewer(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>)
         return Ok(());
     }
     let files = viewer::abs_files(&app.root, &rels);
-
-    disable_raw_mode()?;
-    leave_tui(terminal.backend_mut())?;
-    terminal.show_cursor()?;
-    let open = viewer::open(&files, start);
-    enable_raw_mode()?;
-    enter_tui(terminal.backend_mut())?;
-    terminal.clear()?;
+    let viewer = app.viewer.clone();
+    let open = {
+        let mut run = || viewer.open(&files, start);
+        terminal.suspend_for_viewer(&mut run)
+    };
+    terminal.clear_screen()?;
     match open {
         Ok(()) => {
             app.status = STATUS_HINT.into();
@@ -1442,7 +1665,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
     app.hit = HitRegions::default();
     let area = frame.area();
     let ask = app.ask_active();
-    let second = app.ask.second_paragraph(Instant::now());
+    let now = app.clock.now();
+    let second = app.ask.second_paragraph(now);
     let top_h = ai::search_pane_height(ask, &app.ask.prompt, second.as_deref(), area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2301,6 +2525,172 @@ fn square_cell_size(font_w: u16, font_h: u16, inner_h: u16) -> (u16, u16) {
         inner_w.saturating_add(2).max(3),
         inner_h.saturating_add(2).max(3),
     )
+}
+
+//---------------------------------------------------------------------------
+// Reusable headless e2e test API. Production `run()` is unaffected: it keeps
+// using `RealViewerOpener`, `SystemClock`, and `post_openrouter`.
+//---------------------------------------------------------------------------
+
+impl App {
+    /// Headless constructor for integration tests: fixed font-size picker
+    /// (no TTY query like `Picker::from_query_stdio`), injectable viewer,
+    /// clock, and Ask AI transport.
+    pub fn new_for_test(
+        root: PathBuf,
+        viewer: Arc<dyn ViewerOpener>,
+        clock: Arc<dyn Clock>,
+        ask_post: PostFn,
+    ) -> Result<Self> {
+        let mut app = Self::new_with(root, viewer, clock)?;
+        app.ask_post = ask_post;
+        app.picker = Some(Picker::from_fontsize((10, 20)));
+        Ok(app)
+    }
+
+    /// Drive one key event through the same `handle_key` as production.
+    /// Returns `true` when the app requests quit (q / Ctrl-C).
+    pub fn test_key(&mut self, key: KeyEvent, driver: &mut dyn TerminalDriver) -> Result<bool> {
+        handle_key(self, key, driver)
+    }
+
+    /// Drive one left mouse click at the given screen cell.
+    pub fn test_mouse(
+        &mut self,
+        column: u16,
+        row: u16,
+        driver: &mut dyn TerminalDriver,
+    ) -> Result<()> {
+        handle_mouse(
+            self,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            driver,
+        )
+    }
+
+    /// Click the grid cell showing photo `idx`. Redraw first so hit regions
+    /// are populated. Returns `false` when the photo is not on screen.
+    pub fn click_grid_photo(
+        &mut self,
+        idx: usize,
+        driver: &mut dyn TerminalDriver,
+    ) -> Result<bool> {
+        let Some(hit) = self.hit.grid else {
+            return Ok(false);
+        };
+        if idx >= self.photos.len() || idx < hit.scroll_first {
+            return Ok(false);
+        }
+        let n = idx - hit.scroll_first;
+        let col = n % hit.cols.max(1);
+        let row = n / hit.cols.max(1);
+        if hit.cell_w == 0 || hit.cell_h == 0 {
+            return Ok(false);
+        }
+        let column = hit.inner.x + col as u16 * hit.cell_w + hit.cell_w / 2;
+        let row = hit.inner.y + row as u16 * hit.cell_h + hit.cell_h / 2;
+        if !hit.inner.contains(Position { x: column, y: row }) {
+            return Ok(false);
+        }
+        self.test_mouse(column, row, driver)?;
+        Ok(true)
+    }
+
+    /// Pump one pending Ask AI outcome (the job runs on a background thread).
+    pub fn pump_ask(&mut self) {
+        self.poll_ask();
+    }
+
+    pub fn redraw_for_test(&mut self, driver: &mut dyn TerminalDriver) -> Result<()> {
+        driver.redraw(self)
+    }
+
+    // -- semantic state readers for assertions --------------------------
+
+    pub fn focus_name(&self) -> &'static str {
+        match self.focus {
+            Focus::Search => "search",
+            Focus::Miller => "miller",
+            Focus::Grid => "grid",
+        }
+    }
+
+    pub fn grid_index(&self) -> usize {
+        self.grid_idx
+    }
+
+    pub fn photo_count(&self) -> usize {
+        self.photos.len()
+    }
+
+    pub fn photo_rels(&self) -> Vec<String> {
+        self.photos.iter().map(|p| p.relpath.clone()).collect()
+    }
+
+    pub fn marked_sorted(&self) -> Vec<String> {
+        let mut marked: Vec<String> = self.marked.iter().cloned().collect();
+        marked.sort();
+        marked
+    }
+
+    pub fn is_marked(&self, rel: &str) -> bool {
+        self.marked.contains(rel)
+    }
+
+    pub fn status_text(&self) -> String {
+        self.status.clone()
+    }
+
+    pub fn query_text(&self) -> String {
+        self.query.clone()
+    }
+
+    pub fn ask_prompt_text(&self) -> String {
+        self.ask.prompt.clone()
+    }
+
+    pub fn ask_reply_text(&self) -> Option<String> {
+        match &self.ask.reply {
+            Some(AskReply::Text(t) | AskReply::Error(t)) => Some(t.clone()),
+            None => None,
+        }
+    }
+
+    pub fn ask_waiting(&self) -> bool {
+        self.ask.waiting()
+    }
+
+    pub fn is_ask_active(&self) -> bool {
+        self.ask_active()
+    }
+
+    pub fn clipboard_rels(&self) -> Vec<String> {
+        self.clipboard
+            .as_ref()
+            .map(|c| {
+                let mut rels = c.rels.clone();
+                rels.sort();
+                rels
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn pending_delete_rels(&self) -> Vec<String> {
+        self.pending_delete.clone().unwrap_or_default()
+    }
+
+    pub fn current_album_name(&self) -> Option<String> {
+        self.current_album().map(|f| f.display_name().to_string())
+    }
+
+    pub fn clock_now(&self) -> Instant {
+        self.clock.now()
+    }
 }
 
 #[cfg(test)]
