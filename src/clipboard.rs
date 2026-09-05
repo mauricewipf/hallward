@@ -223,6 +223,8 @@ fn paste_file(
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow::anyhow!("could not paste {rel}"))?;
     let companions = delete::live_motion_paths_for_still(src);
+    let mut companions = companions;
+    companions.extend(delete::raw_dng_paths_for_still(src));
     let (dest, companion_dests) = plan_dest(&dest_dir, filename, &companions)?;
     ensure_inside(root, &dest)?;
     transfer_file(src, &dest, cut)?;
@@ -663,6 +665,33 @@ mod tests {
         assert!(root.join("Rome/photo.jpg").is_file());
         assert!(root.join("Paris/photo.jpg").is_file());
         assert!(root.join("Paris/photo-2.jpg").is_file());
+    }
+
+    #[test]
+    fn copy_keeps_still_and_dng_twin_in_both_albums() {
+        let (_tmp, root) = mini_library();
+        write_still(&root.join("Rome/DSC_1.jpg"));
+        fs::write(root.join("Rome/DSC_1.DNG"), b"dng").unwrap();
+        index::index_library(&root).unwrap();
+        let clip = Clipboard {
+            op: ClipboardOp::Copy,
+            rels: vec!["Rome/DSC_1.jpg".into()],
+        };
+        let result = paste(&root, &clip, "Paris").unwrap();
+        assert_eq!(result.pasted(), vec!["Paris/DSC_1.jpg"]);
+        assert!(root.join("Rome/DSC_1.jpg").is_file());
+        assert!(root.join("Rome/DSC_1.DNG").is_file());
+        assert!(root.join("Paris/DSC_1.jpg").is_file());
+        assert!(root.join("Paris/DSC_1.DNG").is_file());
+        index::index_library(&root).unwrap();
+        let conn = catalog::open(&root, false).unwrap();
+        assert_eq!(catalog::count(&conn).unwrap(), 2);
+        let paris = catalog::photos_in_album(&conn, "Paris").unwrap();
+        assert_eq!(paris.len(), 1);
+        assert_eq!(
+            paris[0].raw_relpath.as_deref(),
+            Some("Paris/DSC_1.DNG")
+        );
     }
 
     #[test]

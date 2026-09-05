@@ -1,5 +1,5 @@
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub const IMAGE_EXTS: &[&str] = &[
@@ -10,6 +10,11 @@ pub const VIDEO_EXTS: &[&str] = &["mov", "mp4"];
 
 const LIVE_STILL_EXT_VARIANTS: &[&str] =
     &["heic", "HEIC", "heif", "HEIF", "jpg", "JPG", "jpeg", "JPEG"];
+
+/// Developed still extensions that pair with a same-stem DNG twin.
+const JPEG_DNG_STILL_EXT_VARIANTS: &[&str] = &["jpg", "JPG", "jpeg", "JPEG"];
+
+const DNG_EXT_VARIANTS: &[&str] = &["dng", "DNG"];
 
 pub fn is_image(path: &Path) -> bool {
     ext_in(path, IMAGE_EXTS)
@@ -99,6 +104,80 @@ fn probe_content_identifier(path: &Path) -> anyhow::Result<Option<String>> {
 }
 
 /// Same-stem still sibling (`<stem>.{heic,heif,jpg,jpeg}`), case variants on the extension.
+/// True when `stem` names an AI edit sidecar (`{stem}-edited`, `{stem}-edited-N`).
+pub fn is_edited_sidecar_stem(stem: &str) -> bool {
+    stem.ends_with("-edited") || stem.contains("-edited-")
+}
+
+/// True when `path` is a JPEG with a same-stem DNG sibling in the same folder.
+pub fn is_jpeg_dng_developed_still(path: &Path) -> bool {
+    if !is_jpeg_dng_still(path) {
+        return false;
+    }
+    dng_twin_for_still(path).is_some()
+}
+
+/// True when `path` is a DNG that should not be indexed (JPEG twin exists).
+pub fn is_dng_raw_companion(path: &Path) -> bool {
+    if !is_dng(path) {
+        return false;
+    }
+    jpeg_dng_still_for_raw(path).is_some()
+}
+
+fn is_jpeg_dng_still(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if stem.is_empty() || is_edited_sidecar_stem(stem) {
+        return false;
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| JPEG_DNG_STILL_EXT_VARIANTS.iter().any(|v| ext == *v))
+        .unwrap_or(false)
+}
+
+/// Same-stem DNG sibling for a developed JPEG still, if present.
+pub fn dng_twin_for_still(still: &Path) -> Option<PathBuf> {
+    if !is_jpeg_dng_still(still) {
+        return None;
+    }
+    let parent = still.parent()?;
+    let stem = still.file_stem()?.to_str()?;
+    dng_at_stem(parent, stem)
+}
+
+/// Same-stem JPEG sibling for a DNG raw file, if present.
+pub fn jpeg_dng_still_for_raw(raw: &Path) -> Option<PathBuf> {
+    let parent = raw.parent()?;
+    let stem = raw.file_stem()?.to_str()?;
+    if stem.is_empty() || is_edited_sidecar_stem(stem) {
+        return None;
+    }
+    jpeg_dng_still_at_stem(parent, stem)
+}
+
+fn dng_at_stem(parent: &Path, stem: &str) -> Option<PathBuf> {
+    for ext in DNG_EXT_VARIANTS {
+        let candidate = parent.join(format!("{stem}.{ext}"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn jpeg_dng_still_at_stem(parent: &Path, stem: &str) -> Option<PathBuf> {
+    for ext in JPEG_DNG_STILL_EXT_VARIANTS {
+        let candidate = parent.join(format!("{stem}.{ext}"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 pub fn live_photo_companion_by_stem(path: &Path) -> bool {
     let Some(parent) = path.parent() else {
         return false;
@@ -200,5 +279,50 @@ mod tests {
         assert!(live_photo_companion_by_stem(
             &dir.path().join("img_1234.MOV")
         ));
+    }
+
+    #[test]
+    fn jpeg_dng_twins_pair_by_same_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        File::create(dir.path().join("DSC_0001.JPG")).unwrap();
+        File::create(dir.path().join("DSC_0001.DNG")).unwrap();
+        let jpg = dir.path().join("DSC_0001.JPG");
+        let dng = dir.path().join("DSC_0001.DNG");
+        assert!(is_jpeg_dng_developed_still(&jpg));
+        assert!(is_dng_raw_companion(&dng));
+        assert_eq!(dng_twin_for_still(&jpg).unwrap(), dng);
+        assert_eq!(jpeg_dng_still_for_raw(&dng).unwrap(), jpg);
+    }
+
+    #[test]
+    fn jpeg_dng_skips_edited_sidecar_stems() {
+        let dir = tempfile::tempdir().unwrap();
+        File::create(dir.path().join("DSC_0001-edited.jpg")).unwrap();
+        File::create(dir.path().join("DSC_0001.DNG")).unwrap();
+        let edited = dir.path().join("DSC_0001-edited.jpg");
+        assert!(!is_jpeg_dng_developed_still(&edited));
+        assert!(dng_twin_for_still(&edited).is_none());
+    }
+
+    #[test]
+    fn standalone_dng_is_not_a_companion() {
+        let dir = tempfile::tempdir().unwrap();
+        File::create(dir.path().join("solo.DNG")).unwrap();
+        assert!(!is_dng_raw_companion(&dir.path().join("solo.DNG")));
+    }
+
+    #[test]
+    fn standalone_dng_does_not_twin_with_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = dir.path().join("orphan.DNG");
+        File::create(&orphan).unwrap();
+        assert!(dng_twin_for_still(&orphan).is_none());
+    }
+
+    #[test]
+    fn standalone_jpeg_without_dng_is_not_paired() {
+        let dir = tempfile::tempdir().unwrap();
+        File::create(dir.path().join("solo.jpg")).unwrap();
+        assert!(!is_jpeg_dng_developed_still(&dir.path().join("solo.jpg")));
     }
 }

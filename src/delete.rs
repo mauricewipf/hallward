@@ -9,7 +9,7 @@ use walkdir::WalkDir;
 
 use crate::catalog::Photo;
 use crate::library::ALBUM_DIR;
-use crate::media::{is_hidden, is_image, is_media_ext, VIDEO_EXTS};
+use crate::media::{self, is_hidden, is_image, is_media_ext, VIDEO_EXTS};
 use crate::thumbs;
 
 pub fn delete_rels(
@@ -69,6 +69,7 @@ pub fn paths_to_unlink(root: &Path, rels: &[String]) -> Vec<PathBuf> {
         out.push(abs.clone());
         out.push(thumbs::thumb_path(root, rel));
         out.extend(live_motion_paths_for_still(&abs));
+        out.extend(raw_dng_paths_for_still(&abs));
     }
     out
 }
@@ -122,6 +123,12 @@ pub(crate) fn live_motion_paths_for_still(still: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+pub(crate) fn raw_dng_paths_for_still(still: &Path) -> Vec<PathBuf> {
+    media::dng_twin_for_still(still)
+        .map(|path| vec![path.canonicalize().unwrap_or(path)])
+        .unwrap_or_default()
 }
 
 fn check_rel(rel: &str) -> Result<()> {
@@ -213,6 +220,7 @@ mod tests {
             camera: None,
             width: None,
             height: None,
+            raw_relpath: None,
         }
     }
 
@@ -304,6 +312,47 @@ mod tests {
         assert!(paths
             .iter()
             .any(|p| p.starts_with(thumbs::thumbs_dir(dir.path()))));
+    }
+
+    #[test]
+    fn paths_to_unlink_include_dng_twin() {
+        let dir = tempfile::tempdir().unwrap();
+        let still = dir.path().join("Rome/DSC_1.jpg");
+        fs::create_dir_all(still.parent().unwrap()).unwrap();
+        fs::write(&still, b"still").unwrap();
+        fs::write(dir.path().join("Rome/DSC_1.DNG"), b"dng").unwrap();
+        let paths = paths_to_unlink(dir.path(), &["Rome/DSC_1.jpg".into()]);
+        assert!(paths.iter().any(|p| p.ends_with("Rome/DSC_1.jpg")));
+        assert!(paths.iter().any(|p| p
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("DSC_1.DNG"))));
+    }
+
+    #[test]
+    fn unlink_then_reindex_drops_still_and_dng_twin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("library");
+        let album = root.join("Rome");
+        fs::create_dir_all(&album).unwrap();
+        catalog::open(&root, true).unwrap();
+        let still = album.join("DSC_1.jpg");
+        RgbImage::from_pixel(32, 24, Rgb([10, 20, 30]))
+            .save(&still)
+            .unwrap();
+        fs::write(album.join("DSC_1.DNG"), b"dng").unwrap();
+        index::index_library(&root).unwrap();
+        {
+            let conn = catalog::open(&root, false).unwrap();
+            assert_eq!(catalog::count(&conn).unwrap(), 1);
+        }
+
+        unlink_media(&root, &["Rome/DSC_1.jpg".into()]).unwrap();
+        assert!(!still.exists());
+        assert!(!album.join("DSC_1.DNG").exists());
+
+        index::index_library(&root).unwrap();
+        let conn = catalog::open(&root, false).unwrap();
+        assert_eq!(catalog::count(&conn).unwrap(), 0);
     }
 
     #[test]
