@@ -37,6 +37,23 @@ enum Cmd {
     Init,
     /// Re-scan files and refresh thumbnails
     Index,
+    /// Manage OpenRouter API credentials
+    Credentials {
+        #[command(subcommand)]
+        cmd: CredentialsCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CredentialsCmd {
+    /// Write OpenRouter API key to ~/.config/hallward/credentials
+    Set {
+        /// Copy HALLWARD_OPENROUTER_API_KEY into the credentials file
+        #[arg(long)]
+        from_env: bool,
+    },
+    /// Remove the credentials file
+    Clear,
 }
 
 pub fn run() -> Result<()> {
@@ -54,6 +71,7 @@ pub fn run() -> Result<()> {
             let stats = index_with_progress(&root)?;
             println!("{}", stats.summary());
         }
+        Some(Cmd::Credentials { cmd }) => run_credentials(cmd)?,
         None => {
             let root = if cli.root.is_some() {
                 start
@@ -91,6 +109,27 @@ fn init_with_progress(root: &std::path::Path) -> Result<index::IndexStats> {
             Err(err)
         }
     }
+}
+
+fn run_credentials(cmd: CredentialsCmd) -> Result<()> {
+    match cmd {
+        CredentialsCmd::Set { from_env } => {
+            let key = if from_env {
+                std::env::var("HALLWARD_OPENROUTER_API_KEY")
+                    .map_err(|_| anyhow::anyhow!("HALLWARD_OPENROUTER_API_KEY is not set."))?
+            } else {
+                credentials::read_secret_from_stdin().map_err(anyhow::Error::msg)?
+            };
+            credentials::set_key(&key).map_err(anyhow::Error::msg)?;
+            let path = credentials::credentials_path().map_err(anyhow::Error::msg)?;
+            eprintln!("Saved OpenRouter credentials to {}.", path.display());
+        }
+        CredentialsCmd::Clear => {
+            credentials::clear().map_err(anyhow::Error::msg)?;
+            eprintln!("Removed OpenRouter credentials.");
+        }
+    }
+    Ok(())
 }
 
 fn index_with_progress(root: &std::path::Path) -> Result<index::IndexStats> {

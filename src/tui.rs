@@ -1,12 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::cursor::MoveTo;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -32,7 +30,7 @@ use rusqlite::Connection;
 use crate::ai::{self, AskHandle, Timeouts};
 use crate::catalog::{self, Photo};
 use crate::clipboard::{self, ClipboardOp};
-use crate::credentials::{self, ResolvedKey};
+use crate::credentials::{self, CredentialIssue, ResolvedKey};
 use crate::delete;
 use crate::image_edit;
 use crate::index;
@@ -297,8 +295,7 @@ struct PendingAsk {
     generation: u64,
 }
 
-struct ApiKeyOverlay {
-    input: String,
+struct CredentialsOverlay {
     error: Option<String>,
 }
 
@@ -444,11 +441,8 @@ pub struct App {
     pending_delete: Option<Vec<String>>,
     clipboard: Option<clipboard::Clipboard>,
     pending_ask: Option<PendingAsk>,
-    api_key_overlay: Option<ApiKeyOverlay>,
+    credentials_overlay: Option<CredentialsOverlay>,
     create_folder_overlay: Option<CreateFolderOverlay>,
-    api_key_url_rect: Option<Rect>,
-    /// Screen cells where an OSC 8 URL was painted outside ratatui's buffer.
-    api_key_url_written: Option<Rect>,
     ask: AskAi,
     viewer: Arc<dyn ViewerOpener>,
     clock: Arc<dyn Clock>,
@@ -491,10 +485,8 @@ impl App {
             pending_delete: None,
             clipboard: None,
             pending_ask: None,
-            api_key_overlay: None,
+            credentials_overlay: None,
             create_folder_overlay: None,
-            api_key_url_rect: None,
-            api_key_url_written: None,
             ask: AskAi::new(),
             viewer,
             clock,
@@ -536,7 +528,7 @@ impl App {
             }
             Ok(ai::AskValue::Saved(saved)) => {
                 self.pending_ask = None;
-                self.api_key_overlay = None;
+                self.credentials_overlay = None;
                 self.focus_saved_edit(&saved.relpath);
                 let message = image_edit::saved_message(&saved.filename);
                 self.status = message.clone();
@@ -551,14 +543,16 @@ impl App {
                         files,
                         generation: self.ask.generation,
                     });
-                    self.api_key_overlay = Some(ApiKeyOverlay {
-                        input: String::new(),
-                        error: Some("OpenRouter rejected that key. Paste a new one.".into()),
+                    self.credentials_overlay = Some(CredentialsOverlay {
+                        error: Some(
+                            "OpenRouter rejected the saved key. Run `hallward credentials set` again."
+                                .into(),
+                        ),
                     });
                     return;
                 }
                 self.pending_ask = None;
-                self.api_key_overlay = None;
+                self.credentials_overlay = None;
                 self.ask.reply = Some(AskReply::Error(err));
             }
         }
@@ -575,7 +569,7 @@ impl App {
             return;
         }
         self.pending_ask = None;
-        self.api_key_overlay = None;
+        self.credentials_overlay = None;
         self.ask.waiting_from = Some(self.clock.now());
         self.ask.job = Some(ai::spawn_with(
             generation,
@@ -588,9 +582,9 @@ impl App {
         ));
     }
 
-    fn dismiss_api_key_overlay(&mut self) {
+    fn dismiss_credentials_overlay(&mut self) {
         self.pending_ask = None;
-        self.api_key_overlay = None;
+        self.credentials_overlay = None;
     }
 
     fn send_ask(&mut self) {
@@ -620,10 +614,7 @@ impl App {
                 files,
                 generation,
             });
-            self.api_key_overlay = Some(ApiKeyOverlay {
-                input: String::new(),
-                error: None,
-            });
+            self.credentials_overlay = Some(CredentialsOverlay { error: None });
         }
     }
 
@@ -754,18 +745,7 @@ fn event_loop_with(driver: &mut dyn TerminalDriver, app: &mut App) -> Result<()>
     loop {
         app.sync_ask_selection();
         app.poll_ask();
-        if app.api_key_overlay.is_none() {
-            if let Some(rect) = app.api_key_url_written.take() {
-                erase_api_key_url_hyperlink(rect);
-            }
-        }
         driver.redraw(app)?;
-        if app.api_key_overlay.is_some() {
-            if let Some(rect) = app.api_key_url_rect {
-                paint_api_key_url_hyperlink(rect);
-                app.api_key_url_written = Some(rect);
-            }
-        }
         if !event::poll(Duration::from_millis(200))? {
             continue;
         }
@@ -774,9 +754,6 @@ fn event_loop_with(driver: &mut dyn TerminalDriver, app: &mut App) -> Result<()>
                 if handle_key(app, key, driver)? {
                     break;
                 }
-            }
-            Event::Paste(text) if app.api_key_overlay.is_some() => {
-                append_api_key_input(app, &text);
             }
             Event::Paste(text) if app.create_folder_overlay.is_some() => {
                 append_create_folder_input(app, &text);
@@ -796,8 +773,8 @@ fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut dyn TerminalDriver) -
         return Ok(true);
     }
 
-    if app.api_key_overlay.is_some() {
-        handle_api_key_overlay_key(app, key);
+    if app.credentials_overlay.is_some() {
+        handle_credentials_overlay_key(app, key);
         return Ok(false);
     }
 
@@ -1186,7 +1163,7 @@ fn shift_tab_focus(from: Focus) -> Focus {
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent, terminal: &mut dyn TerminalDriver) -> Result<()> {
     if app.pending_delete.is_some()
-        || app.api_key_overlay.is_some()
+        || app.credentials_overlay.is_some()
         || app.create_folder_overlay.is_some()
     {
         return Ok(());
@@ -1768,10 +1745,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(rels) = app.pending_delete.as_deref() {
         draw_delete_confirm(frame, &app.root, rels);
     }
-    if app.api_key_overlay.is_some() {
-        draw_api_key_overlay(frame, app);
-    } else {
-        app.api_key_url_rect = None;
+    if app.credentials_overlay.is_some() {
+        draw_credentials_overlay(frame, app);
     }
     if app.create_folder_overlay.is_some() {
         draw_create_folder_overlay(frame, app);
@@ -2126,22 +2101,38 @@ fn draw_delete_confirm(frame: &mut Frame, root: &Path, rels: &[String]) {
     );
 }
 
-const API_KEY_URL: &str = "https://openrouter.ai/keys";
+const CREDENTIALS_BIND: &str = "Esc — back to grid";
 
-const API_KEY_HINT: &str = "Photos are sent to OpenRouter and may use paid quota.\n\
-Paste a key from\n\
-https://openrouter.ai/keys";
+fn credentials_setup_body() -> String {
+    let path = credentials::credentials_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "~/.config/hallward/credentials".into());
+    format!(
+        "Photos are sent to OpenRouter and may use paid quota.\n\n\
+         Run:\n  hallward credentials set\n\n\
+         Or set HALLWARD_OPENROUTER_API_KEY.\n\n\
+         Credentials file:\n  {path}"
+    )
+}
 
-const API_KEY_BIND: &str = "Ctrl+o open URL · Enter save · Esc cancel";
+fn credentials_insecure_body(chmod_hint: &str) -> String {
+    format!("Credentials file permissions are too open.\n\nRun:\n  {chmod_hint}")
+}
 
-fn draw_api_key_overlay(frame: &mut Frame, app: &mut App) {
-    let Some(overlay) = app.api_key_overlay.as_ref() else {
-        app.api_key_url_rect = None;
+fn draw_credentials_overlay(frame: &mut Frame, app: &App) {
+    let Some(overlay) = app.credentials_overlay.as_ref() else {
         return;
     };
     let area = frame.area();
     let width = area.width.min(64).max(36.min(area.width));
-    let height = if overlay.error.is_some() { 11 } else { 10 };
+    let issue = credentials::credential_issue();
+    let body = match issue {
+        Some(CredentialIssue::InsecurePermissions { chmod_hint }) => {
+            credentials_insecure_body(&chmod_hint)
+        }
+        Some(CredentialIssue::Missing) | None => credentials_setup_body(),
+    };
+    let height = if overlay.error.is_some() { 14 } else { 12 };
     let height = height.min(area.height);
     let popup = centered_rect(width, height, area);
     frame.render_widget(Clear, popup);
@@ -2156,36 +2147,22 @@ fn draw_api_key_overlay(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // hint
-            Constraint::Length(1), // gap
-            Constraint::Length(3), // input field
-            Constraint::Length(1), // keybindings
-            Constraint::Min(0),    // error
+            Constraint::Min(6),
+            Constraint::Length(1),
+            Constraint::Min(0),
         ])
         .split(inner);
 
     frame.render_widget(
-        Paragraph::new(API_KEY_HINT)
+        Paragraph::new(body)
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true }),
         chunks[0],
     );
 
-    let input_block = Block::default()
-        .borders(Borders::ALL)
-        .title("API key")
-        .border_style(Style::default().fg(Color::Yellow));
-    let input_inner = input_block.inner(chunks[2]);
-    frame.render_widget(input_block, chunks[2]);
-    let masked = "•".repeat(overlay.input.chars().count());
     frame.render_widget(
-        Paragraph::new(masked).alignment(Alignment::Center),
-        input_inner,
-    );
-
-    frame.render_widget(
-        Paragraph::new(API_KEY_BIND).alignment(Alignment::Center),
-        chunks[3],
+        Paragraph::new(CREDENTIALS_BIND).alignment(Alignment::Center),
+        chunks[1],
     );
 
     if let Some(error) = &overlay.error {
@@ -2193,65 +2170,15 @@ fn draw_api_key_overlay(frame: &mut Frame, app: &mut App) {
             Paragraph::new(error.as_str())
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(Color::LightRed)),
-            chunks[4],
+            chunks[2],
         );
     }
-
-    app.api_key_url_rect = api_key_url_screen_rect(popup, inner);
 }
 
-/// Screen position of the URL in the overlay hint, so the event loop can
-/// emit an OSC 8 hyperlink there after the frame is drawn. The URL is on
-/// its own line below "Paste a key from".
-fn api_key_url_screen_rect(popup: Rect, inner: Rect) -> Option<Rect> {
-    let url_len = API_KEY_URL.len() as u16;
-    let pad = inner.width.saturating_sub(url_len) / 2;
-    let x = inner.x + pad;
-    let y = inner.y + 2;
-    if x + url_len > popup.x + popup.width {
-        return None;
+fn handle_credentials_overlay_key(app: &mut App, key: KeyEvent) {
+    if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+        app.dismiss_credentials_overlay();
     }
-    Some(Rect::new(x, y, url_len, 1))
-}
-
-fn handle_api_key_overlay_key(app: &mut App, key: KeyEvent) {
-    let Some(overlay) = app.api_key_overlay.as_mut() else {
-        return;
-    };
-    match classify_api_key_key(key) {
-        ApiKeyKey::Cancel => app.dismiss_api_key_overlay(),
-        ApiKeyKey::Open => open_api_key_url(),
-        ApiKeyKey::Save => match credentials::save_api_key(&overlay.input) {
-            Ok(()) => {
-                if let Some(key) = credentials::resolve() {
-                    if let Some(pending) = app.pending_ask.take() {
-                        app.start_ask_job(key, pending.prompt, pending.files, pending.generation);
-                    }
-                }
-                app.api_key_overlay = None;
-            }
-            Err(error) => overlay.error = Some(error),
-        },
-        ApiKeyKey::Backspace => {
-            overlay.input.pop();
-            overlay.error = None;
-        }
-        ApiKeyKey::Char(c) => {
-            overlay.input.push(c);
-            overlay.error = None;
-        }
-        ApiKeyKey::Ignore => {}
-    }
-}
-
-fn append_api_key_input(app: &mut App, text: &str) {
-    let Some(overlay) = app.api_key_overlay.as_mut() else {
-        return;
-    };
-    for ch in text.chars().filter(|c| !c.is_control()) {
-        overlay.input.push(ch);
-    }
-    overlay.error = None;
 }
 
 const CREATE_FOLDER_BIND: &str = "Enter save · Esc cancel";
@@ -2468,75 +2395,6 @@ fn classify_create_folder_key(key: KeyEvent) -> CreateFolderKey {
 
 fn allows_text_char(modifiers: KeyModifiers) -> bool {
     modifiers.is_empty() || modifiers == KeyModifiers::SHIFT
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ApiKeyKey {
-    Save,
-    Cancel,
-    Open,
-    Backspace,
-    Char(char),
-    Ignore,
-}
-
-fn classify_api_key_key(key: KeyEvent) -> ApiKeyKey {
-    match key.code {
-        KeyCode::Esc if key.modifiers.is_empty() => ApiKeyKey::Cancel,
-        KeyCode::Enter if key.modifiers.is_empty() => ApiKeyKey::Save,
-        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => ApiKeyKey::Open,
-        KeyCode::Backspace if key.modifiers.is_empty() => ApiKeyKey::Backspace,
-        KeyCode::Char(c) if allows_text_char(key.modifiers) => ApiKeyKey::Char(c),
-        _ => ApiKeyKey::Ignore,
-    }
-}
-
-fn open_api_key_url() {
-    let _ = std::process::Command::new(open_command())
-        .arg(API_KEY_URL)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-}
-
-fn open_command() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    }
-}
-
-const OSC8_LINK_CLOSE: &str = "\x1b]8;;\x1b\\";
-
-/// Paint an OSC 8 hyperlink over the URL text so modern terminals (iTerm2,
-/// Kitty, WezTerm, GNOME Terminal, …) render it as a Cmd/Ctrl+clickable link.
-/// Written after the frame draw so ratatui's buffer doesn't strip it.
-fn paint_api_key_url_hyperlink(rect: Rect) {
-    let mut out = std::io::stdout();
-    let open = format!("\x1b]8;;{API_KEY_URL}\x1b\\");
-    let _ = execute!(
-        out,
-        MoveTo(rect.x, rect.y),
-        crossterm::style::Print(format!("{open}{API_KEY_URL}{OSC8_LINK_CLOSE}")),
-    );
-}
-
-/// Remove a URL painted with [`paint_api_key_url_hyperlink`]. Must run before
-/// the next `terminal.draw` so ratatui can repaint those cells.
-fn erase_api_key_url_hyperlink(rect: Rect) {
-    let mut out = std::io::stdout();
-    let pad = " ".repeat(rect.width as usize);
-    let _ = execute!(
-        out,
-        MoveTo(rect.x, rect.y),
-        crossterm::style::Print(format!("{OSC8_LINK_CLOSE}{pad}")),
-    );
-}
-
-pub fn mask_api_key_input(input: &str) -> String {
-    "•".repeat(input.chars().count())
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -3044,50 +2902,17 @@ mod tests {
     }
 
     #[test]
-    fn api_key_overlay_keys_save_cancel_and_mask() {
+    fn credentials_overlay_esc_dismisses() {
         assert_eq!(
-            classify_api_key_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            ApiKeyKey::Save
+            KeyCode::Esc,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE).code
         );
-        assert_eq!(
-            classify_api_key_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            ApiKeyKey::Cancel
-        );
-        assert_eq!(
-            classify_api_key_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
-            ApiKeyKey::Open
-        );
-        assert_eq!(
-            classify_api_key_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
-            ApiKeyKey::Char('o')
-        );
-        assert_eq!(
-            classify_api_key_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER)),
-            ApiKeyKey::Ignore
-        );
-        assert_eq!(
-            classify_api_key_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
-            ApiKeyKey::Char('a')
-        );
-        assert_eq!(mask_api_key_input("secret"), "••••••");
-    }
-
-    #[test]
-    fn api_key_url_rect_fits_inside_popup() {
-        let popup = Rect::new(10, 5, 64, 10);
-        let inner = Rect::new(11, 6, 62, 8);
-        let rect = api_key_url_screen_rect(popup, inner).unwrap();
-        assert_eq!(rect.y, inner.y + 2);
-        assert_eq!(rect.width, API_KEY_URL.len() as u16);
-        assert!(rect.x >= inner.x);
-        assert!(rect.x + rect.width <= popup.x + popup.width - 1);
-    }
-
-    #[test]
-    fn api_key_url_rect_is_none_when_popup_too_narrow() {
-        let popup = Rect::new(0, 0, 20, 10);
-        let inner = Rect::new(1, 1, 18, 8);
-        assert!(api_key_url_screen_rect(popup, inner).is_none());
+        let body = credentials_setup_body();
+        assert!(body.contains("hallward credentials set"));
+        assert!(body.contains("HALLWARD_OPENROUTER_API_KEY"));
+        let insecure = credentials_insecure_body("chmod 600 ~/.config/hallward/credentials");
+        assert!(insecure.contains("chmod 600"));
+        assert!(!insecure.contains("hallward credentials set"));
     }
 
     #[test]

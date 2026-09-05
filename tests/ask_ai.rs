@@ -115,13 +115,19 @@ fn with_credentials_path<F: FnOnce()>(f: F) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("credentials");
     let prev = std::env::var_os("HALLWARD_CREDENTIALS_PATH");
+    let prev_hallward = std::env::var_os("HALLWARD_OPENROUTER_API_KEY");
     let prev_openrouter = std::env::var_os("OPENROUTER_API_KEY");
     std::env::set_var("HALLWARD_CREDENTIALS_PATH", &path);
+    std::env::remove_var("HALLWARD_OPENROUTER_API_KEY");
     std::env::remove_var("OPENROUTER_API_KEY");
     f();
     match prev {
         Some(value) => std::env::set_var("HALLWARD_CREDENTIALS_PATH", value),
         None => std::env::remove_var("HALLWARD_CREDENTIALS_PATH"),
+    }
+    match prev_hallward {
+        Some(value) => std::env::set_var("HALLWARD_OPENROUTER_API_KEY", value),
+        None => std::env::remove_var("HALLWARD_OPENROUTER_API_KEY"),
     }
     match prev_openrouter {
         Some(value) => std::env::set_var("OPENROUTER_API_KEY", value),
@@ -343,7 +349,7 @@ fn an_invalid_saved_key_is_cleared() {
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
     with_credentials_path(|| {
-        credentials::save_api_key("saved-key").unwrap();
+        credentials::set_key("saved-key").unwrap();
         let error = ask("which car?", &[photo], library.root(), stub_openrouter_post).unwrap_err();
         assert_eq!(error, credentials::INVALID_SAVED_KEY);
         assert!(!credentials::resolve().is_some());
@@ -512,7 +518,7 @@ fn env_key_401_is_not_overlay_recoverable() {
         stub_openrouter_post,
     )
     .unwrap_err();
-    assert!(error.contains("OPENROUTER_API_KEY"), "{error}");
+    assert!(error.contains("HALLWARD_OPENROUTER_API_KEY"), "{error}");
 }
 
 #[test]
@@ -608,12 +614,25 @@ fn custom_models_from_credentials_file_are_used_in_requests() {
     let library = Library::new();
     let photo = library.photo("Rome/photo.jpg");
     with_credentials_path(|| {
-        let path = std::env::var("HALLWARD_CREDENTIALS_PATH").unwrap();
+        let path = PathBuf::from(std::env::var("HALLWARD_CREDENTIALS_PATH").unwrap());
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
         fs::write(
-            path,
+            &path,
             "OPENROUTER_API_KEY=saved\nASK_MODEL=custom/ask\nEDIT_MODEL=custom/edit\n",
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         install_openrouter_stub(OpenRouterStub::single(200, text_response("ok")));
         let key = credentials::resolve().unwrap();
         ask_with(

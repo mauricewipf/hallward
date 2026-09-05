@@ -92,11 +92,10 @@ impl Fixture {
 // Credentials isolation (never touch the developer's real key)
 // ---------------------------------------------------------------------------
 
-/// Points `HALLWARD_CREDENTIALS_PATH` at a tempdir and strips
-/// `OPENROUTER_API_KEY` (same pattern as
-/// `tests/ask_ai.rs`). Restores everything on drop.
+/// Points `HALLWARD_CREDENTIALS_PATH` at a tempdir and strips Hallward env keys.
 pub struct CredGuard {
     prev_path: Option<std::ffi::OsString>,
+    prev_hallward: Option<std::ffi::OsString>,
     prev_openrouter: Option<std::ffi::OsString>,
     _dir: tempfile::TempDir,
 }
@@ -106,18 +105,21 @@ impl CredGuard {
         let dir = tempfile::tempdir().expect("tempdir for credentials");
         let path = dir.path().join("credentials");
         let prev_path = std::env::var_os("HALLWARD_CREDENTIALS_PATH");
+        let prev_hallward = std::env::var_os("HALLWARD_OPENROUTER_API_KEY");
         let prev_openrouter = std::env::var_os("OPENROUTER_API_KEY");
         std::env::set_var("HALLWARD_CREDENTIALS_PATH", &path);
+        std::env::remove_var("HALLWARD_OPENROUTER_API_KEY");
         std::env::remove_var("OPENROUTER_API_KEY");
         Self {
             prev_path,
+            prev_hallward,
             prev_openrouter,
             _dir: dir,
         }
     }
 
     pub fn save_key(&self, key: &str) {
-        credentials::save_api_key(key).expect("save test key");
+        credentials::set_key(key).expect("save test key");
     }
 }
 
@@ -126,6 +128,10 @@ impl Drop for CredGuard {
         match self.prev_path.take() {
             Some(value) => std::env::set_var("HALLWARD_CREDENTIALS_PATH", value),
             None => std::env::remove_var("HALLWARD_CREDENTIALS_PATH"),
+        }
+        match self.prev_hallward.take() {
+            Some(value) => std::env::set_var("HALLWARD_OPENROUTER_API_KEY", value),
+            None => std::env::remove_var("HALLWARD_OPENROUTER_API_KEY"),
         }
         match self.prev_openrouter.take() {
             Some(value) => std::env::set_var("OPENROUTER_API_KEY", value),

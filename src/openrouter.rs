@@ -422,7 +422,7 @@ mod tests {
             ASK_MODEL
         )
         .unwrap_err()
-        .contains("OPENROUTER_API_KEY"));
+        .contains("HALLWARD_OPENROUTER_API_KEY"));
         let saved = interpret_chat_text(401, &auth.to_string(), CredentialSource::File, ASK_MODEL)
             .unwrap_err();
         assert_eq!(saved, credentials::INVALID_SAVED_KEY);
