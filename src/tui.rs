@@ -2706,6 +2706,7 @@ mod tests {
             camera: None,
             width: None,
             height: None,
+            raw_relpath: None,
         }
     }
 

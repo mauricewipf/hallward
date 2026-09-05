@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::library::album_paths;
 use crate::meta::PhotoMeta;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Photo {
     pub relpath: String,
     pub album: String,
@@ -19,6 +19,8 @@ pub struct Photo {
     pub camera: Option<String>,
     pub width: Option<i64>,
     pub height: Option<i64>,
+    /// Same-stem DNG/RAW twin kept on disk but not shown as its own grid cell.
+    pub raw_relpath: Option<String>,
 }
 
 pub fn open(root: &Path, create: bool) -> Result<Connection> {
@@ -60,30 +62,43 @@ pub fn open(root: &Path, create: bool) -> Result<Connection> {
                 captured_at TEXT,
                 camera TEXT,
                 width INTEGER,
-                height INTEGER
+                height INTEGER,
+                raw_relpath TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_photos_album ON photos(album);
             CREATE INDEX IF NOT EXISTS idx_photos_captured ON photos(captured_at);",
         )?;
     }
+    migrate(&conn)?;
     Ok(conn)
 }
 
-/// All `(relpath → (mtime, size))` rows in one query so bulk scans don't pay
-/// a point-`SELECT` per file (N+1 reads on large libraries / slow mounts).
-pub fn all_mtime_sizes(conn: &Connection) -> Result<HashMap<String, (i64, i64)>> {
-    let mut stmt = conn.prepare("SELECT relpath, mtime, size FROM photos")?;
+fn migrate(conn: &Connection) -> Result<()> {
+    let has_raw = conn
+        .prepare("SELECT raw_relpath FROM photos LIMIT 0")
+        .is_ok();
+    if !has_raw {
+        conn.execute("ALTER TABLE photos ADD COLUMN raw_relpath TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// All `(relpath → (mtime, size, raw_relpath))` rows in one query so bulk scans
+/// don't pay a point-`SELECT` per file (N+1 reads on large libraries / slow mounts).
+pub fn all_index_state(conn: &Connection) -> Result<HashMap<String, (i64, i64, Option<String>)>> {
+    let mut stmt = conn.prepare("SELECT relpath, mtime, size, raw_relpath FROM photos")?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, i64>(1)?,
             r.get::<_, i64>(2)?,
+            r.get::<_, Option<String>>(3)?,
         ))
     })?;
     let mut map = HashMap::new();
     for row in rows {
-        let (rel, mtime, size) = row?;
-        map.insert(rel, (mtime, size));
+        let (rel, mtime, size, raw) = row?;
+        map.insert(rel, (mtime, size, raw));
     }
     Ok(map)
 }
@@ -121,8 +136,8 @@ pub fn apply_index_changes(
     }
     for photo in photos {
         tx.execute(
-            "INSERT INTO photos (relpath, album, filename, mtime, size, captured_at, camera, width, height)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO photos (relpath, album, filename, mtime, size, captured_at, camera, width, height, raw_relpath)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(relpath) DO UPDATE SET
                 album=excluded.album,
                 filename=excluded.filename,
@@ -131,7 +146,8 @@ pub fn apply_index_changes(
                 captured_at=excluded.captured_at,
                 camera=excluded.camera,
                 width=excluded.width,
-                height=excluded.height",
+                height=excluded.height,
+                raw_relpath=excluded.raw_relpath",
             params![
                 photo.relpath,
                 photo.album,
@@ -142,6 +158,7 @@ pub fn apply_index_changes(
                 photo.camera,
                 photo.width,
                 photo.height,
+                photo.raw_relpath,
             ],
         )?;
     }
@@ -151,8 +168,8 @@ pub fn apply_index_changes(
 
 pub fn upsert_photo(conn: &Connection, photo: &Photo) -> Result<()> {
     conn.execute(
-        "INSERT INTO photos (relpath, album, filename, mtime, size, captured_at, camera, width, height)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO photos (relpath, album, filename, mtime, size, captured_at, camera, width, height, raw_relpath)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(relpath) DO UPDATE SET
             album=excluded.album,
             filename=excluded.filename,
@@ -161,7 +178,8 @@ pub fn upsert_photo(conn: &Connection, photo: &Photo) -> Result<()> {
             captured_at=excluded.captured_at,
             camera=excluded.camera,
             width=excluded.width,
-            height=excluded.height",
+            height=excluded.height,
+            raw_relpath=excluded.raw_relpath",
         params![
             photo.relpath,
             photo.album,
@@ -172,6 +190,7 @@ pub fn upsert_photo(conn: &Connection, photo: &Photo) -> Result<()> {
             photo.camera,
             photo.width,
             photo.height,
+            photo.raw_relpath,
         ],
     )?;
     Ok(())
@@ -195,7 +214,7 @@ pub fn delete_under_prefix(conn: &Connection, dir_rel: &str) -> Result<usize> {
 
 pub fn photos_in_album(conn: &Connection, album: &str) -> Result<Vec<Photo>> {
     let mut stmt = conn.prepare(
-        "SELECT relpath, album, filename, mtime, size, captured_at, camera, width, height
+        "SELECT relpath, album, filename, mtime, size, captured_at, camera, width, height, raw_relpath
          FROM photos WHERE album = ?1
          ORDER BY COALESCE(captured_at, '') ASC, filename ASC",
     )?;
@@ -210,6 +229,7 @@ pub fn photos_in_album(conn: &Connection, album: &str) -> Result<Vec<Photo>> {
             camera: r.get(6)?,
             width: r.get(7)?,
             height: r.get(8)?,
+            raw_relpath: r.get(9)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -243,6 +263,7 @@ pub fn photo_from_file(
     mtime: i64,
     size: i64,
     meta: PhotoMeta,
+    raw_relpath: Option<String>,
 ) -> Photo {
     Photo {
         relpath,
@@ -254,6 +275,7 @@ pub fn photo_from_file(
         camera: meta.camera,
         width: meta.width.map(|w| w as i64),
         height: meta.height.map(|h| h as i64),
+        raw_relpath,
     }
 }
 
@@ -302,6 +324,7 @@ mod tests {
                     camera: None,
                     width: None,
                     height: None,
+                    raw_relpath: None,
                 },
             )
             .unwrap();
@@ -332,6 +355,7 @@ mod tests {
                     camera: None,
                     width: None,
                     height: None,
+                    raw_relpath: None,
                 },
             )
             .unwrap();

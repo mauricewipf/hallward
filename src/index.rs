@@ -134,7 +134,7 @@ fn index_library_inner(root: &Path, progress: Option<&CliProgress>) -> Result<In
     let mut warned_ffprobe = false;
     // One query up front: the scan loop below must not pay a point-SELECT
     // per file (N+1 reads dominate warm runs on large/slow mounts).
-    let existing = catalog::all_mtime_sizes(&conn)?;
+    let existing = catalog::all_index_state(&conn)?;
 
     for entry in WalkDir::new(root).into_iter().filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
@@ -163,9 +163,11 @@ fn index_library_inner(root: &Path, progress: Option<&CliProgress>) -> Result<In
         let meta_fs = entry.metadata()?;
         let mtime = mtime_epoch(&meta_fs)?;
         let size = meta_fs.len() as i64;
-        if let Some(&(old_m, old_s)) = existing.get(&rel) {
+        let raw_relpath = raw_relpath_for_still(root, path);
+        if let Some(&(old_m, old_s, ref old_raw)) = existing.get(&rel) {
             if old_m == mtime
                 && old_s == size
+                && old_raw == &raw_relpath
                 && meta_fs
                     .modified()
                     .map(|src_m| thumbs::is_current_with_src_mtime(root, &rel, src_m))
@@ -185,6 +187,9 @@ fn index_library_inner(root: &Path, progress: Option<&CliProgress>) -> Result<In
                 continue;
             }
         }
+        if media::is_dng_raw_companion(path) {
+            continue;
+        }
         seen.push(rel.clone());
         let filename = path
             .file_name()
@@ -197,7 +202,7 @@ fn index_library_inner(root: &Path, progress: Option<&CliProgress>) -> Result<In
             meta::read_meta(path)
         };
         dirty.push(catalog::photo_from_file(
-            rel, filename, album, mtime, size, photo_meta,
+            rel, filename, album, mtime, size, photo_meta, raw_relpath,
         ));
     }
 
@@ -330,6 +335,9 @@ pub fn index_pasted(
                 {
                     continue;
                 }
+                if media::is_dng_raw_companion(entry.path()) {
+                    continue;
+                }
                 nested.push(entry.path().to_path_buf());
             }
             nested.sort();
@@ -369,6 +377,9 @@ pub fn index_pasted(
                 continue;
             }
             if is_video(&dest_abs) && media::is_live_photo_companion(&dest_abs, have_ffprobe) {
+                continue;
+            }
+            if media::is_dng_raw_companion(&dest_abs) {
                 continue;
             }
             match build_photo(root, &dest_abs, &item.dest, None) {
@@ -435,7 +446,7 @@ pub fn index_pasted(
 }
 
 fn build_photo(
-    _root: &Path,
+    root: &Path,
     abs: &Path,
     rel: &str,
     captured_at_fallback: Option<&str>,
@@ -469,7 +480,16 @@ fn build_photo(
         mtime,
         size,
         photo_meta,
+        raw_relpath_for_still(root, abs),
     ))
+}
+
+fn raw_relpath_for_still(root: &Path, still: &Path) -> Option<String> {
+    media::dng_twin_for_still(still).and_then(|raw| {
+        raw.strip_prefix(root)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+    })
 }
 
 fn mtime_epoch(meta: &fs::Metadata) -> Result<i64> {
@@ -610,5 +630,22 @@ mod tests {
             .unwrap()
             .iter()
             .any(|p| p.relpath == "Paris/a.jpg"));
+    }
+
+    #[test]
+    fn jpeg_dng_twins_index_as_one_photo() {
+        let (_tmp, root) = mini_library();
+        write_still(&root.join("Rome/DSC_0001.jpg"));
+        std::fs::write(root.join("Rome/DSC_0001.DNG"), b"dng").unwrap();
+        index_library(&root).unwrap();
+        let conn = catalog::open(&root, false).unwrap();
+        assert_eq!(catalog::count(&conn).unwrap(), 1);
+        let photos = catalog::photos_in_album(&conn, "Rome").unwrap();
+        assert_eq!(photos.len(), 1);
+        assert_eq!(photos[0].relpath, "Rome/DSC_0001.jpg");
+        assert_eq!(
+            photos[0].raw_relpath.as_deref(),
+            Some("Rome/DSC_0001.DNG")
+        );
     }
 }
