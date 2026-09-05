@@ -20,7 +20,7 @@ Terminal photo library: miller-style folders, a thumbnail grid for albums, an **
 - `libheif` / `heif-convert` for HEIC thumbnails (Arch: `pacman -S libheif`)
 - **ffmpeg** (ships `ffprobe`) for video **thumbnails** and Live Photo detection — not a player
 - A video player: **mpv**
-- An **OpenRouter API key** for Ask AI and image editing (`OPENROUTER_API_KEY` or paste in the TUI overlay on first use)
+- An **OpenRouter API key** for Ask AI and image editing — set once with `hallward credentials set`, or export `HALLWARD_OPENROUTER_API_KEY`
 
 **macOS:** still images open in built-in **Preview** (no extra install). Quit Preview (Cmd-Q) to return to Hallward, same as mpv. Video playback requires **mpv** (`brew install mpv`). FFmpeg’s `ffplay` is a terminal player: it tears down the TUI, dumps decoder logs to the shell, and is not an acceptable viewer. If the status pane says `video: ffplay` or `video: no player`, install mpv and restart Hallward until it shows `video: mpv`.
 
@@ -79,7 +79,13 @@ Mark with `Space` key one or more **images** and the search bar becomes **Ask AI
 
 Type a question and press Enter: "Which car is this?" OpenRouter answers in the pane (`google/gemini-3.5-flash-lite`).
 
-If the prompt is an edit instruction such as "Remove the persons in the background.", Hallward classifies it with OpenRouter, then edits with `google/gemini-3.1-flash-lite-image`. The first Ask AI request may ask for an OpenRouter API key in a popup; you can also set `OPENROUTER_API_KEY` or save a key in `~/.config/hallward/credentials`. The edited photo is saved as a new sibling file (`photo-edited.png`, then `photo-edited-2.png`, …). The original is never overwritten. Editing needs **exactly one** marked still. Esc cancels an in-flight request.
+If the prompt is an edit instruction such as "Remove the persons in the background.", Hallward classifies it with OpenRouter, then edits with `google/gemini-3.1-flash-lite-image`. Ask AI and image edit share one credential: run `hallward credentials set` (stdin, echo off) or set `HALLWARD_OPENROUTER_API_KEY`. Hallward stores the key in `~/.config/hallward/credentials` (mode `0600`, directory `0700`). The edited photo is saved as a new sibling file (`photo-edited.png`, then `photo-edited-2.png`, …). The original is never overwritten. Editing needs **exactly one** marked still. Esc cancels an in-flight request.
+
+```bash
+hallward credentials set              # paste key at prompt (not echoed)
+hallward credentials set --from-env   # copy HALLWARD_OPENROUTER_API_KEY into the file
+hallward credentials clear            # remove the credentials file
+```
 
 ![Ask AI](assets/2026-09-02_ai-chat.png)
 

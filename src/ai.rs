@@ -354,7 +354,7 @@ fn run_ask(
 
 fn map_job_error(err: String) -> Result<AskValue, String> {
     if credentials::is_invalid_saved_key_error(&err) {
-        let _ = credentials::clear_saved_key();
+        let _ = credentials::clear();
     }
     Err(err)
 }
