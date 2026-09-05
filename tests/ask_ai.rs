@@ -116,10 +116,8 @@ fn with_credentials_path<F: FnOnce()>(f: F) {
     let path = dir.path().join("credentials");
     let prev = std::env::var_os("HALLWARD_CREDENTIALS_PATH");
     let prev_openrouter = std::env::var_os("OPENROUTER_API_KEY");
-    let prev_gemini = std::env::var_os("GEMINI_API_KEY");
     std::env::set_var("HALLWARD_CREDENTIALS_PATH", &path);
     std::env::remove_var("OPENROUTER_API_KEY");
-    std::env::remove_var("GEMINI_API_KEY");
     f();
     match prev {
         Some(value) => std::env::set_var("HALLWARD_CREDENTIALS_PATH", value),
@@ -128,10 +126,6 @@ fn with_credentials_path<F: FnOnce()>(f: F) {
     match prev_openrouter {
         Some(value) => std::env::set_var("OPENROUTER_API_KEY", value),
         None => std::env::remove_var("OPENROUTER_API_KEY"),
-    }
-    match prev_gemini {
-        Some(value) => std::env::set_var("GEMINI_API_KEY", value),
-        None => std::env::remove_var("GEMINI_API_KEY"),
     }
 }
 

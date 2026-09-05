@@ -297,7 +297,7 @@ struct PendingAsk {
     generation: u64,
 }
 
-struct GeminiKeyOverlay {
+struct ApiKeyOverlay {
     input: String,
     error: Option<String>,
 }
@@ -444,11 +444,11 @@ pub struct App {
     pending_delete: Option<Vec<String>>,
     clipboard: Option<clipboard::Clipboard>,
     pending_ask: Option<PendingAsk>,
-    gemini_key_overlay: Option<GeminiKeyOverlay>,
+    api_key_overlay: Option<ApiKeyOverlay>,
     create_folder_overlay: Option<CreateFolderOverlay>,
-    gemini_url_rect: Option<Rect>,
+    api_key_url_rect: Option<Rect>,
     /// Screen cells where an OSC 8 URL was painted outside ratatui's buffer.
-    gemini_url_written: Option<Rect>,
+    api_key_url_written: Option<Rect>,
     ask: AskAi,
     viewer: Arc<dyn ViewerOpener>,
     clock: Arc<dyn Clock>,
@@ -491,10 +491,10 @@ impl App {
             pending_delete: None,
             clipboard: None,
             pending_ask: None,
-            gemini_key_overlay: None,
+            api_key_overlay: None,
             create_folder_overlay: None,
-            gemini_url_rect: None,
-            gemini_url_written: None,
+            api_key_url_rect: None,
+            api_key_url_written: None,
             ask: AskAi::new(),
             viewer,
             clock,
@@ -536,7 +536,7 @@ impl App {
             }
             Ok(ai::AskValue::Saved(saved)) => {
                 self.pending_ask = None;
-                self.gemini_key_overlay = None;
+                self.api_key_overlay = None;
                 self.focus_saved_edit(&saved.relpath);
                 let message = image_edit::saved_message(&saved.filename);
                 self.status = message.clone();
@@ -551,14 +551,14 @@ impl App {
                         files,
                         generation: self.ask.generation,
                     });
-                    self.gemini_key_overlay = Some(GeminiKeyOverlay {
+                    self.api_key_overlay = Some(ApiKeyOverlay {
                         input: String::new(),
                         error: Some("OpenRouter rejected that key. Paste a new one.".into()),
                     });
                     return;
                 }
                 self.pending_ask = None;
-                self.gemini_key_overlay = None;
+                self.api_key_overlay = None;
                 self.ask.reply = Some(AskReply::Error(err));
             }
         }
@@ -575,7 +575,7 @@ impl App {
             return;
         }
         self.pending_ask = None;
-        self.gemini_key_overlay = None;
+        self.api_key_overlay = None;
         self.ask.waiting_from = Some(self.clock.now());
         self.ask.job = Some(ai::spawn_with(
             generation,
@@ -588,9 +588,9 @@ impl App {
         ));
     }
 
-    fn dismiss_gemini_key_overlay(&mut self) {
+    fn dismiss_api_key_overlay(&mut self) {
         self.pending_ask = None;
-        self.gemini_key_overlay = None;
+        self.api_key_overlay = None;
     }
 
     fn send_ask(&mut self) {
@@ -620,7 +620,7 @@ impl App {
                 files,
                 generation,
             });
-            self.gemini_key_overlay = Some(GeminiKeyOverlay {
+            self.api_key_overlay = Some(ApiKeyOverlay {
                 input: String::new(),
                 error: None,
             });
@@ -754,16 +754,16 @@ fn event_loop_with(driver: &mut dyn TerminalDriver, app: &mut App) -> Result<()>
     loop {
         app.sync_ask_selection();
         app.poll_ask();
-        if app.gemini_key_overlay.is_none() {
-            if let Some(rect) = app.gemini_url_written.take() {
-                erase_gemini_url_hyperlink(rect);
+        if app.api_key_overlay.is_none() {
+            if let Some(rect) = app.api_key_url_written.take() {
+                erase_api_key_url_hyperlink(rect);
             }
         }
         driver.redraw(app)?;
-        if app.gemini_key_overlay.is_some() {
-            if let Some(rect) = app.gemini_url_rect {
-                paint_gemini_url_hyperlink(rect);
-                app.gemini_url_written = Some(rect);
+        if app.api_key_overlay.is_some() {
+            if let Some(rect) = app.api_key_url_rect {
+                paint_api_key_url_hyperlink(rect);
+                app.api_key_url_written = Some(rect);
             }
         }
         if !event::poll(Duration::from_millis(200))? {
@@ -775,8 +775,8 @@ fn event_loop_with(driver: &mut dyn TerminalDriver, app: &mut App) -> Result<()>
                     break;
                 }
             }
-            Event::Paste(text) if app.gemini_key_overlay.is_some() => {
-                append_gemini_key_input(app, &text);
+            Event::Paste(text) if app.api_key_overlay.is_some() => {
+                append_api_key_input(app, &text);
             }
             Event::Paste(text) if app.create_folder_overlay.is_some() => {
                 append_create_folder_input(app, &text);
@@ -796,8 +796,8 @@ fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut dyn TerminalDriver) -
         return Ok(true);
     }
 
-    if app.gemini_key_overlay.is_some() {
-        handle_gemini_key_overlay_key(app, key);
+    if app.api_key_overlay.is_some() {
+        handle_api_key_overlay_key(app, key);
         return Ok(false);
     }
 
@@ -1186,7 +1186,7 @@ fn shift_tab_focus(from: Focus) -> Focus {
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent, terminal: &mut dyn TerminalDriver) -> Result<()> {
     if app.pending_delete.is_some()
-        || app.gemini_key_overlay.is_some()
+        || app.api_key_overlay.is_some()
         || app.create_folder_overlay.is_some()
     {
         return Ok(());
@@ -1768,10 +1768,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(rels) = app.pending_delete.as_deref() {
         draw_delete_confirm(frame, &app.root, rels);
     }
-    if app.gemini_key_overlay.is_some() {
-        draw_gemini_key_overlay(frame, app);
+    if app.api_key_overlay.is_some() {
+        draw_api_key_overlay(frame, app);
     } else {
-        app.gemini_url_rect = None;
+        app.api_key_url_rect = None;
     }
     if app.create_folder_overlay.is_some() {
         draw_create_folder_overlay(frame, app);
@@ -2126,17 +2126,17 @@ fn draw_delete_confirm(frame: &mut Frame, root: &Path, rels: &[String]) {
     );
 }
 
-const GEMINI_KEY_URL: &str = "https://openrouter.ai/keys";
+const API_KEY_URL: &str = "https://openrouter.ai/keys";
 
-const GEMINI_KEY_HINT: &str = "Photos are sent to OpenRouter and may use paid quota.\n\
+const API_KEY_HINT: &str = "Photos are sent to OpenRouter and may use paid quota.\n\
 Paste a key from\n\
 https://openrouter.ai/keys";
 
-const GEMINI_KEY_BIND: &str = "Ctrl+o open URL · Enter save · Esc cancel";
+const API_KEY_BIND: &str = "Ctrl+o open URL · Enter save · Esc cancel";
 
-fn draw_gemini_key_overlay(frame: &mut Frame, app: &mut App) {
-    let Some(overlay) = app.gemini_key_overlay.as_ref() else {
-        app.gemini_url_rect = None;
+fn draw_api_key_overlay(frame: &mut Frame, app: &mut App) {
+    let Some(overlay) = app.api_key_overlay.as_ref() else {
+        app.api_key_url_rect = None;
         return;
     };
     let area = frame.area();
@@ -2165,7 +2165,7 @@ fn draw_gemini_key_overlay(frame: &mut Frame, app: &mut App) {
         .split(inner);
 
     frame.render_widget(
-        Paragraph::new(GEMINI_KEY_HINT)
+        Paragraph::new(API_KEY_HINT)
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true }),
         chunks[0],
@@ -2184,7 +2184,7 @@ fn draw_gemini_key_overlay(frame: &mut Frame, app: &mut App) {
     );
 
     frame.render_widget(
-        Paragraph::new(GEMINI_KEY_BIND).alignment(Alignment::Center),
+        Paragraph::new(API_KEY_BIND).alignment(Alignment::Center),
         chunks[3],
     );
 
@@ -2197,14 +2197,14 @@ fn draw_gemini_key_overlay(frame: &mut Frame, app: &mut App) {
         );
     }
 
-    app.gemini_url_rect = gemini_url_screen_rect(popup, inner);
+    app.api_key_url_rect = api_key_url_screen_rect(popup, inner);
 }
 
 /// Screen position of the URL in the overlay hint, so the event loop can
 /// emit an OSC 8 hyperlink there after the frame is drawn. The URL is on
 /// its own line below "Paste a key from".
-fn gemini_url_screen_rect(popup: Rect, inner: Rect) -> Option<Rect> {
-    let url_len = GEMINI_KEY_URL.len() as u16;
+fn api_key_url_screen_rect(popup: Rect, inner: Rect) -> Option<Rect> {
+    let url_len = API_KEY_URL.len() as u16;
     let pad = inner.width.saturating_sub(url_len) / 2;
     let x = inner.x + pad;
     let y = inner.y + 2;
@@ -2214,38 +2214,38 @@ fn gemini_url_screen_rect(popup: Rect, inner: Rect) -> Option<Rect> {
     Some(Rect::new(x, y, url_len, 1))
 }
 
-fn handle_gemini_key_overlay_key(app: &mut App, key: KeyEvent) {
-    let Some(overlay) = app.gemini_key_overlay.as_mut() else {
+fn handle_api_key_overlay_key(app: &mut App, key: KeyEvent) {
+    let Some(overlay) = app.api_key_overlay.as_mut() else {
         return;
     };
-    match classify_gemini_key_key(key) {
-        GeminiKeyKey::Cancel => app.dismiss_gemini_key_overlay(),
-        GeminiKeyKey::Open => open_gemini_key_url(),
-        GeminiKeyKey::Save => match credentials::save_api_key(&overlay.input) {
+    match classify_api_key_key(key) {
+        ApiKeyKey::Cancel => app.dismiss_api_key_overlay(),
+        ApiKeyKey::Open => open_api_key_url(),
+        ApiKeyKey::Save => match credentials::save_api_key(&overlay.input) {
             Ok(()) => {
                 if let Some(key) = credentials::resolve() {
                     if let Some(pending) = app.pending_ask.take() {
                         app.start_ask_job(key, pending.prompt, pending.files, pending.generation);
                     }
                 }
-                app.gemini_key_overlay = None;
+                app.api_key_overlay = None;
             }
             Err(error) => overlay.error = Some(error),
         },
-        GeminiKeyKey::Backspace => {
+        ApiKeyKey::Backspace => {
             overlay.input.pop();
             overlay.error = None;
         }
-        GeminiKeyKey::Char(c) => {
+        ApiKeyKey::Char(c) => {
             overlay.input.push(c);
             overlay.error = None;
         }
-        GeminiKeyKey::Ignore => {}
+        ApiKeyKey::Ignore => {}
     }
 }
 
-fn append_gemini_key_input(app: &mut App, text: &str) {
-    let Some(overlay) = app.gemini_key_overlay.as_mut() else {
+fn append_api_key_input(app: &mut App, text: &str) {
+    let Some(overlay) = app.api_key_overlay.as_mut() else {
         return;
     };
     for ch in text.chars().filter(|c| !c.is_control()) {
@@ -2471,7 +2471,7 @@ fn allows_text_char(modifiers: KeyModifiers) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GeminiKeyKey {
+enum ApiKeyKey {
     Save,
     Cancel,
     Open,
@@ -2480,20 +2480,20 @@ enum GeminiKeyKey {
     Ignore,
 }
 
-fn classify_gemini_key_key(key: KeyEvent) -> GeminiKeyKey {
+fn classify_api_key_key(key: KeyEvent) -> ApiKeyKey {
     match key.code {
-        KeyCode::Esc if key.modifiers.is_empty() => GeminiKeyKey::Cancel,
-        KeyCode::Enter if key.modifiers.is_empty() => GeminiKeyKey::Save,
-        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => GeminiKeyKey::Open,
-        KeyCode::Backspace if key.modifiers.is_empty() => GeminiKeyKey::Backspace,
-        KeyCode::Char(c) if allows_text_char(key.modifiers) => GeminiKeyKey::Char(c),
-        _ => GeminiKeyKey::Ignore,
+        KeyCode::Esc if key.modifiers.is_empty() => ApiKeyKey::Cancel,
+        KeyCode::Enter if key.modifiers.is_empty() => ApiKeyKey::Save,
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => ApiKeyKey::Open,
+        KeyCode::Backspace if key.modifiers.is_empty() => ApiKeyKey::Backspace,
+        KeyCode::Char(c) if allows_text_char(key.modifiers) => ApiKeyKey::Char(c),
+        _ => ApiKeyKey::Ignore,
     }
 }
 
-fn open_gemini_key_url() {
+fn open_api_key_url() {
     let _ = std::process::Command::new(open_command())
-        .arg(GEMINI_KEY_URL)
+        .arg(API_KEY_URL)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -2513,19 +2513,19 @@ const OSC8_LINK_CLOSE: &str = "\x1b]8;;\x1b\\";
 /// Paint an OSC 8 hyperlink over the URL text so modern terminals (iTerm2,
 /// Kitty, WezTerm, GNOME Terminal, …) render it as a Cmd/Ctrl+clickable link.
 /// Written after the frame draw so ratatui's buffer doesn't strip it.
-fn paint_gemini_url_hyperlink(rect: Rect) {
+fn paint_api_key_url_hyperlink(rect: Rect) {
     let mut out = std::io::stdout();
-    let open = format!("\x1b]8;;{GEMINI_KEY_URL}\x1b\\");
+    let open = format!("\x1b]8;;{API_KEY_URL}\x1b\\");
     let _ = execute!(
         out,
         MoveTo(rect.x, rect.y),
-        crossterm::style::Print(format!("{open}{GEMINI_KEY_URL}{OSC8_LINK_CLOSE}")),
+        crossterm::style::Print(format!("{open}{API_KEY_URL}{OSC8_LINK_CLOSE}")),
     );
 }
 
-/// Remove a URL painted with [`paint_gemini_url_hyperlink`]. Must run before
+/// Remove a URL painted with [`paint_api_key_url_hyperlink`]. Must run before
 /// the next `terminal.draw` so ratatui can repaint those cells.
-fn erase_gemini_url_hyperlink(rect: Rect) {
+fn erase_api_key_url_hyperlink(rect: Rect) {
     let mut out = std::io::stdout();
     let pad = " ".repeat(rect.width as usize);
     let _ = execute!(
@@ -2535,7 +2535,7 @@ fn erase_gemini_url_hyperlink(rect: Rect) {
     );
 }
 
-pub fn mask_gemini_key_input(input: &str) -> String {
+pub fn mask_api_key_input(input: &str) -> String {
     "•".repeat(input.chars().count())
 }
 
@@ -3044,50 +3044,50 @@ mod tests {
     }
 
     #[test]
-    fn gemini_key_overlay_keys_save_cancel_and_mask() {
+    fn api_key_overlay_keys_save_cancel_and_mask() {
         assert_eq!(
-            classify_gemini_key_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            GeminiKeyKey::Save
+            classify_api_key_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ApiKeyKey::Save
         );
         assert_eq!(
-            classify_gemini_key_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            GeminiKeyKey::Cancel
+            classify_api_key_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            ApiKeyKey::Cancel
         );
         assert_eq!(
-            classify_gemini_key_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
-            GeminiKeyKey::Open
+            classify_api_key_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            ApiKeyKey::Open
         );
         assert_eq!(
-            classify_gemini_key_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
-            GeminiKeyKey::Char('o')
+            classify_api_key_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
+            ApiKeyKey::Char('o')
         );
         assert_eq!(
-            classify_gemini_key_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER)),
-            GeminiKeyKey::Ignore
+            classify_api_key_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER)),
+            ApiKeyKey::Ignore
         );
         assert_eq!(
-            classify_gemini_key_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
-            GeminiKeyKey::Char('a')
+            classify_api_key_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            ApiKeyKey::Char('a')
         );
-        assert_eq!(mask_gemini_key_input("secret"), "••••••");
+        assert_eq!(mask_api_key_input("secret"), "••••••");
     }
 
     #[test]
-    fn gemini_url_rect_fits_inside_popup() {
+    fn api_key_url_rect_fits_inside_popup() {
         let popup = Rect::new(10, 5, 64, 10);
         let inner = Rect::new(11, 6, 62, 8);
-        let rect = gemini_url_screen_rect(popup, inner).unwrap();
+        let rect = api_key_url_screen_rect(popup, inner).unwrap();
         assert_eq!(rect.y, inner.y + 2);
-        assert_eq!(rect.width, GEMINI_KEY_URL.len() as u16);
+        assert_eq!(rect.width, API_KEY_URL.len() as u16);
         assert!(rect.x >= inner.x);
         assert!(rect.x + rect.width <= popup.x + popup.width - 1);
     }
 
     #[test]
-    fn gemini_url_rect_is_none_when_popup_too_narrow() {
+    fn api_key_url_rect_is_none_when_popup_too_narrow() {
         let popup = Rect::new(0, 0, 20, 10);
         let inner = Rect::new(1, 1, 18, 8);
-        assert!(gemini_url_screen_rect(popup, inner).is_none());
+        assert!(api_key_url_screen_rect(popup, inner).is_none());
     }
 
     #[test]

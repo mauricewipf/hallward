@@ -593,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_before_ask_does_not_call_gemini() {
+    fn cancel_before_ask_does_not_call_openrouter() {
         let cancel = AtomicBool::new(true);
         let progress = Mutex::new(AskProgress::Analyzing);
         let dir = tempfile::tempdir().unwrap();

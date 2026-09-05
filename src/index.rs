@@ -314,7 +314,8 @@ pub fn index_pasted(
                 if !entry.file_type().is_file() || !is_media_ext(entry.path()) {
                     continue;
                 }
-                if is_video(entry.path()) && media::is_live_photo_companion(entry.path(), have_ffprobe)
+                if is_video(entry.path())
+                    && media::is_live_photo_companion(entry.path(), have_ffprobe)
                 {
                     continue;
                 }
@@ -356,9 +357,7 @@ pub fn index_pasted(
                 stats.failed += 1;
                 continue;
             }
-            if is_video(&dest_abs)
-                && media::is_live_photo_companion(&dest_abs, have_ffprobe)
-            {
+            if is_video(&dest_abs) && media::is_live_photo_companion(&dest_abs, have_ffprobe) {
                 continue;
             }
             match build_photo(root, &dest_abs, &item.dest, None) {
@@ -415,11 +414,7 @@ pub fn index_pasted(
         }
     }
 
-    if !have_ffmpeg
-        && dest_rels
-            .iter()
-            .any(|rel| is_video(&root.join(rel)))
-    {
+    if !have_ffmpeg && dest_rels.iter().any(|rel| is_video(&root.join(rel))) {
         eprintln!(
             "hallward: ffmpeg not found; video thumbnails skipped (install ffmpeg to enable)"
         );
@@ -535,8 +530,14 @@ mod tests {
         assert_eq!(stats.removed, 1);
         let conn = catalog::open(&root, false).unwrap();
         assert_eq!(catalog::count(&conn).unwrap(), 2);
-        assert!(catalog::photos_in_album(&conn, "Paris").unwrap().iter().any(|p| p.relpath == "Paris/a.jpg"));
-        assert!(catalog::photos_in_album(&conn, "Rome").unwrap().iter().all(|p| p.relpath != "Rome/a.jpg"));
+        assert!(catalog::photos_in_album(&conn, "Paris")
+            .unwrap()
+            .iter()
+            .any(|p| p.relpath == "Paris/a.jpg"));
+        assert!(catalog::photos_in_album(&conn, "Rome")
+            .unwrap()
+            .iter()
+            .all(|p| p.relpath != "Rome/a.jpg"));
     }
 
     #[test]
@@ -594,6 +595,9 @@ mod tests {
         assert_eq!(stats.added_or_updated, 1);
         assert_eq!(stats.failed, 1);
         let conn = catalog::open(&root, false).unwrap();
-        assert!(catalog::photos_in_album(&conn, "Paris").unwrap().iter().any(|p| p.relpath == "Paris/a.jpg"));
+        assert!(catalog::photos_in_album(&conn, "Paris")
+            .unwrap()
+            .iter()
+            .any(|p| p.relpath == "Paris/a.jpg"));
     }
 }

@@ -35,10 +35,10 @@ pub const DEFAULT_ASK_MODEL: &str = "google/gemini-3.5-flash-lite";
 pub const DEFAULT_EDIT_MODEL: &str = "google/gemini-3.1-flash-lite-image";
 
 /// Returned when a saved file key is rejected; the TUI reopens the overlay.
-pub const INVALID_SAVED_KEY: &str = "HALLWARD_GEMINI_SAVED_KEY_REJECTED";
+pub const INVALID_SAVED_KEY: &str = "HALLWARD_OPENROUTER_SAVED_KEY_REJECTED";
 
 /// Returned when the environment key is rejected; the overlay cannot help.
-pub const INVALID_ENV_KEY: &str = "HALLWARD_GEMINI_ENV_KEY_REJECTED";
+pub const INVALID_ENV_KEY: &str = "HALLWARD_OPENROUTER_ENV_KEY_REJECTED";
 
 const CREDENTIALS_KEY: &str = "OPENROUTER_API_KEY";
 const CREDENTIALS_PREFIX: &str = "OPENROUTER_API_KEY=";
@@ -50,18 +50,13 @@ const EDIT_MODEL_PREFIX: &str = "EDIT_MODEL=";
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ParsedCredentials {
     openrouter_key: Option<String>,
-    legacy_gemini_key: Option<String>,
-    legacy_lowercase_key: Option<String>,
     ask_model: Option<String>,
     edit_model: Option<String>,
 }
 
 impl ParsedCredentials {
     fn resolved_key(&self) -> Option<String> {
-        self.openrouter_key
-            .clone()
-            .or_else(|| self.legacy_gemini_key.clone())
-            .or_else(|| self.legacy_lowercase_key.clone())
+        self.openrouter_key.clone()
     }
 
     fn ask_model(&self) -> String {
@@ -158,12 +153,10 @@ pub fn is_invalid_env_key_error(text: &str) -> bool {
 }
 
 fn key_from_env() -> Option<String> {
-    for name in ["OPENROUTER_API_KEY", "GEMINI_API_KEY"] {
-        if let Ok(key) = std::env::var(name) {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
+    if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
         }
     }
     None
@@ -213,22 +206,6 @@ fn parse_credentials_text(text: &str) -> ParsedCredentials {
                 parsed.edit_model = Some(value.to_string());
             }
             continue;
-        }
-        if parsed.legacy_gemini_key.is_none() {
-            if let Some(value) = line.strip_prefix("GEMINI_API_KEY=") {
-                let value = value.trim();
-                if !value.is_empty() {
-                    parsed.legacy_gemini_key = Some(value.to_string());
-                }
-            }
-        }
-        if parsed.legacy_lowercase_key.is_none() {
-            if let Some(value) = line.strip_prefix("gemini_api_key=") {
-                let value = value.trim();
-                if !value.is_empty() {
-                    parsed.legacy_lowercase_key = Some(value.to_string());
-                }
-            }
         }
     }
     parsed
@@ -293,10 +270,8 @@ mod tests {
         let prev_home = std::env::var_os("HOME");
         let prev_path = std::env::var_os("HALLWARD_CREDENTIALS_PATH");
         let prev_openrouter = std::env::var_os("OPENROUTER_API_KEY");
-        let prev_gemini = std::env::var_os("GEMINI_API_KEY");
         std::env::remove_var("HALLWARD_CREDENTIALS_PATH");
         std::env::remove_var("OPENROUTER_API_KEY");
-        std::env::remove_var("GEMINI_API_KEY");
         std::env::set_var("HOME", &home);
         f(creds);
         match prev_home {
@@ -310,10 +285,6 @@ mod tests {
         match prev_openrouter {
             Some(value) => std::env::set_var("OPENROUTER_API_KEY", value),
             None => std::env::remove_var("OPENROUTER_API_KEY"),
-        }
-        match prev_gemini {
-            Some(value) => std::env::set_var("GEMINI_API_KEY", value),
-            None => std::env::remove_var("GEMINI_API_KEY"),
         }
     }
 
@@ -406,9 +377,7 @@ mod tests {
         let path = dir.path().join("credentials");
         let prev = std::env::var_os("HALLWARD_CREDENTIALS_PATH");
         let prev_openrouter = std::env::var_os("OPENROUTER_API_KEY");
-        let prev_gemini = std::env::var_os("GEMINI_API_KEY");
         std::env::remove_var("OPENROUTER_API_KEY");
-        std::env::remove_var("GEMINI_API_KEY");
         std::env::set_var("HALLWARD_CREDENTIALS_PATH", &path);
         save_api_key("override-key").unwrap();
         assert_eq!(resolve().unwrap().key, "override-key");
@@ -420,39 +389,5 @@ mod tests {
             Some(value) => std::env::set_var("OPENROUTER_API_KEY", value),
             None => std::env::remove_var("OPENROUTER_API_KEY"),
         }
-        match prev_gemini {
-            Some(value) => std::env::set_var("GEMINI_API_KEY", value),
-            None => std::env::remove_var("GEMINI_API_KEY"),
-        }
-    }
-
-    #[test]
-    fn legacy_gemini_env_key_still_loads() {
-        with_home(|_| {
-            std::env::set_var("GEMINI_API_KEY", "legacy-env");
-            let resolved = resolve().unwrap();
-            assert_eq!(resolved.key, "legacy-env");
-            assert_eq!(resolved.ask_model, DEFAULT_ASK_MODEL);
-        });
-    }
-
-    #[test]
-    fn legacy_gemini_file_key_still_loads() {
-        with_home(|path| {
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, "GEMINI_API_KEY=legacy-file\n").unwrap();
-            let resolved = resolve().unwrap();
-            assert_eq!(resolved.key, "legacy-file");
-            assert_eq!(resolved.ask_model, DEFAULT_ASK_MODEL);
-        });
-    }
-
-    #[test]
-    fn legacy_lowercase_key_still_loads() {
-        with_home(|path| {
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, "gemini_api_key=legacy-key\n").unwrap();
-            assert_eq!(resolve().unwrap().key, "legacy-key");
-        });
     }
 }

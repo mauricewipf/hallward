@@ -275,7 +275,12 @@ mod tests {
     fn delete_photo_and_prefix_do_not_overmatch() {
         let dir = tempfile::tempdir().unwrap();
         let conn = open(dir.path(), true).unwrap();
-        for rel in ["Rome/a.jpg", "Rome/sub/b.jpg", "Rome-2/a.jpg", "Paris/c.jpg"] {
+        for rel in [
+            "Rome/a.jpg",
+            "Rome/sub/b.jpg",
+            "Rome-2/a.jpg",
+            "Paris/c.jpg",
+        ] {
             upsert_photo(
                 &conn,
                 &Photo {

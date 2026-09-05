@@ -20,7 +20,7 @@ Terminal photo library: miller-style folders, a thumbnail grid for albums, an **
 - `libheif` / `heif-convert` for HEIC thumbnails (Arch: `pacman -S libheif`)
 - **ffmpeg** (ships `ffprobe`) for video **thumbnails** and Live Photo detection — not a player
 - A video player: **mpv**
-- An **OpenRouter API key** for Ask AI and image editing (`OPENROUTER_API_KEY` or paste in the TUI overlay on first use; legacy `GEMINI_API_KEY` still works)
+- An **OpenRouter API key** for Ask AI and image editing (`OPENROUTER_API_KEY` or paste in the TUI overlay on first use)
 
 **macOS:** still images open in built-in **Preview** (no extra install). Quit Preview (Cmd-Q) to return to Hallward, same as mpv. Video playback requires **mpv** (`brew install mpv`). FFmpeg’s `ffplay` is a terminal player: it tears down the TUI, dumps decoder logs to the shell, and is not an acceptable viewer. If the status pane says `video: ffplay` or `video: no player`, install mpv and restart Hallward until it shows `video: mpv`.
 
