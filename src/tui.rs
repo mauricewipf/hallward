@@ -2117,8 +2117,7 @@ fn credentials_setup_body() -> String {
 
 fn credentials_insecure_body(chmod_hint: &str) -> String {
     format!(
-        "Credentials file permissions are too open.\n\nRun:\n  {chmod_hint}\n\n\
-         Then run:\n  hallward credentials set"
+        "Credentials file permissions are too open.\n\nRun:\n  {chmod_hint}"
     )
 }
 
@@ -2915,6 +2914,7 @@ mod tests {
         assert!(body.contains("HALLWARD_OPENROUTER_API_KEY"));
         let insecure = credentials_insecure_body("chmod 600 ~/.config/hallward/credentials");
         assert!(insecure.contains("chmod 600"));
+        assert!(!insecure.contains("hallward credentials set"));
     }
 
     #[test]
