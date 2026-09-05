@@ -449,27 +449,39 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
-    /// Serializes tests that mutate HOME / HALLWARD_CREDENTIALS_PATH /
-    /// HALLWARD_OPENROUTER_API_KEY so parallel cargo test runs don't race on env vars.
+    /// Serializes tests that mutate HOME / XDG_CONFIG_HOME /
+    /// HALLWARD_CREDENTIALS_PATH / HALLWARD_OPENROUTER_API_KEY so parallel cargo test
+    /// runs don't race on env vars.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn with_home<F: FnOnce(PathBuf)>(f: F) {
-        let _lock = ENV_LOCK.lock().unwrap();
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn with_home_in<F: FnOnce(PathBuf)>(f: F) {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_path_buf();
-        let creds = home.join(".config/hallward/credentials");
         let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
         let prev_path = std::env::var_os("HALLWARD_CREDENTIALS_PATH");
         let prev_hallward = std::env::var_os(ENV_KEY);
         let prev_openrouter = std::env::var_os("OPENROUTER_API_KEY");
         std::env::remove_var("HALLWARD_CREDENTIALS_PATH");
+        std::env::remove_var("XDG_CONFIG_HOME");
         std::env::remove_var(ENV_KEY);
         std::env::remove_var("OPENROUTER_API_KEY");
         std::env::set_var("HOME", &home);
+        let creds = credentials_path().unwrap();
         f(creds);
         match prev_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
+        }
+        match prev_xdg {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
         match prev_path {
             Some(value) => std::env::set_var("HALLWARD_CREDENTIALS_PATH", value),
@@ -483,6 +495,11 @@ mod tests {
             Some(value) => std::env::set_var("OPENROUTER_API_KEY", value),
             None => std::env::remove_var("OPENROUTER_API_KEY"),
         }
+    }
+
+    fn with_home<F: FnOnce(PathBuf)>(f: F) {
+        let _lock = env_lock();
+        with_home_in(f);
     }
 
     #[test]
@@ -590,8 +607,24 @@ mod tests {
     }
 
     #[test]
+    fn with_home_ignores_external_xdg_config_home() {
+        let _lock = env_lock();
+        let external_xdg = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", external_xdg.path());
+        with_home_in(|path| {
+            set_key("isolated-key").unwrap();
+            assert_eq!(path, credentials_path().unwrap());
+            assert!(path.is_file());
+            assert!(
+                !path.starts_with(external_xdg.path()),
+                "with_home must not write under the process XDG_CONFIG_HOME"
+            );
+        });
+    }
+
+    #[test]
     fn explicit_credentials_path_override() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials");
         let prev = std::env::var_os("HALLWARD_CREDENTIALS_PATH");
@@ -661,7 +694,7 @@ mod tests {
 
     #[test]
     fn xdg_config_home_is_honored() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let xdg = dir.path().join("xdg");
         let creds = xdg.join("hallward/credentials");
