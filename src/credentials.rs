@@ -162,9 +162,7 @@ pub fn config_dir() -> Result<PathBuf, String> {
     }
     let home = std::env::var_os("HOME")
         .ok_or_else(|| "Could not find a home directory for API credentials.".to_string())?;
-    Ok(PathBuf::from(home)
-        .join(".config")
-        .join("hallward"))
+    Ok(PathBuf::from(home).join(".config").join("hallward"))
 }
 
 /// Write the OpenRouter key to the credentials file (CLI-only writer).
@@ -213,9 +211,7 @@ pub fn clear() -> Result<(), String> {
 }
 
 pub fn invalid_env_key_message() -> String {
-    format!(
-        "OpenRouter rejected {ENV_KEY}. Unset or replace it and try again."
-    )
+    format!("OpenRouter rejected {ENV_KEY}. Unset or replace it and try again.")
 }
 
 pub fn invalid_saved_key_message() -> String {
@@ -250,8 +246,7 @@ pub fn read_secret_from_stdin() -> Result<String, String> {
                             return Err("Cancelled.".into());
                         }
                         KeyCode::Char(c)
-                            if key.modifiers.is_empty()
-                                || key.modifiers == KeyModifiers::SHIFT =>
+                            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
                         {
                             secret.push(c);
                         }
@@ -360,12 +355,8 @@ fn fix_dir_mode(dir: &Path) -> Result<(), String> {
         .mode()
         & 0o777;
     if mode != 0o700 {
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|error| {
-            format!(
-                "Could not set {} to mode 0700: {error}",
-                dir.display()
-            )
-        })?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("Could not set {} to mode 0700: {error}", dir.display()))?;
     }
     Ok(())
 }
@@ -405,11 +396,7 @@ fn check_secure_permissions(_path: &Path) -> Result<(), String> {
 fn chmod_hint(path: &Path) -> String {
     let path_display = path.display();
     if let Some(parent) = path.parent() {
-        format!(
-            "chmod 700 {}\nchmod 600 {}",
-            parent.display(),
-            path_display
-        )
+        format!("chmod 700 {}\nchmod 600 {}", parent.display(), path_display)
     } else {
         format!("chmod 600 {path_display}")
     }
@@ -538,8 +525,11 @@ mod tests {
             assert_eq!(parsed.resolved_key(), Some("secret-key".into()));
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
-            let dir_mode =
-                fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+            let dir_mode = fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(dir_mode, 0o700);
             let resolved = resolve().unwrap();
             assert_eq!(resolved.key, "secret-key");
@@ -559,8 +549,7 @@ mod tests {
             )
             .unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-            fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700))
-                .unwrap();
+            fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
             let resolved = resolve().unwrap();
             assert_eq!(resolved.ask_model, "custom/ask");
             assert_eq!(resolved.edit_model, "custom/edit");
@@ -581,8 +570,7 @@ mod tests {
             )
             .unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-            fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700))
-                .unwrap();
+            fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
             std::env::set_var(ENV_KEY, "env-key");
             let resolved = resolve().unwrap();
             assert_eq!(resolved.key, "env-key");
@@ -638,8 +626,7 @@ mod tests {
             )
             .unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-            fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700))
-                .unwrap();
+            fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
             set_key("new-key").unwrap();
             let contents = fs::read_to_string(&path).unwrap();
             assert!(contents.contains("OPENROUTER_API_KEY=new-key"));

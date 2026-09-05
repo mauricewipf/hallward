@@ -115,12 +115,10 @@ fn run_credentials(cmd: CredentialsCmd) -> Result<()> {
     match cmd {
         CredentialsCmd::Set { from_env } => {
             let key = if from_env {
-                std::env::var("HALLWARD_OPENROUTER_API_KEY").map_err(|_| {
-                    anyhow::anyhow!("HALLWARD_OPENROUTER_API_KEY is not set.")
-                })?
+                std::env::var("HALLWARD_OPENROUTER_API_KEY")
+                    .map_err(|_| anyhow::anyhow!("HALLWARD_OPENROUTER_API_KEY is not set."))?
             } else {
-                credentials::read_secret_from_stdin()
-                    .map_err(anyhow::Error::msg)?
+                credentials::read_secret_from_stdin().map_err(anyhow::Error::msg)?
             };
             credentials::set_key(&key).map_err(anyhow::Error::msg)?;
             let path = credentials::credentials_path().map_err(anyhow::Error::msg)?;

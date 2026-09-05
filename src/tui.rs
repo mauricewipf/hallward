@@ -2116,9 +2116,7 @@ fn credentials_setup_body() -> String {
 }
 
 fn credentials_insecure_body(chmod_hint: &str) -> String {
-    format!(
-        "Credentials file permissions are too open.\n\nRun:\n  {chmod_hint}"
-    )
+    format!("Credentials file permissions are too open.\n\nRun:\n  {chmod_hint}")
 }
 
 fn draw_credentials_overlay(frame: &mut Frame, app: &App) {
