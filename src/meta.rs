@@ -10,6 +10,13 @@ use exif::{In, Reader, Tag, Value};
 /// identical while large RAWs/HEICs avoid a full-file read on the miss path.
 const EXIF_HEAD_CAP: u64 = 1024 * 1024;
 
+/// Bytes of TIFF payload assumed to follow an `Exif` marker. Blobs carrying
+/// the tags we read fit well within this (JPEG APP1 segments are capped at
+/// 64 KiB); if a marker starts closer than this to the head truncation
+/// point, fall back to a full read so a parse can never succeed on truncated
+/// input and return partial metadata.
+const EXIF_TAIL_MARGIN: u64 = 64 * 1024;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PhotoMeta {
     pub captured_at: Option<String>,
@@ -74,11 +81,27 @@ fn read_meta_inner(path: &Path) -> Result<PhotoMeta> {
     File::open(path)?
         .take(EXIF_HEAD_CAP)
         .read_to_end(&mut head)?;
-    if let Some(meta) = parse_embedded_exif(&head) {
-        return Ok(meta);
+    // Trust the head parse only when the blob starts far enough from the
+    // truncation point that its payload cannot be cut off; otherwise read
+    // the whole file.
+    if head_blob_complete(&head) {
+        if let Some(meta) = parse_embedded_exif(&head) {
+            return Ok(meta);
+        }
     }
     let bytes = std::fs::read(path)?;
     Ok(parse_embedded_exif(&bytes).unwrap_or_default())
+}
+
+/// True when the head window holds no `Exif` marker within `EXIF_TAIL_MARGIN`
+/// of its end, i.e. a successful head parse cannot be the product of
+/// truncated TIFF input. A missing marker also returns true: the head parse
+/// then finds nothing and the caller falls through to the full read anyway.
+fn head_blob_complete(head: &[u8]) -> bool {
+    match find_subslice(head, b"Exif\0\0") {
+        Some(pos) => (pos as u64) + EXIF_TAIL_MARGIN <= head.len() as u64,
+        None => true,
+    }
 }
 
 fn parse_embedded_exif(bytes: &[u8]) -> Option<PhotoMeta> {
@@ -192,6 +215,19 @@ mod tests {
         let jpeg = embedded_jpeg(&data).unwrap();
         assert_eq!(jpeg.first(), Some(&0xFF));
         assert_eq!(jpeg.last(), Some(&0xD9));
+    }
+
+    #[test]
+    fn head_parse_rejected_near_truncation_point() {
+        // No marker: head parse is attempted (and finds nothing).
+        assert!(head_blob_complete(&vec![0u8; 70_000]));
+        let mut far = vec![0u8; 70_000];
+        far[0..6].copy_from_slice(b"Exif\0\0");
+        assert!(head_blob_complete(&far));
+        // Marker within the 64 KiB tail margin: must not be trusted.
+        let mut near = vec![0u8; 70_000];
+        near[5_000..5_006].copy_from_slice(b"Exif\0\0");
+        assert!(!head_blob_complete(&near));
     }
 
     #[test]
