@@ -132,6 +132,9 @@ fn index_library_inner(root: &Path, progress: Option<&CliProgress>) -> Result<In
     let have_ffmpeg = media::bin_on_path("ffmpeg");
     let have_ffprobe = media::bin_on_path("ffprobe");
     let mut warned_ffprobe = false;
+    // One query up front: the scan loop below must not pay a point-SELECT
+    // per file (N+1 reads dominate warm runs on large/slow mounts).
+    let existing = catalog::all_mtime_sizes(&conn)?;
 
     for entry in WalkDir::new(root).into_iter().filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
@@ -157,11 +160,17 @@ fn index_library_inner(root: &Path, progress: Option<&CliProgress>) -> Result<In
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
-        let meta_fs = fs::metadata(path)?;
+        let meta_fs = entry.metadata()?;
         let mtime = mtime_epoch(&meta_fs)?;
         let size = meta_fs.len() as i64;
-        if let Some((old_m, old_s)) = catalog::get_mtime_size(&conn, &rel)? {
-            if old_m == mtime && old_s == size && thumbs::is_current(root, path, &rel) {
+        if let Some(&(old_m, old_s)) = existing.get(&rel) {
+            if old_m == mtime
+                && old_s == size
+                && meta_fs
+                    .modified()
+                    .map(|src_m| thumbs::is_current_with_src_mtime(root, &rel, src_m))
+                    .unwrap_or(false)
+            {
                 seen.push(rel);
                 stats.skipped += 1;
                 continue;
@@ -208,7 +217,9 @@ fn index_library_inner(root: &Path, progress: Option<&CliProgress>) -> Result<In
             let result = if is_video(&abs) && !have_ffmpeg {
                 (photo, None)
             } else {
-                match thumbs::generate_thumb(root, &abs, &photo.relpath) {
+                // Freshness was verified in the scan loop above; skip the
+                // re-stat so dirty files cost one pass over the bytes.
+                match thumbs::generate_thumb_force(root, &abs, &photo.relpath) {
                     Ok(_) => (photo, None),
                     Err(e) => (photo, Some(format!("{e:#}"))),
                 }

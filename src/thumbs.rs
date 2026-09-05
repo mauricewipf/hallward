@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use image::imageops::FilterType;
@@ -39,10 +40,16 @@ pub fn thumb_path(root: &Path, relpath: &str) -> PathBuf {
 
 /// True when a 256×256 thumb exists and is at least as new as the original.
 pub fn is_current(root: &Path, abs: &Path, relpath: &str) -> bool {
-    let out = thumb_path(root, relpath);
     let Ok(src_m) = abs.metadata().and_then(|m| m.modified()) else {
         return false;
     };
+    is_current_with_src_mtime(root, relpath, src_m)
+}
+
+/// `is_current` when the source mtime is already known (e.g. from a directory
+/// scan), saving one `stat` per file on bulk runs.
+pub fn is_current_with_src_mtime(root: &Path, relpath: &str, src_m: SystemTime) -> bool {
+    let out = thumb_path(root, relpath);
     let Ok(dst_m) = out.metadata().and_then(|m| m.modified()) else {
         return false;
     };
@@ -50,14 +57,20 @@ pub fn is_current(root: &Path, abs: &Path, relpath: &str) -> bool {
 }
 
 pub fn generate_thumb(root: &Path, abs: &Path, relpath: &str) -> Result<PathBuf> {
+    if is_current(root, abs, relpath) {
+        return Ok(thumb_path(root, relpath));
+    }
+    generate_thumb_force(root, abs, relpath)
+}
+
+/// `generate_thumb` without the freshness re-check, for callers that already
+/// verified staleness (bulk indexer). A file changed in the race window is
+/// self-healing: the next index sees the mtime/size mismatch and regenerates.
+pub fn generate_thumb_force(root: &Path, abs: &Path, relpath: &str) -> Result<PathBuf> {
     let out = thumb_path(root, relpath);
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
     }
-    if is_current(root, abs, relpath) {
-        return Ok(out);
-    }
-
     let img = load_image(abs).with_context(|| format!("decode {}", abs.display()))?;
     let thumb = crop_square(img);
     thumb

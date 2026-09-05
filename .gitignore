@@ -7,6 +7,10 @@ medialibrary/*
 !medialibrary/Instructions/Getting Started/hallward-install-omarchy-infographic.png
 !medialibrary/Instructions/Getting Started/hallward-keybindings-infographic-pil.png
 
+# Benchmark libraries (generated, never commit)
+benchdata/*
+!benchdata/.gitkeep
+
 # Generated catalog and thumbs (inside the library root)
 .album/
 **/.album/

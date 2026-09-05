@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -68,15 +69,23 @@ pub fn open(root: &Path, create: bool) -> Result<Connection> {
     Ok(conn)
 }
 
-pub fn get_mtime_size(conn: &Connection, relpath: &str) -> Result<Option<(i64, i64)>> {
-    let row = conn
-        .query_row(
-            "SELECT mtime, size FROM photos WHERE relpath = ?1",
-            [relpath],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(row)
+/// All `(relpath → (mtime, size))` rows in one query so bulk scans don't pay
+/// a point-`SELECT` per file (N+1 reads on large libraries / slow mounts).
+pub fn all_mtime_sizes(conn: &Connection) -> Result<HashMap<String, (i64, i64)>> {
+    let mut stmt = conn.prepare("SELECT relpath, mtime, size FROM photos")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (rel, mtime, size) = row?;
+        map.insert(rel, (mtime, size));
+    }
+    Ok(map)
 }
 
 pub fn captured_at(conn: &Connection, relpath: &str) -> Result<Option<String>> {

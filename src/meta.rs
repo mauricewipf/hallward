@@ -1,9 +1,14 @@
 use std::fs::File;
-use std::io::{BufReader, Cursor};
+use std::io::{BufReader, Cursor, Read};
 use std::path::Path;
 
 use anyhow::Result;
 use exif::{In, Reader, Tag, Value};
+
+/// EXIF blobs live near the head of the file. Read this much first; the rare
+/// file with a deeper blob still gets a full read as fallback, so results are
+/// identical while large RAWs/HEICs avoid a full-file read on the miss path.
+const EXIF_HEAD_CAP: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PhotoMeta {
@@ -58,23 +63,55 @@ fn read_meta_inner(path: &Path) -> Result<PhotoMeta> {
     if let Ok(exif) = Reader::new().read_from_container(&mut BufReader::new(&mut file)) {
         return Ok(from_exif(&exif));
     }
-    // HEIC and some DNG: scan for an Exif TIFF blob.
-    let bytes = std::fs::read(path)?;
-    if let Some(meta) = parse_embedded_exif(&bytes) {
+    // HEIC and some DNG: scan for an Exif TIFF blob. Head first (covers the
+    // common layouts without reading tens of MB); full read only on miss.
+    let len = path.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+    if len <= EXIF_HEAD_CAP {
+        let bytes = std::fs::read(path)?;
+        return Ok(parse_embedded_exif(&bytes).unwrap_or_default());
+    }
+    let mut head = Vec::new();
+    File::open(path)?
+        .take(EXIF_HEAD_CAP)
+        .read_to_end(&mut head)?;
+    if let Some(meta) = parse_embedded_exif(&head) {
         return Ok(meta);
     }
-    Ok(PhotoMeta::default())
+    let bytes = std::fs::read(path)?;
+    Ok(parse_embedded_exif(&bytes).unwrap_or_default())
 }
 
 fn parse_embedded_exif(bytes: &[u8]) -> Option<PhotoMeta> {
     let needle = b"Exif\0\0";
-    let pos = bytes.windows(needle.len()).position(|w| w == needle)?;
+    let pos = find_subslice(bytes, needle)?;
     let tiff = &bytes[pos + needle.len()..];
     let exif = Reader::new()
         .read_raw(tiff.to_vec())
         .or_else(|_| Reader::new().read_from_container(&mut Cursor::new(tiff)))
         .ok()?;
     Some(from_exif(&exif))
+}
+
+/// First index of `needle` in `haystack` (like `<[u8]>::windows().position`,
+/// without the per-window closure overhead on multi-MB scans).
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    let first = needle[0];
+    let rest = &needle[1..];
+    haystack
+        .iter()
+        .position(|&b| b == first)
+        .and_then(|mut i| loop {
+            if haystack.len() - i < needle.len() {
+                return None;
+            }
+            if &haystack[i + 1..i + needle.len()] == rest {
+                return Some(i);
+            }
+            i += haystack[i + 1..].iter().position(|&b| b == first)? + 1;
+        })
 }
 
 fn from_exif(exif: &exif::Exif) -> PhotoMeta {
@@ -122,10 +159,26 @@ fn uint_tag(exif: &exif::Exif, tag: Tag) -> Option<u32> {
 
 /// Best-effort JPEG preview embedded in DNG/TIFF.
 pub fn embedded_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
-    let start = bytes.windows(3).position(|w| w == [0xFF, 0xD8, 0xFF])?;
+    let start = find_marker(bytes, &[0xFF, 0xD8, 0xFF])?;
     let rest = &bytes[start..];
-    let end_rel = rest.windows(2).position(|w| w == [0xFF, 0xD9])?;
+    let end_rel = find_marker(rest, &[0xFF, 0xD9])?;
     Some(rest[..=end_rel + 1].to_vec())
+}
+
+/// First offset where `needle` starts (plain byte loop: no
+/// `windows()` closure per position on multi-MB RAW scans).
+fn find_marker(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    let mut i = 0;
+    while i + needle.len() <= haystack.len() {
+        if haystack[i] == needle[0] && &haystack[i..i + needle.len()] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]

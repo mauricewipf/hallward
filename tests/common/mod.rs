@@ -88,6 +88,65 @@ impl Fixture {
     }
 }
 
+/// Write a deterministic benchmark JPEG at `rel` under `root` without
+/// indexing it (bulk-index later with `index::index_library`).
+///
+/// Pixels are seeded gradient + noise so JPEG byte size and decode cost are
+/// realistic (solid colors would compress to almost nothing). Generation is
+/// kept cheap on purpose: one noisy scanline is synthesized with an LCG,
+/// remaining rows are rotated `memcpy`s, then a single JPEG encode.
+pub fn write_bench_jpeg(root: &Path, rel: &str, width: u32, height: u32, seed: u64) -> PathBuf {
+    assert!(width > 0 && height > 0, "bench image needs nonzero size");
+    let abs = root.join(rel);
+    fs::create_dir_all(abs.parent().expect("bench photo parent")).expect("mkdirs");
+    let mut img = RgbImage::new(width, height);
+    let row_len = width as usize * 3;
+    let mut state = seed
+        .wrapping_add(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(u64::from(width) << 32 | u64::from(height));
+    if state == 0 {
+        state = 1;
+    }
+    let mut next_byte = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as u8
+    };
+    {
+        let buf = img.as_mut();
+        for (i, byte) in buf[..row_len].iter_mut().enumerate() {
+            let x = (i / 3) as u8;
+            let channel = (i % 3) as u8;
+            let noise = next_byte();
+            *byte = match channel {
+                0 => x.wrapping_add(noise),
+                1 => x
+                    .wrapping_mul(7)
+                    .wrapping_add(seed as u8)
+                    .wrapping_add(noise >> 1),
+                _ => noise ^ 0x80,
+            };
+        }
+    }
+    let row0: Vec<u8> = img.as_mut()[..row_len].to_vec();
+    for y in 1..height as usize {
+        let shift_px = (y * 37) % width as usize;
+        let shift = shift_px * 3;
+        let dst = y * row_len;
+        let buf = img.as_mut();
+        if shift == 0 {
+            buf[dst..dst + row_len].copy_from_slice(&row0);
+        } else {
+            let mid = row_len - shift;
+            buf[dst..dst + mid].copy_from_slice(&row0[shift..]);
+            buf[dst + mid..dst + row_len].copy_from_slice(&row0[..shift]);
+        }
+    }
+    img.save(&abs).expect("write bench photo");
+    abs
+}
+
 // ---------------------------------------------------------------------------
 // Credentials isolation (never touch the developer's real key)
 // ---------------------------------------------------------------------------
