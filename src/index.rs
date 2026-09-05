@@ -648,4 +648,17 @@ mod tests {
             Some("Rome/DSC_0001.DNG")
         );
     }
+
+    #[test]
+    fn standalone_dng_indexes_without_raw_twin() {
+        let (_tmp, root) = mini_library();
+        std::fs::write(root.join("Rome/orphan.DNG"), b"dng").unwrap();
+        index_library(&root).unwrap();
+        let conn = catalog::open(&root, false).unwrap();
+        assert_eq!(catalog::count(&conn).unwrap(), 1);
+        let photos = catalog::photos_in_album(&conn, "Rome").unwrap();
+        assert_eq!(photos.len(), 1);
+        assert_eq!(photos[0].relpath, "Rome/orphan.DNG");
+        assert!(photos[0].raw_relpath.is_none());
+    }
 }

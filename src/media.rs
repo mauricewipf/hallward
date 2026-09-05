@@ -140,11 +140,11 @@ fn is_jpeg_dng_still(path: &Path) -> bool {
 
 /// Same-stem DNG sibling for a developed JPEG still, if present.
 pub fn dng_twin_for_still(still: &Path) -> Option<PathBuf> {
-    let parent = still.parent()?;
-    let stem = still.file_stem()?.to_str()?;
-    if stem.is_empty() || is_edited_sidecar_stem(stem) {
+    if !is_jpeg_dng_still(still) {
         return None;
     }
+    let parent = still.parent()?;
+    let stem = still.file_stem()?.to_str()?;
     dng_at_stem(parent, stem)
 }
 
@@ -309,6 +309,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         File::create(dir.path().join("solo.DNG")).unwrap();
         assert!(!is_dng_raw_companion(&dir.path().join("solo.DNG")));
+    }
+
+    #[test]
+    fn standalone_dng_does_not_twin_with_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = dir.path().join("orphan.DNG");
+        File::create(&orphan).unwrap();
+        assert!(dng_twin_for_still(&orphan).is_none());
     }
 
     #[test]
