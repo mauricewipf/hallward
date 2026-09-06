@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Result};
@@ -34,20 +37,29 @@ impl IndexStats {
     }
 }
 
-/// CLI-only progress display and cancellation state. The signal handler only
-/// sets a flag, leaving catalog writes and terminal cleanup to the indexer.
+/// CLI-only progress display and cancellation state.
+///
+/// The first Ctrl+C sets a flag the indexer polls; the second exits immediately
+/// so a hung network `stat`/`readdir` cannot trap the process.
+#[derive(Clone)]
 pub struct CliProgress {
     cancelled: Arc<AtomicBool>,
     scanning: ProgressBar,
-    thumbnails: Mutex<Option<ProgressBar>>,
+    thumbnails: Arc<Mutex<Option<ProgressBar>>>,
 }
+
+const CANCEL_HINT: &str = "Cancelling… (press Ctrl+C again to force quit)";
+const CANCEL_POLL: Duration = Duration::from_millis(50);
 
 impl CliProgress {
     pub fn new() -> Result<Self> {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let signal_cancelled = Arc::clone(&cancelled);
-        ctrlc::set_handler(move || signal_cancelled.store(true, Ordering::SeqCst))?;
+        let this = Self::with_spinner(Arc::new(AtomicBool::new(false)))?;
+        let handler = this.clone();
+        ctrlc::set_handler(move || handler.on_sigint())?;
+        Ok(this)
+    }
 
+    fn with_spinner(cancelled: Arc<AtomicBool>) -> Result<Self> {
         let scanning = ProgressBar::new_spinner();
         scanning.set_style(
             ProgressStyle::with_template("{spinner:.cyan} {msg}  [{elapsed_precise}]")?
@@ -58,8 +70,26 @@ impl CliProgress {
         Ok(Self {
             cancelled,
             scanning,
-            thumbnails: Mutex::new(None),
+            thumbnails: Arc::new(Mutex::new(None)),
         })
+    }
+
+    fn on_sigint(&self) {
+        if self.cancelled.swap(true, Ordering::SeqCst) {
+            self.finish();
+            eprintln!("Indexing cancelled");
+            std::process::exit(130);
+        }
+        self.show_cancelling();
+    }
+
+    fn show_cancelling(&self) {
+        self.scanning.set_message(CANCEL_HINT);
+        if let Ok(guard) = self.thumbnails.lock() {
+            if let Some(bar) = guard.as_ref() {
+                bar.set_message(CANCEL_HINT);
+            }
+        }
     }
 
     fn check_cancelled(&self) -> Result<()> {
@@ -70,6 +100,9 @@ impl CliProgress {
     }
 
     fn scanned(&self) {
+        if self.cancelled.load(Ordering::SeqCst) {
+            return;
+        }
         self.scanning.inc(1);
         self.scanning.set_message(format!(
             "Scanning library… {} media files examined",
@@ -92,19 +125,25 @@ impl CliProgress {
         bar
     }
 
+    #[cfg(test)]
+    fn hidden(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            cancelled,
+            scanning: ProgressBar::hidden(),
+            thumbnails: Arc::new(Mutex::new(None)),
+        }
+    }
+
     pub fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
 
     pub fn finish(&self) {
         self.scanning.finish_and_clear();
-        if let Some(bar) = self
-            .thumbnails
-            .lock()
-            .expect("progress lock poisoned")
-            .take()
-        {
-            bar.finish_and_clear();
+        if let Ok(mut guard) = self.thumbnails.lock() {
+            if let Some(bar) = guard.take() {
+                bar.finish_and_clear();
+            }
         }
     }
 }
@@ -124,17 +163,113 @@ pub fn index_library_with_progress(root: &Path, progress: &CliProgress) -> Resul
     index_library_inner(root, Some(progress))
 }
 
+struct ScanOutcome {
+    seen: Vec<String>,
+    dirty: Vec<Photo>,
+    stats: IndexStats,
+}
+
+/// Run `work` on a helper thread while progress is showing so Ctrl+C is
+/// noticed even when the worker is blocked in a network `readdir`/`stat`.
+/// On cancel the helper is detached; the CLI process then exits.
+fn run_cancellable<T, F>(progress: Option<&CliProgress>, work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let Some(progress) = progress else {
+        return Ok(work());
+    };
+    let (tx, rx) = mpsc::sync_channel(1);
+    let handle = thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    match wait_cancellable(&rx, progress) {
+        Ok(value) => {
+            let _ = handle.join();
+            Ok(value)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn wait_cancellable<T>(rx: &mpsc::Receiver<T>, progress: &CliProgress) -> Result<T> {
+    loop {
+        match rx.recv_timeout(CANCEL_POLL) {
+            Ok(value) => return Ok(value),
+            Err(RecvTimeoutError::Timeout) => progress.check_cancelled()?,
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("index worker exited unexpectedly")
+            }
+        }
+    }
+}
+
 fn index_library_inner(root: &Path, progress: Option<&CliProgress>) -> Result<IndexStats> {
     let mut conn = catalog::open(root, true)?;
-    let mut stats = IndexStats::default();
-    let mut seen = Vec::new();
-    let mut dirty: Vec<Photo> = Vec::new();
     let have_ffmpeg = media::bin_on_path("ffmpeg");
     let have_ffprobe = media::bin_on_path("ffprobe");
-    let mut warned_ffprobe = false;
     // One query up front: the scan loop below must not pay a point-SELECT
     // per file (N+1 reads dominate warm runs on large/slow mounts).
     let existing = catalog::all_index_state(&conn)?;
+    let progress_owned = progress.cloned();
+    let root_buf = root.to_path_buf();
+
+    let scan = run_cancellable(progress, {
+        let progress_owned = progress_owned.clone();
+        let root_buf = root_buf.clone();
+        move || scan_library(&root_buf, existing, have_ffprobe, progress_owned.as_ref())
+    })??;
+
+    if !have_ffmpeg && scan.dirty.iter().any(|p| is_video(&root.join(&p.relpath))) {
+        eprintln!(
+            "hallward: ffmpeg not found; video thumbnails skipped (install ffmpeg to enable)"
+        );
+    }
+    let thumbnail_progress = progress.map(|p| p.start_thumbnails(scan.dirty.len() as u64));
+    let results = run_cancellable(progress, {
+        let progress_owned = progress_owned.clone();
+        move || {
+            generate_thumbs(
+                &root_buf,
+                scan.dirty,
+                have_ffmpeg,
+                progress_owned.as_ref(),
+                thumbnail_progress.as_ref(),
+            )
+        }
+    })??;
+
+    if let Some(progress) = progress {
+        progress.check_cancelled()?;
+    }
+    let photos: Vec<Photo> = results.iter().map(|(photo, _)| photo.clone()).collect();
+    let mut stats = scan.stats;
+    stats.removed = catalog::apply_index_changes(&mut conn, &scan.seen, &photos)?;
+    for (photo, err) in results {
+        if let Some(e) = err {
+            eprintln!("hallward: thumbnail failed for {}: {e}", photo.relpath);
+            stats.failed += 1;
+        }
+        stats.added_or_updated += 1;
+    }
+    stats.total = catalog::count(&conn)?;
+    if let Some(progress) = progress {
+        progress.finish();
+    }
+    Ok(stats)
+}
+
+fn scan_library(
+    root: &Path,
+    existing: HashMap<String, (i64, i64, Option<String>)>,
+    have_ffprobe: bool,
+    progress: Option<&CliProgress>,
+) -> Result<ScanOutcome> {
+    let mut stats = IndexStats::default();
+    let mut seen = Vec::new();
+    let mut dirty: Vec<Photo> = Vec::new();
+    let mut warned_ffprobe = false;
 
     for entry in WalkDir::new(root).into_iter().filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
@@ -212,13 +347,17 @@ fn index_library_inner(root: &Path, progress: Option<&CliProgress>) -> Result<In
         ));
     }
 
-    if !have_ffmpeg && dirty.iter().any(|p| is_video(&root.join(&p.relpath))) {
-        eprintln!(
-            "hallward: ffmpeg not found; video thumbnails skipped (install ffmpeg to enable)"
-        );
-    }
-    let thumbnail_progress = progress.map(|p| p.start_thumbnails(dirty.len() as u64));
-    let results: Vec<(Photo, Option<String>)> = dirty
+    Ok(ScanOutcome { seen, dirty, stats })
+}
+
+fn generate_thumbs(
+    root: &Path,
+    dirty: Vec<Photo>,
+    have_ffmpeg: bool,
+    progress: Option<&CliProgress>,
+    thumbnail_progress: Option<&ProgressBar>,
+) -> Result<Vec<(Photo, Option<String>)>> {
+    dirty
         .into_par_iter()
         .map(|photo| -> Result<_> {
             if let Some(progress) = progress {
@@ -235,7 +374,7 @@ fn index_library_inner(root: &Path, progress: Option<&CliProgress>) -> Result<In
                     Err(e) => (photo, Some(format!("{e:#}"))),
                 }
             };
-            if let Some(bar) = &thumbnail_progress {
+            if let Some(bar) = thumbnail_progress {
                 bar.inc(1);
             }
             if let Some(progress) = progress {
@@ -243,25 +382,7 @@ fn index_library_inner(root: &Path, progress: Option<&CliProgress>) -> Result<In
             }
             Ok(result)
         })
-        .collect::<Result<_>>()?;
-
-    if let Some(progress) = progress {
-        progress.check_cancelled()?;
-    }
-    let photos: Vec<Photo> = results.iter().map(|(photo, _)| photo.clone()).collect();
-    stats.removed = catalog::apply_index_changes(&mut conn, &seen, &photos)?;
-    for (photo, err) in results {
-        if let Some(e) = err {
-            eprintln!("hallward: thumbnail failed for {}: {e}", photo.relpath);
-            stats.failed += 1;
-        }
-        stats.added_or_updated += 1;
-    }
-    stats.total = catalog::count(&conn)?;
-    if let Some(progress) = progress {
-        progress.finish();
-    }
-    Ok(stats)
+        .collect()
 }
 
 /// Index a single new still without pruning the rest of the catalog.
@@ -513,6 +634,7 @@ mod tests {
     use crate::catalog;
     use crate::clipboard::{paste, paste_into, Clipboard, ClipboardOp};
     use image::{Rgb, RgbImage};
+    use std::time::Instant;
 
     fn write_still(path: &Path) {
         RgbImage::from_pixel(32, 24, Rgb([10, 20, 30]))
@@ -718,5 +840,40 @@ mod tests {
         assert_eq!(photos.len(), 1);
         assert_eq!(photos[0].relpath, "Rome/DSC_0001-edited.DNG");
         assert!(photos[0].raw_relpath.is_none());
+    }
+
+    #[test]
+    fn wait_cancellable_stops_without_worker_result() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let progress = CliProgress::hidden(Arc::clone(&cancelled));
+        let (tx, rx) = mpsc::channel::<()>();
+        let started = Instant::now();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            cancelled.store(true, Ordering::SeqCst);
+            std::mem::forget(tx);
+        });
+        let err = wait_cancellable(&rx, &progress).unwrap_err();
+        assert!(err.to_string().contains("indexing cancelled"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn wait_cancellable_yields_worker_value() {
+        let progress = CliProgress::hidden(Arc::new(AtomicBool::new(false)));
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || tx.send(9u8).unwrap());
+        assert_eq!(wait_cancellable(&rx, &progress).unwrap(), 9);
+    }
+
+    #[test]
+    fn cancel_before_scan_skips_catalog_writes() {
+        let (_tmp, root) = mini_library();
+        write_still(&root.join("Rome/a.jpg"));
+        let progress = CliProgress::hidden(Arc::new(AtomicBool::new(true)));
+        let err = index_library_with_progress(&root, &progress).unwrap_err();
+        assert!(err.to_string().contains("indexing cancelled"), "{err}");
+        let conn = catalog::open(&root, false).unwrap();
+        assert_eq!(catalog::count(&conn).unwrap(), 0);
     }
 }
