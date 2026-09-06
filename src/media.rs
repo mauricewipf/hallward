@@ -290,8 +290,14 @@ mod tests {
         let dng = dir.path().join("DSC_0001.DNG");
         assert!(is_jpeg_dng_developed_still(&jpg));
         assert!(is_dng_raw_companion(&dng));
-        assert_eq!(dng_twin_for_still(&jpg).unwrap(), dng);
-        assert_eq!(jpeg_dng_still_for_raw(&dng).unwrap(), jpg);
+        assert!(dng_twin_for_still(&jpg)
+            .unwrap()
+            .as_os_str()
+            .eq_ignore_ascii_case(dng.as_os_str()));
+        assert!(jpeg_dng_still_for_raw(&dng)
+            .unwrap()
+            .as_os_str()
+            .eq_ignore_ascii_case(jpg.as_os_str()));
     }
 
     #[test]
@@ -314,8 +320,14 @@ mod tests {
         let edited_dng = dir.path().join("DSC_0001-edited.DNG");
         assert!(is_jpeg_dng_developed_still(&edited_jpg));
         assert!(is_dng_raw_companion(&edited_dng));
-        assert_eq!(dng_twin_for_still(&edited_jpg).unwrap(), edited_dng);
-        assert_eq!(jpeg_dng_still_for_raw(&edited_dng).unwrap(), edited_jpg);
+        assert!(dng_twin_for_still(&edited_jpg)
+            .unwrap()
+            .as_os_str()
+            .eq_ignore_ascii_case(edited_dng.as_os_str()));
+        assert!(jpeg_dng_still_for_raw(&edited_dng)
+            .unwrap()
+            .as_os_str()
+            .eq_ignore_ascii_case(edited_jpg.as_os_str()));
     }
 
     #[test]

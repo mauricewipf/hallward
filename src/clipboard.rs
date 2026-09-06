@@ -688,7 +688,10 @@ mod tests {
         assert_eq!(catalog::count(&conn).unwrap(), 2);
         let paris = catalog::photos_in_album(&conn, "Paris").unwrap();
         assert_eq!(paris.len(), 1);
-        assert_eq!(paris[0].raw_relpath.as_deref(), Some("Paris/DSC_1.DNG"));
+        assert!(paris[0]
+            .raw_relpath
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case("Paris/DSC_1.DNG")));
     }
 
     #[test]

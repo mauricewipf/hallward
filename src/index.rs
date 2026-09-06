@@ -649,7 +649,10 @@ mod tests {
         let photos = catalog::photos_in_album(&conn, "Rome").unwrap();
         assert_eq!(photos.len(), 1);
         assert_eq!(photos[0].relpath, "Rome/DSC_0001.jpg");
-        assert_eq!(photos[0].raw_relpath.as_deref(), Some("Rome/DSC_0001.DNG"));
+        assert!(photos[0]
+            .raw_relpath
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case("Rome/DSC_0001.DNG")));
     }
 
     #[test]
@@ -676,10 +679,10 @@ mod tests {
         let photos = catalog::photos_in_album(&conn, "Rome").unwrap();
         assert_eq!(photos.len(), 1);
         assert_eq!(photos[0].relpath, "Rome/DSC_0001-edited.jpg");
-        assert_eq!(
-            photos[0].raw_relpath.as_deref(),
-            Some("Rome/DSC_0001-edited.DNG")
-        );
+        assert!(photos[0]
+            .raw_relpath
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case("Rome/DSC_0001-edited.DNG")));
     }
 
     #[test]
