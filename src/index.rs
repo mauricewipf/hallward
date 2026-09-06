@@ -661,4 +661,56 @@ mod tests {
         assert_eq!(photos[0].relpath, "Rome/orphan.DNG");
         assert!(photos[0].raw_relpath.is_none());
     }
+
+    #[test]
+    fn edited_jpeg_dng_twins_index_as_one_photo() {
+        let (_tmp, root) = mini_library();
+        write_still(&root.join("Rome/DSC_0001-edited.jpg"));
+        std::fs::write(root.join("Rome/DSC_0001-edited.DNG"), b"dng").unwrap();
+        index_library(&root).unwrap();
+        let conn = catalog::open(&root, false).unwrap();
+        assert_eq!(catalog::count(&conn).unwrap(), 1);
+        let photos = catalog::photos_in_album(&conn, "Rome").unwrap();
+        assert_eq!(photos.len(), 1);
+        assert_eq!(photos[0].relpath, "Rome/DSC_0001-edited.jpg");
+        assert_eq!(
+            photos[0].raw_relpath.as_deref(),
+            Some("Rome/DSC_0001-edited.DNG")
+        );
+    }
+
+    #[test]
+    fn edited_jpeg_does_not_pair_with_original_dng() {
+        let (_tmp, root) = mini_library();
+        write_still(&root.join("Rome/DSC_0001-edited.jpg"));
+        std::fs::write(root.join("Rome/DSC_0001.DNG"), b"dng").unwrap();
+        index_library(&root).unwrap();
+        let conn = catalog::open(&root, false).unwrap();
+        assert_eq!(catalog::count(&conn).unwrap(), 2);
+        let photos = catalog::photos_in_album(&conn, "Rome").unwrap();
+        assert_eq!(photos.len(), 2);
+        let edited = photos
+            .iter()
+            .find(|p| p.relpath == "Rome/DSC_0001-edited.jpg")
+            .unwrap();
+        assert!(edited.raw_relpath.is_none());
+        let original_dng = photos
+            .iter()
+            .find(|p| p.relpath == "Rome/DSC_0001.DNG")
+            .unwrap();
+        assert!(original_dng.raw_relpath.is_none());
+    }
+
+    #[test]
+    fn lone_edited_dng_indexes_without_raw_twin() {
+        let (_tmp, root) = mini_library();
+        std::fs::write(root.join("Rome/DSC_0001-edited.DNG"), b"dng").unwrap();
+        index_library(&root).unwrap();
+        let conn = catalog::open(&root, false).unwrap();
+        assert_eq!(catalog::count(&conn).unwrap(), 1);
+        let photos = catalog::photos_in_album(&conn, "Rome").unwrap();
+        assert_eq!(photos.len(), 1);
+        assert_eq!(photos[0].relpath, "Rome/DSC_0001-edited.DNG");
+        assert!(photos[0].raw_relpath.is_none());
+    }
 }
