@@ -215,6 +215,40 @@ fn ask_ai_answers_question_without_tokens() {
 }
 
 #[test]
+fn ask_ai_without_key_shows_setup_command() {
+    let _lock = stub_lock();
+    let mut h = Harness::without_saved_key(album_fixture());
+    open_rome(&mut h);
+
+    h.key(KeyCode::Char(' '));
+    h.type_text("who is in the photo?");
+    h.key(KeyCode::Enter);
+    h.redraw();
+
+    let screen = h.screen();
+    assert!(screen.contains("RUN:"), "{screen}");
+    assert!(
+        screen.contains("hallward credentials set OPENROUTER_API_KEY"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("https://openrouter.ai/settings/keys"),
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("Or set HALLWARD_OPENROUTER_API_KEY"),
+        "{screen}"
+    );
+
+    h.key(KeyCode::Esc);
+    let screen = h.screen();
+    assert!(
+        !screen.contains("hallward credentials set OPENROUTER_API_KEY"),
+        "{screen}"
+    );
+}
+
+#[test]
 fn ask_ai_edit_saves_sibling_next_to_source() {
     let _lock = stub_lock();
     let fixture = album_fixture();

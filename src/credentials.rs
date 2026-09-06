@@ -40,7 +40,7 @@ pub const INVALID_SAVED_KEY: &str = "HALLWARD_OPENROUTER_SAVED_KEY_REJECTED";
 /// Returned when the environment key is rejected.
 pub const INVALID_ENV_KEY: &str = "HALLWARD_OPENROUTER_ENV_KEY_REJECTED";
 
-const CREDENTIALS_KEY: &str = "OPENROUTER_API_KEY";
+pub const CREDENTIALS_KEY: &str = "OPENROUTER_API_KEY";
 const CREDENTIALS_PREFIX: &str = "OPENROUTER_API_KEY=";
 const ASK_MODEL_KEY: &str = "ASK_MODEL";
 const ASK_MODEL_PREFIX: &str = "ASK_MODEL=";

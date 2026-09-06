@@ -371,8 +371,20 @@ impl Harness {
     /// Build over an existing fixture, saving `key` as the credentials-file
     /// key and serving `transport` for Ask AI requests.
     pub fn with_transport(fixture: Fixture, transport: hallward::openrouter::PostFn) -> Self {
+        Self::build(fixture, transport, true)
+    }
+
+    /// Isolated credentials path, but no saved key (Ask AI shows the setup overlay).
+    pub fn without_saved_key(fixture: Fixture) -> Self {
+        install_text_response(text_response("ok"));
+        Self::build(fixture, stub_post, false)
+    }
+
+    fn build(fixture: Fixture, transport: hallward::openrouter::PostFn, save_key: bool) -> Self {
         let cred = CredGuard::isolated();
-        cred.save_key("test-key");
+        if save_key {
+            cred.save_key("test-key");
+        }
         let viewer = Arc::new(FakeViewerOpener::new());
         let clock = Arc::new(FixedClock::new(Instant::now()));
         let root = fixture.root().to_path_buf();

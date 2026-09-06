@@ -17,7 +17,7 @@ use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
@@ -174,16 +174,35 @@ pub trait TerminalDriver {
 /// Production driver over a live Crossterm terminal.
 pub struct CrosstermDriver<'a> {
     terminal: &'a mut Terminal<CrosstermBackend<Stdout>>,
+    mouse_captured: bool,
 }
 
 impl<'a> CrosstermDriver<'a> {
     pub fn new(terminal: &'a mut Terminal<CrosstermBackend<Stdout>>) -> Self {
-        Self { terminal }
+        Self {
+            terminal,
+            mouse_captured: true,
+        }
+    }
+
+    fn sync_mouse_capture(&mut self, app: &App) -> Result<()> {
+        let want = mouse_capture_wanted(app.credentials_overlay.is_some());
+        if want == self.mouse_captured {
+            return Ok(());
+        }
+        if want {
+            execute!(self.terminal.backend_mut(), EnableMouseCapture)?;
+        } else {
+            execute!(self.terminal.backend_mut(), DisableMouseCapture)?;
+        }
+        self.mouse_captured = want;
+        Ok(())
     }
 }
 
 impl TerminalDriver for CrosstermDriver<'_> {
     fn redraw(&mut self, app: &mut App) -> Result<()> {
+        self.sync_mouse_capture(app)?;
         self.terminal.draw(|f| draw(f, app))?;
         Ok(())
     }
@@ -200,6 +219,7 @@ impl TerminalDriver for CrosstermDriver<'_> {
         let result = run();
         enable_raw_mode()?;
         enter_tui(self.terminal.backend_mut())?;
+        self.mouse_captured = true;
         self.terminal.clear()?;
         result
     }
@@ -544,10 +564,9 @@ impl App {
                         generation: self.ask.generation,
                     });
                     self.credentials_overlay = Some(CredentialsOverlay {
-                        error: Some(
-                            "OpenRouter rejected the saved key. Run `hallward credentials set` again."
-                                .into(),
-                        ),
+                        error: Some(format!(
+                            "OpenRouter rejected the saved key. Run `{CREDENTIALS_SET_COMMAND}` again."
+                        )),
                     });
                     return;
                 }
@@ -2102,21 +2121,31 @@ fn draw_delete_confirm(frame: &mut Frame, root: &Path, rels: &[String]) {
 }
 
 const CREDENTIALS_BIND: &str = "Esc — back to grid";
+const CREDENTIALS_SET_COMMAND: &str = "hallward credentials set OPENROUTER_API_KEY";
+const OPENROUTER_KEYS_URL: &str = "https://openrouter.ai/settings/keys";
 
-fn credentials_setup_body() -> String {
-    let path = credentials::credentials_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "~/.config/hallward/credentials".into());
-    format!(
-        "Photos are sent to OpenRouter and may use paid quota.\n\n\
-         Run:\n  hallward credentials set\n\n\
-         Or set HALLWARD_OPENROUTER_API_KEY.\n\n\
-         Credentials file:\n  {path}"
-    )
+fn mouse_capture_wanted(credentials_overlay: bool) -> bool {
+    !credentials_overlay
+}
+
+fn credentials_setup_text() -> Text<'static> {
+    Text::from(vec![
+        Line::from("Photos are sent to OpenRouter and may use paid quota."),
+        Line::default(),
+        Line::from(Span::styled(
+            OPENROUTER_KEYS_URL,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::UNDERLINED),
+        )),
+        Line::default(),
+        Line::from("RUN:"),
+        Line::from(CREDENTIALS_SET_COMMAND),
+    ])
 }
 
 fn credentials_insecure_body(chmod_hint: &str) -> String {
-    format!("Credentials file permissions are too open.\n\nRun:\n  {chmod_hint}")
+    format!("Credentials file permissions are too open.\n\nRUN:\n{chmod_hint}")
 }
 
 fn draw_credentials_overlay(frame: &mut Frame, app: &App) {
@@ -2124,13 +2153,13 @@ fn draw_credentials_overlay(frame: &mut Frame, app: &App) {
         return;
     };
     let area = frame.area();
-    let width = area.width.min(64).max(36.min(area.width));
+    let width = area.width.min(64).max(46.min(area.width));
     let issue = credentials::credential_issue();
     let body = match issue {
         Some(CredentialIssue::InsecurePermissions { chmod_hint }) => {
-            credentials_insecure_body(&chmod_hint)
+            Text::from(credentials_insecure_body(&chmod_hint))
         }
-        Some(CredentialIssue::Missing) | None => credentials_setup_body(),
+        Some(CredentialIssue::Missing) | None => credentials_setup_text(),
     };
     let height = if overlay.error.is_some() { 14 } else { 12 };
     let height = height.min(area.height);
@@ -2153,10 +2182,13 @@ fn draw_credentials_overlay(frame: &mut Frame, app: &App) {
         ])
         .split(inner);
 
+    // Left-aligned so the command and URL can be drag-selected without
+    // center padding. Mouse capture is off while this overlay is open, so
+    // terminals can Cmd-click the https URL and copy with a drag-select.
     frame.render_widget(
         Paragraph::new(body)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true }),
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: false }),
         chunks[0],
     );
 
@@ -2168,7 +2200,8 @@ fn draw_credentials_overlay(frame: &mut Frame, app: &App) {
     if let Some(error) = &overlay.error {
         frame.render_widget(
             Paragraph::new(error.as_str())
-                .alignment(Alignment::Center)
+                .alignment(Alignment::Left)
+                .wrap(Wrap { trim: true })
                 .style(Style::default().fg(Color::LightRed)),
             chunks[2],
         );
@@ -2908,12 +2941,16 @@ mod tests {
             KeyCode::Esc,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE).code
         );
-        let body = credentials_setup_body();
-        assert!(body.contains("hallward credentials set"));
-        assert!(body.contains("HALLWARD_OPENROUTER_API_KEY"));
+        let body = credentials_setup_text().to_string();
+        assert!(body.contains(CREDENTIALS_SET_COMMAND));
+        assert!(body.contains("RUN:"));
+        assert!(body.contains(OPENROUTER_KEYS_URL));
+        assert!(!body.contains("Or set HALLWARD_OPENROUTER_API_KEY"));
         let insecure = credentials_insecure_body("chmod 600 ~/.config/hallward/credentials");
         assert!(insecure.contains("chmod 600"));
-        assert!(!insecure.contains("hallward credentials set"));
+        assert!(!insecure.contains(CREDENTIALS_SET_COMMAND));
+        assert!(mouse_capture_wanted(false));
+        assert!(!mouse_capture_wanted(true));
     }
 
     #[test]

@@ -38,6 +38,7 @@ enum Cmd {
     /// Re-scan files and refresh thumbnails
     Index,
     /// Manage OpenRouter API credentials
+    #[command(visible_alias = "credential")]
     Credentials {
         #[command(subcommand)]
         cmd: CredentialsCmd,
@@ -48,6 +49,9 @@ enum Cmd {
 enum CredentialsCmd {
     /// Write OpenRouter API key to ~/.config/hallward/credentials
     Set {
+        /// OpenRouter API key. If omitted, read from stdin (echo off).
+        #[arg(value_name = "KEY")]
+        key: Option<String>,
         /// Copy HALLWARD_OPENROUTER_API_KEY into the credentials file
         #[arg(long)]
         from_env: bool,
@@ -113,13 +117,8 @@ fn init_with_progress(root: &std::path::Path) -> Result<index::IndexStats> {
 
 fn run_credentials(cmd: CredentialsCmd) -> Result<()> {
     match cmd {
-        CredentialsCmd::Set { from_env } => {
-            let key = if from_env {
-                std::env::var("HALLWARD_OPENROUTER_API_KEY")
-                    .map_err(|_| anyhow::anyhow!("HALLWARD_OPENROUTER_API_KEY is not set."))?
-            } else {
-                credentials::read_secret_from_stdin().map_err(anyhow::Error::msg)?
-            };
+        CredentialsCmd::Set { key, from_env } => {
+            let key = credential_value_to_save(key, from_env)?;
             credentials::set_key(&key).map_err(anyhow::Error::msg)?;
             let path = credentials::credentials_path().map_err(anyhow::Error::msg)?;
             eprintln!("Saved OpenRouter credentials to {}.", path.display());
@@ -130,6 +129,23 @@ fn run_credentials(cmd: CredentialsCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn credential_value_to_save(key: Option<String>, from_env: bool) -> Result<String> {
+    if from_env && key.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+        anyhow::bail!("Pass the key or --from-env, not both.");
+    }
+    if from_env {
+        return std::env::var("HALLWARD_OPENROUTER_API_KEY")
+            .map_err(|_| anyhow::anyhow!("HALLWARD_OPENROUTER_API_KEY is not set."));
+    }
+    match key.as_deref().map(str::trim) {
+        None | Some("") => credentials::read_secret_from_stdin().map_err(anyhow::Error::msg),
+        Some(credentials::CREDENTIALS_KEY) => {
+            credentials::read_secret_from_stdin().map_err(anyhow::Error::msg)
+        }
+        Some(value) => Ok(value.to_string()),
+    }
 }
 
 fn index_with_progress(root: &std::path::Path) -> Result<index::IndexStats> {
@@ -160,5 +176,45 @@ mod tests {
             msg.contains(env!("CARGO_PKG_VERSION")),
             "expected crate version in --version output: {msg}"
         );
+    }
+
+    #[test]
+    fn credentials_set_key_argument_parses() {
+        let cli = Cli::try_parse_from(["hallward", "credentials", "set", "sk-test"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Credentials {
+                cmd: CredentialsCmd::Set { key, from_env },
+            }) => {
+                assert_eq!(key.as_deref(), Some("sk-test"));
+                assert!(!from_env);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn credential_alias_parses() {
+        let cli = Cli::try_parse_from(["hallward", "credential", "set"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Credentials {
+                cmd: CredentialsCmd::Set { key, from_env },
+            }) => {
+                assert!(key.is_none());
+                assert!(!from_env);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn credential_value_from_argument_is_saved_verbatim() {
+        let value = credential_value_to_save(Some("sk-test-key".into()), false).unwrap();
+        assert_eq!(value, "sk-test-key");
+    }
+
+    #[test]
+    fn credential_value_rejects_key_and_from_env_together() {
+        let err = credential_value_to_save(Some("sk-test-key".into()), true).unwrap_err();
+        assert!(err.to_string().contains("--from-env"), "{err}");
     }
 }
