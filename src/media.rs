@@ -129,7 +129,7 @@ fn is_jpeg_dng_still(path: &Path) -> bool {
     let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
         return false;
     };
-    if stem.is_empty() || is_edited_sidecar_stem(stem) {
+    if stem.is_empty() {
         return false;
     }
     path.extension()
@@ -152,7 +152,7 @@ pub fn dng_twin_for_still(still: &Path) -> Option<PathBuf> {
 pub fn jpeg_dng_still_for_raw(raw: &Path) -> Option<PathBuf> {
     let parent = raw.parent()?;
     let stem = raw.file_stem()?.to_str()?;
-    if stem.is_empty() || is_edited_sidecar_stem(stem) {
+    if stem.is_empty() {
         return None;
     }
     jpeg_dng_still_at_stem(parent, stem)
@@ -295,13 +295,36 @@ mod tests {
     }
 
     #[test]
-    fn jpeg_dng_skips_edited_sidecar_stems() {
+    fn jpeg_dng_edited_sidecar_does_not_pair_with_original_dng() {
         let dir = tempfile::tempdir().unwrap();
         File::create(dir.path().join("DSC_0001-edited.jpg")).unwrap();
         File::create(dir.path().join("DSC_0001.DNG")).unwrap();
         let edited = dir.path().join("DSC_0001-edited.jpg");
         assert!(!is_jpeg_dng_developed_still(&edited));
         assert!(dng_twin_for_still(&edited).is_none());
+        assert!(!is_dng_raw_companion(&dir.path().join("DSC_0001.DNG")));
+    }
+
+    #[test]
+    fn jpeg_dng_edited_twins_pair_by_same_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        File::create(dir.path().join("DSC_0001-edited.jpg")).unwrap();
+        File::create(dir.path().join("DSC_0001-edited.DNG")).unwrap();
+        let edited_jpg = dir.path().join("DSC_0001-edited.jpg");
+        let edited_dng = dir.path().join("DSC_0001-edited.DNG");
+        assert!(is_jpeg_dng_developed_still(&edited_jpg));
+        assert!(is_dng_raw_companion(&edited_dng));
+        assert_eq!(dng_twin_for_still(&edited_jpg).unwrap(), edited_dng);
+        assert_eq!(jpeg_dng_still_for_raw(&edited_dng).unwrap(), edited_jpg);
+    }
+
+    #[test]
+    fn lone_edited_dng_is_not_a_companion() {
+        let dir = tempfile::tempdir().unwrap();
+        File::create(dir.path().join("DSC_0001-edited.DNG")).unwrap();
+        let lone = dir.path().join("DSC_0001-edited.DNG");
+        assert!(!is_dng_raw_companion(&lone));
+        assert!(dng_twin_for_still(&lone).is_none());
     }
 
     #[test]
