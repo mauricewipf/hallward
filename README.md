@@ -91,7 +91,30 @@ hallward credentials clear            # remove the credentials file
 
 ## Install
 
-### Homebrew (macOS Apple Silicon, Linux x86_64)
+### GitHub Releases
+
+Download a binary from [Releases](https://github.com/mauricewipf/hallward/releases):
+
+- Linux x86_64 (glibc, Ubuntu 24.04): `hallward-x86_64-unknown-linux-gnu.tar.gz`
+- macOS Apple Silicon: `hallward-aarch64-apple-darwin.tar.gz`
+
+```bash
+tar -xzf hallward-x86_64-unknown-linux-gnu.tar.gz
+chmod +x hallward
+# move onto PATH, e.g. mkdir -p ~/.local/bin && mv hallward ~/.local/bin/
+```
+
+**Linux (Arch/Omarchy):** install the dependencies with pacman rather than Homebrew — brew on a rolling-release distro duplicates the system package stack and is discouraged:
+
+```bash
+sudo pacman -S ffmpeg libheif mpv imv   # imv = stills viewer (nsxiv, feh, or swayimg also work)
+```
+
+On other distros use the equivalent packages. Sharp thumbnails need a Kitty-graphics-capable terminal (Kitty, Ghostty, WezTerm).
+
+**macOS:** the binary is unsigned; if Gatekeeper blocks it, allow it in System Settings → Privacy & Security. Stills open in **Preview** (built in). HEIC thumbnails need `libheif` / `heif-convert`; video thumbnails need `ffmpeg`; video **playback** needs **mpv** (`brew install mpv`). Do not use `ffplay` (see [Prerequisites](#prerequisites)).
+
+### Homebrew (macOS Apple Silicon; Linux x86_64 where brew is already in use)
 
 ```bash
 brew install mauricewipf/hallward/hallward
@@ -103,24 +126,9 @@ Homebrew auto-taps on first install. You may need to trust the formula once:
 brew trust --formula mauricewipf/hallward/hallward
 ```
 
-This installs **hallward** plus `libheif`, `ffmpeg`, and `mpv`. On macOS, stills open in **Preview** (built in). On Linux, install a stills viewer separately (imv, nsxiv, feh, or swayimg). Sharp thumbnails still need Ghostty or Kitty (`brew install --cask ghostty`).
+This installs **hallward** plus `libheif`, `ffmpeg`, and `mpv`. On macOS, stills open in **Preview** (built in); sharp thumbnails need Ghostty or Kitty (`brew install --cask ghostty`). On Linux the formula works but is only recommended if you already use Homebrew there — on Arch/Omarchy prefer pacman + the release binary above. Install a stills viewer separately (imv, nsxiv, feh, or swayimg).
 
 Tap: [mauricewipf/homebrew-hallward](https://github.com/mauricewipf/homebrew-hallward).
-
-### GitHub Releases
-
-Download a binary from [Releases](https://github.com/mauricewipf/hallward/releases):
-
-- macOS Apple Silicon: `hallward-aarch64-apple-darwin.tar.gz`
-- Linux x86_64 (glibc, Ubuntu 24.04): `hallward-x86_64-unknown-linux-gnu.tar.gz`
-
-```bash
-tar -xzf hallward-aarch64-apple-darwin.tar.gz
-chmod +x hallward
-# move onto PATH, e.g. mkdir -p ~/.local/bin && mv hallward ~/.local/bin/
-```
-
-The macOS binary is unsigned; if Gatekeeper blocks it, allow it in System Settings → Privacy & Security. HEIC thumbnails still need `libheif` / `heif-convert`; video thumbnails need `ffmpeg`; video **playback** needs **mpv** (`brew install mpv`). Do not use `ffplay` (see [Prerequisites](#prerequisites)).
 
 ### From source
 
