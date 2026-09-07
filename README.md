@@ -98,6 +98,17 @@ Download a binary from [Releases](https://github.com/mauricewipf/hallward/releas
 - Linux x86_64 (glibc, Ubuntu 24.04): `hallward-x86_64-unknown-linux-gnu.tar.gz`
 - macOS Apple Silicon: `hallward-aarch64-apple-darwin.tar.gz`
 
+No browser needed — the `latest` URL always points at the newest release:
+
+```bash
+# Linux x86_64
+curl -fLO https://github.com/mauricewipf/hallward/releases/latest/download/hallward-x86_64-unknown-linux-gnu.tar.gz
+# macOS Apple Silicon
+curl -fLO https://github.com/mauricewipf/hallward/releases/latest/download/hallward-aarch64-apple-darwin.tar.gz
+```
+
+With the GitHub CLI: `gh release download --repo mauricewipf/hallward --pattern '*linux-gnu.tar.gz'`.
+
 ```bash
 tar -xzf hallward-x86_64-unknown-linux-gnu.tar.gz
 chmod +x hallward
