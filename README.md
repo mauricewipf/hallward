@@ -101,7 +101,7 @@ hallward credentials clear            # remove the credentials file
 
    `imv` is the stills viewer — nsxiv, feh, or swayimg also work.
 
-2. Download the latest release (no browser needed):
+2. Download the latest release:
 
    ```bash
    curl -fLO https://github.com/mauricewipf/hallward/releases/latest/download/hallward-x86_64-unknown-linux-gnu.tar.gz
