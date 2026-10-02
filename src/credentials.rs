@@ -32,7 +32,7 @@ impl ResolvedKey {
 /// Default vision Q&A model written into new credential files.
 pub const DEFAULT_ASK_MODEL: &str = "google/gemini-3.5-flash-lite";
 /// Default image-edit model written into new credential files.
-pub const DEFAULT_EDIT_MODEL: &str = "google/gemini-3.1-flash-lite-image";
+pub const DEFAULT_EDIT_MODEL: &str = "black-forest-labs/flux.2-pro";
 
 /// Returned when a saved file key is rejected; the TUI reopens the setup overlay.
 pub const INVALID_SAVED_KEY: &str = "HALLWARD_OPENROUTER_SAVED_KEY_REJECTED";

@@ -79,7 +79,7 @@ Mark with `Space` key one or more **images** and the search bar becomes **Ask AI
 
 Type a question and press Enter: "Which car is this?" OpenRouter answers in the pane (`google/gemini-3.5-flash-lite`).
 
-If the prompt is an edit instruction such as "Remove the persons in the background.", Hallward classifies it with OpenRouter, then edits with `google/gemini-3.1-flash-lite-image`. Ask AI and image edit share one credential: run `hallward credentials set` (stdin, echo off) or set `HALLWARD_OPENROUTER_API_KEY`. Hallward stores the key in `~/.config/hallward/credentials` (mode `0600`, directory `0700`). The edited photo is saved as a new sibling file (`photo-edited.png`, then `photo-edited-2.png`, …). The original is never overwritten. Editing needs **exactly one** marked still. Esc cancels an in-flight request.
+If the prompt is an edit instruction such as "Remove the persons in the background.", Hallward classifies it with OpenRouter, then edits with `black-forest-labs/flux.2-pro`. Ask AI and image edit share one credential: run `hallward credentials set` (stdin, echo off) or set `HALLWARD_OPENROUTER_API_KEY`. Hallward stores the key in `~/.config/hallward/credentials` (mode `0600`, directory `0700`). The edited photo is saved as a new sibling file (`photo-edited.png`, then `photo-edited-2.png`, …). The original is never overwritten. Editing needs **exactly one** marked still. Esc cancels an in-flight request.
 
 ```bash
 hallward credentials set              # paste key at prompt (not echoed)
